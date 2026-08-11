@@ -70,27 +70,88 @@ class ConfirmRequest(BaseModel):
 # ============================================================
 
 class SessionStore:
-    """简单内存会话存储"""
-    def __init__(self):
-        self.sessions = {}  # session_id -> {
-                            #   "input_path": str,
-                            #   "output_path": str,
-                            #   "manifest": RedactionManifest,
-                            #   "report": dict,
-                            # }
+    """会话存储（内存 + SQLite 持久化）— P3.4 合规修复"""
+    def __init__(self, db_path: str = None):
+        if db_path is None:
+            db_path = Path(__file__).parent / "sessions.db"
+        self.db_path = db_path
+        self.sessions = {}  # 内存缓存：session_id -> kwargs（不含 manifest/report 大对象）
+        self._init_db()
+
+    def _init_db(self):
+        """初始化 SQLite 表"""
+        import sqlite3
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                session_id TEXT PRIMARY KEY,
+                input_path TEXT,
+                output_path TEXT,
+                status TEXT DEFAULT 'pending',
+                created_at TEXT,
+                updated_at TEXT,
+                manifest_summary TEXT,
+                operator TEXT
+            )
+        """)
+        conn.commit()
+        conn.close()
 
     def create(self, session_id: str, **kwargs):
+        import sqlite3, json
+        now = datetime.now().isoformat()
         self.sessions[session_id] = kwargs
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            "INSERT OR REPLACE INTO sessions "
+            "(session_id, input_path, output_path, status, created_at, updated_at, operator) "
+            "VALUES (?, ?, ?, 'pending', ?, ?, ?)",
+            (session_id, kwargs.get("input_path", ""), kwargs.get("output_path", ""),
+             now, now, kwargs.get("operator", ""))
+        )
+        conn.commit()
+        conn.close()
 
     def get(self, session_id: str) -> dict:
-        return self.sessions.get(session_id, {})
+        # 优先从内存（不含大对象）
+        base = self.sessions.get(session_id, {})
+        # 从 SQLite 补全元数据
+        import sqlite3
+        conn = sqlite3.connect(self.db_path)
+        row = conn.execute(
+            "SELECT status, created_at, updated_at, manifest_summary FROM sessions "
+            "WHERE session_id = ?", (session_id,)
+        ).fetchone()
+        conn.close()
+        if row:
+            base.setdefault("status", row[0])
+            base.setdefault("created_at", row[1])
+            base.setdefault("updated_at", row[2])
+            base.setdefault("manifest_summary", row[3])
+        return base
 
     def update(self, session_id: str, **kwargs):
-        if session_id in self.sessions:
-            self.sessions[session_id].update(kwargs)
+        import sqlite3, json
+        self.sessions[session_id] = {**self.sessions.get(session_id, {}), **kwargs}
+        now = datetime.now().isoformat()
+        manifest_summary = kwargs.get("manifest_summary", "")
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            "UPDATE sessions SET status=?, updated_at=?, manifest_summary=? "
+            "WHERE session_id = ?",
+            (kwargs.get("status", "in_progress"), now,
+             str(manifest_summary)[:500], session_id)
+        )
+        conn.commit()
+        conn.close()
 
     def delete(self, session_id: str):
+        import sqlite3
         self.sessions.pop(session_id, None)
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+        conn.commit()
+        conn.close()
 
 
 store = SessionStore()

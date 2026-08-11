@@ -25,6 +25,7 @@ from llm_client import LLMClient
 from entity_detector import EntityDetector
 from ocr_processor import OCRProcessor
 from editor_executor import EditorSDKExecutor
+from extensions.templates import TemplateManager
 
 # 配置日志
 logging.basicConfig(
@@ -65,6 +66,7 @@ class RedactionPipeline:
         self.detector = EntityDetector(self.llm, self.config)
         self.ocr = OCRProcessor(self.llm, self.config)
         self.executor = EditorSDKExecutor(self.config)
+        self.template_mgr = TemplateManager()  # P2.7 行业模板管理器
 
     def run(
         self,
@@ -130,6 +132,16 @@ class RedactionPipeline:
             f"= {text_data['stats']['total_chars']}字符"
         )
 
+        # ── Phase 2.5: 行业自动识别 + 模板注入（P2.7）─────────
+        t0_industry = time.time()
+        full_text = text_data["full_text"]
+        detected_industry = self.template_mgr.detect_industry(full_text)
+        report["industry"] = detected_industry
+        report["phases"]["phase2_5_industry"] = {
+            "industry": detected_industry,
+            "duration_sec": time.time() - t0_industry,
+        }
+
         # ── Phase 3: LLM 实体识别 ───────────────────────────
         logger.info("")
         logger.info("【Phase 3】LLM 实体识别")
@@ -143,6 +155,9 @@ class RedactionPipeline:
 
         # 合并段落和表格内容
         full_text = text_data["full_text"]
+
+        # P2.7: 将识别到的行业注入 detector（供 LLM system prompt 扩展）
+        self.detector.industry = detected_industry
 
         # 调用 LLM 检测（包含 regex 兜底 + 角色词规则）
         llm_manifest = self.detector.detect_from_text(full_text)
@@ -201,6 +216,12 @@ class RedactionPipeline:
         )
         report["phases"]["phase4_execute"] = exec_result
 
+        # ── Phase 4b: Word 元数据脱敏 ──────────────────────
+        if not dry_run:
+            logger.info("【Phase 4b】Word 文档元数据脱敏")
+            meta_result = self.executor.redact_metadata(input_path)
+            report["phases"]["phase4b_metadata"] = meta_result
+
         # ── Phase 5: 质量验证 ──────────────────────────────
         logger.info("")
         logger.info("【Phase 5】脱敏质量验证")
@@ -209,17 +230,44 @@ class RedactionPipeline:
         # 获取脱敏后文本（仅 dry_run 模式实际执行前有效）
         redacted_text = ""
         if dry_run:
-            # dry_run 不实际修改文档，验证分析文本
-            pass
+            # dry_run 模式：跳过真实质量验证（无实际修改），
+            # 改为 dry-run 分析：模拟替换后应无敏感词
+            logger.info("   [dry_run] 跳过真实质量验证（文档未被修改）")
+            verification = {
+                "checks": {
+                    "bank_names_check": "DRY_RUN",
+                    "person_names_check": "DRY_RUN",
+                    "dates_check": "DRY_RUN",
+                },
+                "remaining_issues": ["dry_run 模式：需手动确认 manifest 中的替换计划"],
+                "quality_score": -1,  # -1 表示未执行
+                "overall_quality": "DRY_RUN",
+                "dry_run_note": "实际质量验证需在非 dry_run 模式下执行",
+            }
         else:
             # 实际替换后，重新提取文本进行验证
-            doc_content2 = self.executor.get_document_content(file_id)
-            text_data2 = self.executor.extract_all_text(doc_content2)
-            redacted_text = text_data2["full_text"]
+            # 注意：如果 editor_sdk 替换未落盘（已知 bug），
+            #       get_document_content 读到的是原文本 → 假阳性通过
+            try:
+                doc_content2 = self.executor.get_document_content(file_id)
+                text_data2 = self.executor.extract_all_text(doc_content2)
+                redacted_text = text_data2["full_text"]
+            except Exception as e:
+                logger.warning(f"   ⚠️ 重新提取文档内容失败: {e}，质量验证结果可能不准确")
+                redacted_text = ""
 
-        verification = self._quality_check(full_text, redacted_text)
+            verification = self._quality_check(full_text, redacted_text)
+            # P1.6 修复：标记假阳性风险
+            if redacted_text and ("海峡银行" in redacted_text or "海峡行" in redacted_text):
+                verification["false_positive_risk"] = (
+                    "editor_sdk 替换可能未落盘，验证到的可能是原文本而非脱敏后文本。"
+                    "建议用 python-docx 重新读取输出文件进行独立验证。"
+                )
+                verification["overall_quality"] = "UNRELIABLE"
+                logger.warning("   ⚠️ 质量验证结果可能不可靠（editor_sdk 落盘问题）")
+
         report["phases"]["phase5_verify"] = verification
-        logger.info(f"   质量评分: {verification.get('quality_score', 0):.2f}")
+        logger.info(f"   质量评分: {verification.get('quality_score', 'N/A')}")
 
         # ── Phase 6: 保存文件 ───────────────────────────────
         logger.info("")
