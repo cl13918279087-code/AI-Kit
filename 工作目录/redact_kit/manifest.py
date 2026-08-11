@@ -121,6 +121,104 @@ class RejectedItem:
 
 
 @dataclass
+class RedactionAuditRecord:
+    """
+    脱敏操作审计留痕记录（P1.1 合规修复）
+
+    金融监管要求：脱敏操作必须可追溯，记录"哪个自然人在哪个时间点
+    确认了哪项替换"。本记录作为 manifest 之外独立的审计证据链。
+
+    使用场景：
+    - 人工确认低置信实体时创建
+    - 自动执行替换后批量生成
+    - 监管检查时作为操作凭证提交
+    """
+    operator_id: str           # 操作者工号（来源：环境变量或登录会话）
+    operator_name: str         # 操作者姓名
+    operation_time: str        # ISO 8601 操作时间（含时区，如 2026-08-10T23:00:00+08:00）
+    document_name: str         # 原文档名称
+    document_hash_original: str # 原文档 SHA-256（Hex）
+    document_hash_redacted: str # 脱敏后文档 SHA-256（Hex）
+    tool_version: str          # 脱敏工具版本号/Commit ID
+    llm_model: str              # 使用的 LLM 模型
+    total_replacements: int    # 总替换次数
+    approved_entities: list    # 人工确认的实体列表 [{"text": "...", "category": "..."}]
+    rejected_entities: list    # 人工拒绝/修改的实体列表
+    low_confidence_reviewed: int  # 低置信项中人工复查数量
+    execution_duration_seconds: float  # 执行耗时（秒）
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    def save_json(self, path: str):
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(self.to_dict(), f, ensure_ascii=False, indent=2)
+
+    @classmethod
+    def load_json(cls, path: str) -> "RedactionAuditRecord":
+        with open(path, encoding="utf-8") as f:
+            return cls(**json.load(f))
+
+
+class AuditLog:
+    """
+    审计日志管理器（P1.1 合规修复）
+
+    负责：
+    - 在每个脱敏会话开始时创建 RedactionAuditRecord
+    - 在会话结束时计算文档哈希、记录操作时长
+    - 支持审计记录的持久化和查询
+    """
+
+    def __init__(self, operator_id: str, operator_name: str,
+                 tool_version: str = "1.0.0"):
+        import hashlib, os
+        self.operator_id = operator_id
+        self.operator_name = operator_name
+        self.tool_version = tool_version
+        self.start_time = datetime.now()
+        self.records: list[RedactionAuditRecord] = []
+
+    def new_record(self, document_name: str,
+                   llm_model: str = "unknown") -> RedactionAuditRecord:
+        """创建一条新的审计记录"""
+        return RedactionAuditRecord(
+            operator_id=self.operator_id,
+            operator_name=self.operator_name,
+            operation_time=datetime.now().astimezone().isoformat(),
+            document_name=document_name,
+            document_hash_original="",
+            document_hash_redacted="",
+            tool_version=self.tool_version,
+            llm_model=llm_model,
+            total_replacements=0,
+            approved_entities=[],
+            rejected_entities=[],
+            low_confidence_reviewed=0,
+            execution_duration_seconds=0.0,
+        )
+
+    @staticmethod
+    def compute_file_hash(file_path: str) -> str:
+        """计算文件的 SHA-256 哈希值"""
+        import hashlib
+        sha256 = hashlib.sha256()
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                sha256.update(chunk)
+        return sha256.hexdigest()
+
+    @staticmethod
+    def get_operator_from_env() -> tuple[str, str]:
+        """从环境变量获取操作者信息（可扩展为 LDAP/SSO 集成）"""
+        import os
+        return (
+            os.environ.get("REDUCT_OPERATOR_ID", "UNKNOWN"),
+            os.environ.get("REDUCT_OPERATOR_NAME", "UNKNOWN"),
+        )
+
+
+@dataclass
 class RedactionManifest:
     """
     完整脱敏清单 - LLM与规则引擎协作的核心数据结构

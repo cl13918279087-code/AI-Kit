@@ -15,6 +15,7 @@ import logging
 import subprocess
 import base64
 import io
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -52,19 +53,30 @@ class EditorSDKExecutor:
         特殊处理异步命令（如 open_file）：
         - 异步命令会立即返回 "open started" 并进入 SSE 流
         - 同步读取第一行（JSON 响应），再启动 SSE 监听线程
-        """
-        import threading, time
 
-        cmd = f"{self.sdk_cmd} call {subcmd}"
+        安全修复（P0.3）：使用 shlex.split + shell=False 避免命令注入
+        """
+        import shlex, threading, time
+
+        # 安全：拆分为列表，用 shell=False 执行
+        base_parts = shlex.split(self.sdk_cmd)
+        cmd_parts = base_parts + ["call", subcmd]
         for k, v in params.items():
             if isinstance(v, str):
-                v = f'"{v}"'
-            cmd += f" {k}={v}"
+                # 用 shlex.quote 防止字符串内容注入 shell
+                cmd_parts.append(f"{k}={shlex.quote(v)}")
+            elif isinstance(v, bool):
+                if v:
+                    cmd_parts.append(f"{k}=true")
+            elif isinstance(v, (int, float)):
+                cmd_parts.append(f"{k}={v}")
+            else:
+                cmd_parts.append(f"{k}={shlex.quote(str(v))}")
 
-        logger.debug(f"执行: {cmd[:200]}...")
+        logger.debug(f"执行: {' '.join(cmd_parts[:5])}...")
 
         proc = subprocess.Popen(
-            cmd, shell=True,
+            cmd_parts,  # 安全：列表形式，shell=False
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True,
         )
@@ -121,13 +133,29 @@ class EditorSDKExecutor:
         time.sleep(3)
 
     def open_file(self, file_path: str) -> str:
-        """打开文件，返回 file_id"""
+        """
+        打开文件，返回 editor_sdk 分配的真正 file_id。
+
+        注意：editor_sdk 响应的 JSON 中，文件 ID 字段可能是 "file_id" 或 "id"，
+        而非输入的 file_path。后续 get_document_content / execute_manifest
+        传入的 file_id 必须使用此返回值。
+        """
         logger.info(f"📂 打开文件: {file_path}")
         result = self._run("open_file", file_path=file_path)
         if "error" in result:
             raise RuntimeError(f"打开文件失败: {result['error']}")
-        logger.info(f"   文件已打开，file_id={file_path}")
-        return file_path
+
+        # 尝试从响应中提取真实的 file_id
+        file_id = result.get("file_id") or result.get("id") or result.get("data", {}).get("file_id")
+        if not file_id:
+            logger.warning(
+                f"⚠️ editor_sdk 响应中未找到 file_id 字段，响应: {str(result)[:200]}，"
+                f"降级使用 file_path 作为 file_id"
+            )
+            file_id = file_path
+
+        logger.info(f"   文件已打开，file_id={file_id}")
+        return file_id
 
     def get_document_content(self, file_id: str) -> dict:
         """获取文档内容"""
@@ -257,10 +285,134 @@ class EditorSDKExecutor:
         )
         return results
 
-    def process_image_mosaic(
-        self, file_id: str,
-        image_url: str, idx: int
-    ) -> dict:
+    def redact_metadata(self, file_path: str) -> dict:
+        """
+        Word 文档元数据脱敏（P1.5 合规修复）
+
+        处理 Word 文档中可能含敏感信息的元数据字段：
+        - dc:creator（文档作者）
+        - cp:lastModifiedBy（最后修改人）
+        - cp:keywords（关键词，可能含人员/机构名）
+        - Custom Properties（业务自定义字段）
+
+        策略：直接编辑 docx 内部 XML（core.xml / app.xml / custom.xml），
+        用 python-docx 的 zipfile 层级操作，无需打开编辑器。
+
+        Args:
+            file_path: 文档路径（将被就地修改）
+
+        Returns:
+            {"redacted": [字段列表], "errors": [错误列表]}
+        """
+        import zipfile, shutil, re, os
+        from pathlib import Path
+        from xml.etree import ElementTree as ET
+
+        NS = {
+            "dc": "http://purl.org/dc/elements/1.1/",
+            "cp": "http://schemas.openxmlformats.org/package/2006/metadata/core-properties",
+            "dcterms": "http://purl.org/dc/terms/",
+            "cts": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+        }
+
+        # 姓名正则（2-4个汉字）
+        CHINESE_NAME_RE = re.compile(r'[\u4e00-\u9fa5]{2,4}')
+        # 排除词（不视为敏感）
+        SAFE_TERMS = {
+            "Administrator", "admin", "User", "user",
+            "SYSTEM", "system", "Guest", "guest",
+        }
+
+        result = {"redacted": [], "errors": []}
+
+        tmp_dir = Path(tempfile.mkdtemp())
+        extract_dir = tmp_dir / "docx_extracted"
+        extract_dir.mkdir()
+
+        try:
+            # 解压 docx
+            with zipfile.ZipFile(file_path, "r") as z:
+                z.extractall(extract_dir)
+
+            # 1. core.xml — 作者 / 最后修改人
+            core_xml = extract_dir / "docProps" / "core.xml"
+            if core_xml.exists():
+                tree = ET.parse(core_xml)
+                root = tree.getroot()
+                changed = False
+                for tag in ["creator", "lastModifiedBy"]:
+                    for elem in root.iter(f"{{{NS['dc']}}}{tag}"):
+                        val = (elem.text or "").strip()
+                        if not val or val in SAFE_TERMS:
+                            continue
+                        # 检查是否含中文姓名
+                        if CHINESE_NAME_RE.search(val):
+                            elem.text = self.config.get("redaction", {}).get(
+                                "person_replacement", "XXX"
+                            )
+                            result["redacted"].append(f"core.xml:{tag}={val}→XXX")
+                            changed = True
+                if changed:
+                    tree.write(core_xml, encoding="utf-8", xml_declaration=True)
+
+            # 2. app.xml — 公司/经理等字段
+            app_xml = extract_dir / "docProps" / "app.xml"
+            if app_xml.exists():
+                tree = ET.parse(app_xml)
+                root = tree.getroot()
+                changed = False
+                # app.xml 命名空间不同，需用通用遍历
+                for elem in root.iter():
+                    val = (elem.text or "").strip()
+                    if not val or val in SAFE_TERMS:
+                        continue
+                    if CHINESE_NAME_RE.search(val):
+                        elem.text = "XXX"
+                        result["redacted"].append(f"app.xml:{elem.tag}={val}→XXX")
+                        changed = True
+                if changed:
+                    tree.write(app_xml, encoding="utf-8", xml_declaration=True)
+
+            # 3. custom.xml — 自定义属性（如有）
+            custom_xml = extract_dir / "docProps" / "custom.xml"
+            if custom_xml.exists():
+                tree = ET.parse(custom_xml)
+                root = tree.getroot()
+                changed = False
+                for elem in root.iter():
+                    val = (elem.text or "").strip()
+                    if not val:
+                        continue
+                    # 替换所有含敏感信息的文本节点
+                    new_val = CHINESE_NAME_RE.sub("XXX", val)
+                    if new_val != val:
+                        elem.text = new_val
+                        result["redacted"].append(f"custom.xml:{elem.tag}={val}→XXX")
+                        changed = True
+                if changed:
+                    tree.write(custom_xml, encoding="utf-8", xml_declaration=True)
+
+            # 重新打包
+            tmp_out = tmp_dir / "output.docx"
+            with zipfile.ZipFile(tmp_out, "w", zipfile.ZIP_DEFLATED) as z:
+                for fp in extract_dir.rglob("*"):
+                    if fp.is_file():
+                        arcname = fp.relative_to(extract_dir)
+                        z.write(fp, arcname)
+
+            # 替换原文件
+            shutil.copy2(tmp_out, file_path)
+            logger.info(f"   [元数据脱敏] 完成: {result['redacted']}")
+
+        except Exception as e:
+            result["errors"].append(str(e))
+            logger.error(f"   [元数据脱敏] 失败: {e}")
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        return result
+
+    def process_image_mosaic(self, file_id: str, image_url: str, idx: int) -> dict:
         """
         对图片应用马赛克效果
 
@@ -326,7 +478,7 @@ class EditorSDKExecutor:
             scale = max_dim / max(width, height)
             img = img.resize(
                 (int(width * scale), int(height * scale)),
-                Image.Resampling.LANCZOS
+                Image.Resampling.BICUBIC
             )
 
         # 马赛克效果：缩小到 1/20 再放大回
@@ -334,7 +486,7 @@ class EditorSDKExecutor:
         w, h = img.size
         small = img.resize(
             (max(int(w * mosaic_scale), 1), max(int(h * mosaic_scale), 1)),
-            Image.Resampling.LANCZOS
+            Image.Resampling.BICUBIC
         )
         mosaic = small.resize(img.size, Image.Resampling.NEAREST)
 

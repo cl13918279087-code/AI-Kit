@@ -132,7 +132,12 @@ class LLMClient:
         self.max_tokens = llm_cfg.get("max_tokens", 8192)
 
         # 判断是否启用 Mock 模式
-        self.mock_mode = not bool(self.api_key)
+        # 排除常见占位符："***"、"your-key-here"、空字符串
+        _placeholder_keys = {"***", "your-key-here", "your_api_key", "sk-placeholder", ""}
+        self.mock_mode = (
+            not bool(self.api_key)
+            or self.api_key.strip() in _placeholder_keys
+        )
         if self.mock_mode:
             logger.warning("⚠️ 未配置 API Key，自动启用 DEMO_MOCK 模式")
             logger.warning("⚠️ DEMO_MOCK 模式返回预设数据，不调用真实 LLM")

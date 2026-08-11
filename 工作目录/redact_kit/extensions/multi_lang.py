@@ -17,8 +17,14 @@ from __future__ import annotations
 import re
 import logging
 from typing import Optional
-from langdetect import detect, detect_langs
-from langdetect.lang_detect_exception import LangDetectException
+
+try:
+    from langdetect import detect, detect_langs
+    from langdetect.lang_detect_exception import LangDetectException
+    _LANGDETECT_AVAILABLE = True
+except ImportError:
+    _LANGDETECT_AVAILABLE = False
+    LangDetectException = Exception  # type: ignore
 
 logger = logging.getLogger("multi_lang")
 
