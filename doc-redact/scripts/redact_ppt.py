@@ -133,31 +133,77 @@ def _process_media_dir(media_dir: Path) -> None:
             print(f"  [媒体重命名] {stem}{ext} → {redacted_stem}{ext}")
 
 
+def _mosaic_image(img_path: Path, quality: int = 8) -> None:
+    """将图片原地马赛克处理（缩小→放大）"""
+    from PIL import Image
+    img = Image.open(img_path).convert("RGB")
+    small = img.resize(
+        (max(1, img.width // quality), max(1, img.height // quality)),
+        Image.NEAREST,
+    )
+    big = small.resize(img.size, Image.NEAREST)
+    big.save(img_path)
+
+
+def _is_logo_image(img: Image.Image) -> bool:
+    """
+    基于图片统计特征判断是否为 Logo/文字型图片。
+    特征：颜色数少（<300）、高宽比特殊（横条/小图）、边缘弱
+    """
+    import io
+    w, h = img.size
+    # 横条型（宽>300，高<200，宽高比>3）→ 典型 Banner/Header Logo
+    if w > 300 and h < 200 and w / max(h, 1) > 3:
+        return True
+    # 颜色数少 + 尺寸小（<300x300）
+    pixels = list(img.convert("L").getdata())
+    unique_colors = len(set(pixels))
+    if unique_colors < 300 and w < 1000 and h < 300:
+        return True
+    return False
+
+
 def _redact_bank_logos(media_dir: Path) -> None:
     """
     检测并遮盖银行 Logo 图片。
-    策略：检查 media 目录中文件名含 bank/logo/银行 等关键词的图片，
-    将其替换为纯黑图（不改变文档结构）。
+    策略：结合文件名关键词检测 + 图片统计特征（颜色数/尺寸）双重判断。
     """
     if not media_dir.exists():
         return
 
     from PIL import Image
-    import numpy as np
 
-    sensitive_keywords = ["bank", "logo", "银行", "logo", "brand"]
+    sensitive_keywords = ["bank", "logo", "银行", "brand"]
+    blurred = []
+    skipped = []
 
     for img_file in media_dir.iterdir():
         name_lower = img_file.name.lower()
+
+        # 策略1：文件名含敏感关键词 → 直接模糊
         if any(k in name_lower for k in sensitive_keywords):
             try:
-                img = Image.open(img_file)
-                w, h = img.size
-                black = Image.new("RGB", (max(w, 10), max(h, 10)), (0, 0, 0))
-                black.save(img_file)
-                print(f"  [银行Logo遮盖] {img_file.name} → 纯黑图")
+                _mosaic_image(img_file)
+                blurred.append(img_file.name)
+                print(f"  [Logo遮盖-文件名] {img_file.name}")
+                continue
             except Exception as e:
-                print(f"  [警告] 无法处理图片 {img_file.name}: {e}")
+                print(f"  [警告] {img_file.name}: {e}")
+
+        # 策略2：图片统计特征判断（颜色数少/横条型）
+        try:
+            img = Image.open(img_file)
+            if _is_logo_image(img):
+                _mosaic_image(img_file)
+                blurred.append(img_file.name)
+                print(f"  [Logo遮盖-特征分析] {img_file.name}: {img.size}")
+            else:
+                skipped.append(img_file.name)
+        except Exception as e:
+            print(f"  [警告] 无法分析图片 {img_file.name}: {e}")
+
+    if blurred:
+        print(f"  [Logo处理] 模糊 {len(blurred)} 个，保留原图 {len(skipped)} 个")
 
 
 # ---------------------------------------------------------------------------
