@@ -1,0 +1,26 @@
+# doc-redact 依赖包
+# pip install -r requirements.txt
+
+# 核心依赖
+lxml           # Word/Excel/PPT XML 操作（所有脚本共用）
+
+# Word 文档
+python-docx    # 辅助解析（可选，主要用 lxml）
+
+# Excel 电子表格
+openpyxl       # .xlsx 读写
+xlrd           # .xls 读取
+xlwt           # .xls 写入
+
+# PPT 演示文稿
+python-pptx    # 辅助解析（可选，主要用 lxml）
+
+# PDF 文档
+pymupdf        # 文本型 PDF + 页面渲染
+pytesseract    # 扫描版 PDF OCR
+Pillow         # 图片处理
+numpy          # 数组运算
+opencv-python  # 图像分析（Logo 检测）
+
+# OLE 文件格式检测
+olefile        # .doc/.xls/.ppt 二进制格式检测

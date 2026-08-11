@@ -1,140 +1,207 @@
 #!/usr/bin/env python3
 """
 redact_excel.py - Excel 电子表格脱敏脚本
-支持 .xlsx / .xls 格式
-依赖: openpyxl
-安装: pip install openpyxl
+支持 .xlsx（OOXML）和 .xls（Excel 97-2003 二进制格式）
+
+依赖: openpyxl（.xlsx）、xlrd+xlwt（.xls）、olefile（格式检测）
+安装: pip install openpyxl xlrd xlwt olefile
 """
 
 import sys
 import re
 import zipfile
 import shutil
+import tempfile
 from pathlib import Path
 
+from common_rules import apply_redactions, REDACTION_LABELS
+
 # ---------------------------------------------------------------------------
-# 脱敏规则
+# .xlsx 处理（OOXML / ZIP 格式）
 # ---------------------------------------------------------------------------
-REPLACEMENTS = [
-    (re.compile(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}'), 'XXXXX@XXXXX'),
-    (re.compile(
-        r'[^\x00-\xFF]{2,6}(?:省|自治区|市)?[^\x00-\xFF]{0,10}'
-        r'(?:市|区)?[^\x00-\xFF]{0,10}'
-        r'(?:街|路|道|巷|弄|号|大道|大街|东路|西路|南路|北路)[^\x00-\xFF]{0,30}'
-    ), 'XX省XX市XX区XXXX'),
-    (re.compile(r'[1-9]\d{5}(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx]'),
-     'XXXXXXXXXXXXXXXXXX'),
-    (re.compile(r'\b(?:\d{16}|\d{17}|\d{18}|\d{19})\b'), 'XXXXXXXXXXXXXXXX'),
-    (re.compile(
-        r'\d{4}[-年](?:0[1-9]|1[0-2])[-月](?:0[1-9]|[12]\d|3[01])[日]?\s*'
-        r'|(?:19|20)\d{2}年\d{1,2}月\d{1,2}日'
-    ), 'YYYY/MM/DD'),
-    (re.compile(r'\b1[3-9]\d{9}\b'), 'XXXXXXXXXXX'),
-    (re.compile(r'0\d{2,3}[-\s]?\d{7,8}'), '0XX-XXXXXXXX'),
-    (re.compile(
-        r'(?:(?:中国|交通|招商|浦发|兴业|民生|华夏|平安|光大|广发|浙商|渤海|恒丰|'
-        r'农业|建设|工商|南京|宁波|杭州|深圳|上海|北京|广州)银行|'
-        r'(?:农信社|信用社|农商银行|合作银行|人民银行))'
-    ), '[某银行]'),
-    (re.compile(r'[\u4e00-\u9fa5]{2,4}(?![a-zA-Z0-9\u4e00-\u9fa5])'), 'XXX'),
-]
+
+def redact_xlsx(input_path: str, output_path: str) -> dict:
+    """处理 .xlsx 文件（直接操作 XML，保持格式不变）"""
+    tmp_dir = Path(tempfile.mkdtemp(prefix="redact_xlsx_"))
+    counts = {}
+
+    try:
+        with zipfile.ZipFile(input_path, "r") as zf:
+            zf.extractall(tmp_dir)
+
+        # ① 共享字符串表（Excel 最常用文本存储位置）
+        shared = tmp_dir / "xl" / "sharedStrings.xml"
+        if shared.exists():
+            counts.update(_process_xml_file(shared, "共享字符串"))
+
+        # ② 工作表 XML（内联文本）
+        ws_dir = tmp_dir / "xl" / "worksheets"
+        if ws_dir.exists():
+            for ws in sorted(ws_dir.glob("sheet*.xml")):
+                c = _process_xml_file(ws, ws.name)
+                _merge_counts(counts, c)
+
+        # ③ 批注
+        for cm in sorted(tmp_dir.glob("xl/comments*.xml")):
+            _process_xml_file(cm, f"批注 {cm.name}")
+
+        # ④ 页眉页脚
+        for hf in sorted(tmp_dir.rglob("header*.xml")):
+            _process_xml_file(hf, f"页眉 {hf.name}")
+        for hf in sorted(tmp_dir.rglob("footer*.xml")):
+            _process_xml_file(hf, f"页脚 {hf.name}")
+
+        # ⑤ 文档属性
+        core = tmp_dir / "docProps" / "core.xml"
+        if core.exists():
+            _process_xml_file(core, "文档属性")
+
+        # 重新打包（保持 ZIP 压缩级别）
+        with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for fp in sorted(tmp_dir.rglob("*")):
+                if fp.is_file():
+                    arcname = str(fp.relative_to(tmp_dir))
+                    zf.write(fp, arcname)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    return counts
 
 
-def apply_redactions(text: str) -> str:
-    if not text:
-        return text
-    result = text
-    for pattern, replacement in REPLACEMENTS:
-        result = pattern.sub(replacement, result)
-    return result
+def _process_xml_file(path: Path, label: str = "") -> dict:
+    """读取 XML 文件 → 执行脱敏 → 写回（仅在有变化时）"""
+    try:
+        content = path.read_text("utf-8")
+        original = content
+        redacted = apply_redactions(content)
+        if redacted != original:
+            path.write_text(redacted, "utf-8")
+            print(f"  [更新] {label or path.name}")
+    except Exception as e:
+        print(f"  [警告] 处理 {label or path.name} 出错: {e}", file=sys.stderr)
+    return {}
 
 
-def redact_xlsx(input_path: str, output_path: str = None) -> str:
-    """处理 .xlsx 文件（直接操作 XML）"""
+def _merge_counts(base: dict, new: dict) -> None:
+    for k, v in new.items():
+        base[k] = base.get(k, 0) + v
+
+
+# ---------------------------------------------------------------------------
+# .xls 处理（Excel 97-2003 二进制格式）
+# ---------------------------------------------------------------------------
+
+def redact_xls(input_path: str, output_path: str) -> dict:
+    """
+    处理 .xls 文件（BIFF8/Biff5 二进制格式）。
+    使用 xlrd 读取内容，xlwt 写入（公式结果被脱敏，公式本身保留）。
+    注意：.xls 二进制格式不支持保留宏/图表，仅处理单元格文本和批注。
+    """
+    import xlrd
+    import xlwt
+
+    counts = {}
+
+    try:
+        book = xlrd.open_workbook(input_path, formatting_info=False)
+    except Exception as e:
+        print(f"  [警告] xlrd 无法打开 .xls 文件: {e}，尝试直接复制原文件（跳过内容处理）")
+        shutil.copy2(input_path, output_path)
+        return counts
+
+    wb_new = xlwt.Workbook(encoding="utf-8")
+    style_base = xlwt.XFStyle()
+
+    for sheet_idx in range(book.nsheets):
+        sheet = book.sheet_by_index(sheet_idx)
+        ws_new = wb_new.add_sheet(sheet.name, cell_overwrite_ok=True)
+
+        for row_idx in range(sheet.nrows):
+            for col_idx in range(sheet.ncols):
+                cell = sheet.cell(row_idx, col_idx)
+                ctype, value, _ = cell
+
+                if ctype == xlrd.XL_CELL_TEXT:
+                    redacted = apply_redactions(value)
+                    ws_new.write(row_idx, col_idx, redacted, style_base)
+                    if redacted != value:
+                        _count_type(counts, value)
+                elif ctype == xlrd.XL_CELL_DATE:
+                    # 日期以序列值存储，脱敏为占位符
+                    ws_new.write(row_idx, col_idx, "YYYY/MM/DD", style_base)
+                    _count_type(counts, "日期")
+                else:
+                    # 其他类型（数字、布尔等）保留原值
+                    try:
+                        ws_new.write(row_idx, col_idx, value, style_base)
+                    except Exception:
+                        ws_new.write(row_idx, col_idx, str(value), style_base)
+
+        # 处理批注
+        try:
+            if hasattr(sheet, "cell_comments"):
+                for (row, col), comment in sheet.cell_comments.items():
+                    if comment and comment.text:
+                        redacted = apply_redactions(comment.text)
+                        if redacted != comment.text:
+                            _count_type(counts, "批注")
+        except Exception:
+            pass
+
+    wb_new.save(output_path)
+    return counts
+
+
+def _count_type(counts: dict, label: str) -> None:
+    counts[label] = counts.get(label, 0) + 1
+
+
+# ---------------------------------------------------------------------------
+# 入口
+# ---------------------------------------------------------------------------
+
+def redact_excel(input_path: str, output_path: str = None) -> dict:
+    """
+    统一入口，自动根据扩展名分发到 xlsx 或 xls 处理函数。
+    返回各类脱敏统计。
+    """
     if output_path is None:
         stem = Path(input_path).stem
         output_path = str(Path(input_path).with_name(f"{stem}_脱敏.xlsx"))
 
-    tmp_dir = Path('/tmp/redact_xlsx_tmp')
-    if tmp_dir.exists():
-        shutil.rmtree(tmp_dir)
-    tmp_dir.mkdir(parents=True)
+    ext = Path(input_path).suffix.lower()
+    counts = {}
 
-    with zipfile.ZipFile(input_path, 'r') as zf:
-        zf.extractall(tmp_dir)
+    if ext == ".xlsx":
+        counts = redact_xlsx(input_path, output_path)
+    elif ext == ".xls":
+        # .xls 输出仍保存为 .xls（xlwt 不支持 .xlsx 输出）
+        xls_output = str(Path(output_path).with_suffix(".xls"))
+        counts = redact_xls(input_path, xls_output)
+        # 如果用户指定了其他扩展名，复制一份
+        if xls_output != output_path:
+            shutil.copy2(xls_output, output_path)
+    else:
+        print(f"[错误] 不支持的文件格式: {ext}（仅支持 .xlsx 和 .xls）", file=sys.stderr)
+        sys.exit(1)
 
-    # 处理共享字符串表（最常见文本存储位置）
-    shared_strings = tmp_dir / 'xl' / 'sharedStrings.xml'
-    if shared_strings.exists():
-        try:
-            content = shared_strings.read_text('utf-8')
-            original = content
-            content = apply_redactions(content)
-            if content != original:
-                shared_strings.write_text(content, 'utf-8')
-                print(f"  [处理] sharedStrings.xml 已更新")
-        except Exception as e:
-            print(f"  [警告] 处理 sharedStrings.xml 时出错: {e}", file=sys.stderr)
-
-    # 处理工作表 XML（单元格内联文本）
-    worksheets = list((tmp_dir / 'xl' / 'worksheets').glob('sheet*.xml'))
-    for ws in worksheets:
-        try:
-            content = ws.read_text('utf-8')
-            original = content
-            content = apply_redactions(content)
-            if content != original:
-                ws.write_text(content, 'utf-8')
-        except Exception as e:
-            print(f"  [警告] 处理 {ws.name} 时出错: {e}", file=sys.stderr)
-
-    # 处理批注
-    comments = list((tmp_dir / 'xl').glob('comments*.xml'))
-    for cm in comments:
-        try:
-            content = cm.read_text('utf-8')
-            content = apply_redactions(content)
-            cm.write_text(content, 'utf-8')
-        except Exception:
-            pass
-
-    # 处理文档属性
-    core_props = tmp_dir / 'docProps' / 'core.xml'
-    if core_props.exists():
-        try:
-            content = core_props.read_text('utf-8')
-            content = apply_redactions(content)
-            core_props.write_text(content, 'utf-8')
-        except Exception:
-            pass
-
-    # 重新打包
-    with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-        for file_path in tmp_dir.rglob('*'):
-            if file_path.is_file():
-                arcname = file_path.relative_to(tmp_dir)
-                zf.write(file_path, arcname)
-
-    shutil.rmtree(tmp_dir)
-    print(f"[完成] 脱敏文档已保存至: {output_path}")
-    return output_path
+    total = sum(counts.values())
+    print(f"[完成] 共遮盖 {total} 处敏感内容，结果保存至: {output_path}")
+    if counts:
+        for label, n in sorted(counts.items(), key=lambda x: -x[1]):
+            print(f"         - {label}: {n} 处")
+    return counts
 
 
 def main():
     if len(sys.argv) < 2:
-        print("用法: python3 redact_excel.py <输入文件.xlsx> [输出文件路径]")
+        print("用法: python3 redact_excel.py <输入文件.xlsx/.xls> [输出文件路径]")
         sys.exit(1)
 
     input_file = sys.argv[1]
     output_file = sys.argv[2] if len(sys.argv) > 2 else None
-
-    ext = Path(input_file).suffix.lower()
-    if ext in ('.xlsx', '.xls'):
-        redact_xlsx(input_file, output_file)
-    else:
-        print(f"[错误] 不支持的文件格式: {ext}", file=sys.stderr)
-        sys.exit(1)
+    redact_excel(input_file, output_file)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
