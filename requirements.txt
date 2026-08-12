@@ -1,0 +1,31 @@
+# Core dependencies
+lxml>=4.9.0
+openpyxl>=3.1.0
+python-docx>=1.1.0
+python-pptx>=0.6.23
+Pillow>=10.0.0
+numpy>=1.24.0
+opencv-python>=4.8.0
+
+# PDF processing
+PyMuPDF>=1.23.0
+
+# OCR
+pytesseract>=0.3.10
+tesseract
+
+# Excel legacy format
+xlrd>=2.0.1
+xlwt>=1.3.0
+
+# LLM client
+requests>=2.31.0
+
+# Utilities
+tqdm>=4.66.0
+chardet>=4.0.0
+olefile>=0.46
+
+# Testing
+pytest>=7.4.0
+pytest-cov>=4.1.0
