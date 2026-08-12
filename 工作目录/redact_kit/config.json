@@ -1,0 +1,35 @@
+{
+  "_comment": "LLM增强文档脱敏工具包配置文件",
+  "llm": {
+    "provider": "openai",
+    "base_url": "https://api.minimaxi.com/v1",
+    "api_key": "sk-cp-RK-uJ7jY2NDnmS2NMuTPYVvp3Wcs3PrdOdOaKdH0TNiWKr7iV7dgkGqXH5FIhhaVWCPhLvQGSzwjhIfDoQYdq9ZFUP7koj1GH7DYy23o9oPoeuyaFrlIDXE",
+    "model": "MiniMax-Text-01",
+    "temperature": 0.0,
+    "max_tokens": 8192,
+    "_comment": "provider支持: openai(兼容OpenAI格式)/minimax/dashscope  api_key为空时自动启用DEMO_MOCK模式"
+  },
+  "ocr": {
+    "engine": "tesseract",
+    "tesseract_cmd": "/opt/homebrew/bin/tesseract",
+    "lang": "chi_sim+eng",
+    "_comment": "engine支持: tesseract/paddle  tesseract需系统安装并配置语言包"
+  },
+  "editor_sdk": {
+    "python_path": "/Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked/resources/builtin-skills/tencent-local-office-edit/edsdk.py"
+  },
+  "redaction": {
+    "bank_replacement": "XX银行",
+    "branch_replacement": "XX",
+    "person_replacement": "XXX",
+    "date_format": "YYYY/MM/DD",
+    "date_format_chinese": "YYYY年MM月DD日",
+    "phone_format": "138****{last4}",
+    "confidence_high": 0.90,
+    "confidence_medium": 0.70
+  },
+  "output": {
+    "report_format": "json",
+    "save_intermediate": true
+  }
+}
