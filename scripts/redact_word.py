@@ -1,3 +1,4 @@
+from typing import Optional
 #!/usr/bin/env python3
 """
 redact_word.py - Word 文档脱敏脚本
@@ -224,7 +225,7 @@ def _merge_counts(base: dict, new: dict) -> None:
 # .doc 处理（通过 LibreOffice 转换为 .docx）
 # ---------------------------------------------------------------------------
 
-def _find_converter() -> str | None:
+def _find_converter() -> Optional[str]:
     """查找 LibreOffice 路径"""
     for cmd in ["soffice", "libreoffice"]:
         r = shutil.run(["which", cmd], capture_output=True, text=True)

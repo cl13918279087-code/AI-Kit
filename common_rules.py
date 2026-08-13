@@ -202,7 +202,7 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
         r'正(?=月)'
         r')'
     )
-    day_pat = r'[^月]+(?=日)'
+    day_pat = r'(?:月)?[^月\s]+(?=日)'
 
     # 中文日期范围：2022年4月8日至2022年4月10日
     patterns.append((
@@ -265,14 +265,19 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
             b.replace("中国", "").replace("银行", "") for b in bank_names
             if "银行" in b and len(b) <= 6
         ]
+        # 银行名正则：直接匹配全称，优先长匹配
         bank_pattern = (
-            r'(?:(?:中国|交通|招商|浦发|兴业|民生|华夏|平安|光大|广发|浙商|渤海|恒丰|'
-            r'农业|建设|工商|南京|宁波|杭州|深圳|上海|北京|广州|郑州|重庆|天津|成都|西安|'
-            r'苏州|武汉|长沙|青岛|济南|大连|沈阳|哈尔滨|长春|石家庄|福州|厦门|南昌|合肥|'
-            r'昆明|贵阳|南宁|海口|太原|兰州|呼和浩特|乌鲁木齐)银行|'
-            r'(?:农信社|信用社|农商银行|合作银行|人民银行|'
-            r'海峡|农商|城商|村镇|股份|合行))'
-            r'(?:[^\x00-\xFF]{0,20}银行)?'
+            r'(?:'
+            # 全称：前缀(中国/农业/工商/...) + [0-8汉字中间词] + 银行
+            r'(?:中国|农业|建设|工商|交通|招商|浦发|兴业|民生|华夏|平安|光大|广发|浙商|渤海|恒丰|'
+            r'邮政储蓄|人民银行)(?:[^\x00-\xFF]{0,8})?银行|'
+            # 农信/农商/村镇等 + [0-8汉字] + 银行
+            r'(?:农信社|信用社|农商银行|合作银行|村镇银行|农村商业银行|海峡|城商)(?:[^\x00-\xFF]{0,8})?银行|'
+            # 独立城市名+银行（无中间词）
+            r'(?:北京|上海|南京|宁波|杭州|深圳|广州|郑州|重庆|天津|成都|西安|'
+            r'苏州|武汉|长沙|青岛|济南|大连|沈阳|哈尔滨|长春|石家庄|福州|厦门|'
+            r'南昌|合肥|昆明|贵阳|南宁|海口|太原|兰州|呼和浩特|乌鲁木齐)银行'
+            r')'
         )
         patterns.append((
             re.compile(bank_pattern),
@@ -291,16 +296,15 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
             rep.get("ORG", "XXXX")
         ))
 
-    # ---------- 13. 人员姓名（2-4个汉字，排除已知非姓名词） ----------
-    # 在 common 层只做粗筛，精确姓名识别交给 entity_detector 的 LLM 层
+    # ---------- 13. 人员姓名（2-3个汉字，粗筛） ----------
+    # Python 3.9 不支持变长 lookbehind，移除 excluded 检查
+    # 精确排除由 entity_detector 角色词层处理
     surname_alt = '|'.join(re.escape(s) for s in SURNAME_SET)
-    excluded_alt = '|'.join(re.escape(w) for w in EXCLUDED_COMMON_WORDS)
     patterns.append((
         re.compile(
             rf'(?<![a-zA-Z0-9\u4e00-\u9fa5])'
-            rf'(?:{surname_alt})[\u4e00-\u9fa5]{{1,3}}'
+            rf'(?:{surname_alt})[\u4e00-\u9fa5]{{0,2}}'
             rf'(?![a-zA-Z0-9\u4e00-\u9fa5])'
-            rf'(?<!(?:{excluded_alt}))'
         ),
         rep.get("NAME", "XXX")
     ))

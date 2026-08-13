@@ -1,3 +1,4 @@
+from typing import Optional
 #!/usr/bin/env python3
 """
 redact_ppt.py - PPT 演示文稿脱敏脚本
@@ -213,7 +214,7 @@ def _redact_bank_logos(media_dir: Path) -> None:
 # .ppt 处理（转换为 .pptx 后处理）
 # ---------------------------------------------------------------------------
 
-def _find_converter() -> str | None:
+def _find_converter() -> Optional[str]:
     """查找可用的 PPT 转换工具"""
     # LibreOffice（跨平台）
     for cmd in ["soffice", "libreoffice"]:
