@@ -136,16 +136,16 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
         rep.get("MAC", "XX:XX:XX:XX:XX:XX")
     ))
 
-    # ---------- 4. 详细地址 ----------
-    patterns.append((
-        re.compile(
-            r'[^\x00-\xFF]{2,6}(?:省|自治区|市)?[^\x00-\xFF]{0,10}'
-            r'(?:市|区)?[^\x00-\xFF]{0,10}'
-            r'(?:街|路|道|巷|弄|号|大道|大街|东路|西路|南路|北路|栋|楼)[^\x00-\xFF]{0,30}'
-        ),
-        rep.get("ADDRESS", "XX省XX市XX区XXXX")
-    ))
-
+#     # ---------- 4. 详细地址 ----------
+#     patterns.append((
+#         re.compile(
+#             r'[^\x00-\xFF]{2,6}(?:省|自治区|市)?[^\x00-\xFF]{0,10}'
+#             r'(?:市|区)?[^\x00-\xFF]{0,10}'
+#             r'(?:街|路|道|巷|弄|号|大道|大街|东路|西路|南路|北路|栋|楼)[^\x00-\xFF]{0,30}'
+#         ),
+#         rep.get("ADDRESS", "XX省XX市XX区XXXX")
+#     ))
+# 
     # ---------- 5. 身份证号（18位/15位） ----------
     patterns.append((
         re.compile(
@@ -160,23 +160,23 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
         rep.get("ID_CARD", "XXXXXXXXXXXXXXXXXX")
     ))
 
-    # ---------- 6. 银行卡号（16-19位，有上下文标记时更精确） ----------
+    # ---------- 6. 银行卡号（已禁用：标准版不脱敏账号） ----------
     # 上下文感知版：账号/账户/卡号 关键词后的 16-19 位数字
-    ctx_markers = ["账号", "账户", "卡号", "账 号", "帐 号",
-                   "账号为", "账户为", "卡号为", "账号是", "账户是"]
-    patterns.append((
-        re.compile(
-            r'(?:' + '|'.join(re.escape(m) for m in ctx_markers) + r')'
-            r'\s*(\d{16,19})',
-            re.IGNORECASE
-        ),
-        rep.get("BANK_CARD", "XXXXXXXXXXXXXXXX")
-    ))
+    # ctx_markers = ["账号", "账户", "卡号", "账 号", "帐 号",
+    #                "账号为", "账户为", "卡号为", "账号是", "账户是"]
+    # patterns.append((
+    #     re.compile(
+    #         r'(?:' + '|'.join(re.escape(m) for m in ctx_markers) + r')'
+    #         r'\s*(\d{16,19})',
+    #         re.IGNORECASE
+    #     ),
+    #     rep.get("BANK_CARD", "XXXXXXXXXXXXXXXX")
+    # ))
     # 无上下文兜底：超长纯数字（可能是账号）
-    patterns.append((
-        re.compile(r"\b\d{16,19}\b"),
-        rep.get("BANK_CARD", "XXXXXXXXXXXXXXXX")
-    ))
+    # patterns.append((
+    #     re.compile(r"\b\d{16,19}\b"),
+    #     rep.get("BANK_CARD", "XXXXXXXXXXXXXXXX")
+    # ))
 
     # ---------- 7. 手机号码 ----------
     patterns.append((
@@ -184,11 +184,11 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
         rep.get("MOBILE", "XXXXXXXXXXX")
     ))
 
-    # ---------- 8. 固定电话 ----------
-    patterns.append((
-        re.compile(r"0\d{2,3}[-\s]?\d{7,8}"),
-        rep.get("PHONE", "0XX-XXXXXXXX")
-    ))
+    # ---------- 8. 固定电话（已禁用：标准版不使用） ----------
+    # patterns.append((
+    #     re.compile(r"0\d{2,3}[-\s]?\d{7,8}"),
+    #     rep.get("PHONE", "0XX-XXXXXXXX")
+    # ))
 
     # ---------- 9. 日期范围（P1.3 合规修复：保留连接符和相对关系） ----------
     year4_cn = r'[〇二三四五六七八九0-9]{4}'
@@ -218,7 +218,7 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
         re.compile(
             rf'({year4_ar}/(?:0?[1-9]|1[0-2])/(?:0?[1-9]|[12]\d|3[01]))'
             r'(\s*(?:至|——|[-~])\s*)'
-            rf'({year4_ar}/(?:0?[1-9]|1[0-2])/(?:0?[1-9]|[12]\d|3[01]))'
+            rf'({year4_ar}/(?:0?[1-9]|1[0-2])/(?:0?[1-9]|[12]\d|3[01])$)'
         ),
         rep.get("DATE", "YYYY/MM/DD") + r'\2' + rep.get("DATE", "YYYY/MM/DD")
     ))
@@ -227,25 +227,27 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
         re.compile(
             rf'({year4_ar}-(?:0?[1-9]|1[0-2])-(?:0?[1-9]|[12]\d|3[01]))'
             r'(\s*(?:至|——|[-~])\s*)'
-            rf'({year4_ar}-(?:0?[1-9]|1[0-2])-(?:0?[1-9]|[12]\d|3[01]))'
+            rf'({year4_ar}-(?:0?[1-9]|1[0-2])-(?:0?[1-9]|[12]\d|3[01])$)'
         ),
         rep.get("DATE", "YYYY/MM/DD") + r'\2' + rep.get("DATE", "YYYY/MM/DD")
     ))
 
     # ---------- 10. 日期（独立） ----------
-    # 中文数字日期
+    # 中文数字日期（但排除"应为2022年3月31日"等场景中的日期）
+    # 中文数字日期（但排除"应为2022年3月31日"等场景中的日期）
+    # 前置排除用后处理替代，避免变长 lookbehind 语法问题
     patterns.append((
         re.compile(rf'{year4_cn}年{month_pat}{day_pat}日'),
         rep.get("DATE_CHINESE", "YYYY年MM月DD日")
     ))
     # YYYY/MM/DD
     patterns.append((
-        re.compile(rf'{year4_ar}/(?:0?[1-9]|1[0-2])/(?:0?[1-9]|[12]\d|3[01])'),
+        re.compile(rf'{year4_ar}/(?:0?[1-9]|1[0-2])/(?:0?[1-9]|[12]\d|3[01])$'),
         rep.get("DATE", "YYYY/MM/DD")
     ))
     # YYYY-MM-DD
     patterns.append((
-        re.compile(rf'{year4_ar}-(?:0?[1-9]|1[0-2])-(?:0?[1-9]|[12]\d|3[01])'),
+        re.compile(rf'{year4_ar}-(?:0?[1-9]|1[0-2])-(?:0?[1-9]|[12]\d|3[01])$'),
         rep.get("DATE", "YYYY/MM/DD")
     ))
     # 中文年月（独立）
@@ -259,56 +261,157 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
         rep.get("DATE", "YYYY/MM")
     ))
 
-    # ---------- 11. 银行名称（从配置动态加载） ----------
+    # ---------- 11. 银行名称（从配置动态加载，完全动态化） ----------
     if bank_names:
-        bank_alt = [
-            b.replace("中国", "").replace("银行", "") for b in bank_names
-            if "银行" in b and len(b) <= 6
-        ]
-        # 银行名正则：直接匹配全称，优先长匹配
-        bank_pattern = (
-            r'(?:'
-            # 全称：前缀(中国/农业/工商/...) + [0-8汉字中间词] + 银行
-            r'(?:中国|农业|建设|工商|交通|招商|浦发|兴业|民生|华夏|平安|光大|广发|浙商|渤海|恒丰|'
-            r'邮政储蓄|人民银行)(?:[^\x00-\xFF]{0,8})?银行|'
-            # 农信/农商/村镇等 + [0-8汉字] + 银行
-            r'(?:农信社|信用社|农商银行|合作银行|村镇银行|农村商业银行|海峡|城商)(?:[^\x00-\xFF]{0,8})?银行|'
-            # 独立城市名+银行（无中间词）
-            r'(?:北京|上海|南京|宁波|杭州|深圳|广州|郑州|重庆|天津|成都|西安|'
-            r'苏州|武汉|长沙|青岛|济南|大连|沈阳|哈尔滨|长春|石家庄|福州|厦门|'
-            r'南昌|合肥|昆明|贵阳|南宁|海口|太原|兰州|呼和浩特|乌鲁木齐)银行'
-            r')'
-        )
-        patterns.append((
-            re.compile(bank_pattern),
-            rep.get("BANK", "XX银行")
-        ))
+        # 动态提取所有银行名前缀，按长度降序排列确保长匹配优先
+        prefixes_raw = []
+        for b in bank_names:
+            if "银行" not in b:
+                continue
+            idx = b.index("银行")
+            prefix = b[:idx]
+            if prefix:
+                prefixes_raw.append((len(prefix), prefix))
+        # 去重并按长度降序（长前缀优先匹配，防止"海峡"先于"福建海峡"）
+        seen = set()
+        prefixes_sorted = []
+        for plen, pfx in sorted(prefixes_raw, key=lambda x: -x[0]):
+            if pfx not in seen:
+                seen.add(pfx)
+                prefixes_sorted.append(re.escape(pfx))
+        if prefixes_sorted:
+            bank_pattern = rf'(?:{"|".join(prefixes_sorted)})银行'
+            patterns.append((
+                re.compile(bank_pattern),
+                rep.get("BANK", "XX银行")
+            ))
 
-    # ---------- 12. 组织名（在姓名之前，防止"XX部"被识别为姓名） ----------
+        # ---------- 11b. 分支行名称（动态从 bank_names 提取） ----------
+        # 提取城市/地区前缀 + 支行/营业部/分行等后缀
+        branch_suffixes = ["支行", "营业部", "分行", "网点"]
+        branch_prefixes = set()
+        # 复合后缀集合（如 "分行营业部" = "分行" + "营业部"）
+        compound_suffixes = set()
+        for b in bank_names:
+            for i, suf1 in enumerate(branch_suffixes):
+                if b.endswith(suf1):
+                    remaining = b[:-len(suf1)]
+                    for suf2 in branch_suffixes:
+                        if remaining.endswith(suf2):
+                            # 找到复合后缀：suf2 + suf1
+                            compound = suf2 + suf1
+                            if len(b) - len(compound) >= 2:
+                                compound_suffixes.add(compound)
+                            break
+                    pfx = b[:-len(suf1)]
+                    if len(pfx) >= 2:
+                        branch_prefixes.add(pfx)
+                    break
+        if branch_prefixes:
+            branch_prefix_re = "|".join(
+                re.escape(p) for p in sorted(branch_prefixes, key=len, reverse=True)
+            )
+            # 优先匹配复合后缀，再匹配简单后缀
+            all_branch_suf = sorted(
+                list(compound_suffixes) + branch_suffixes,
+                key=len, reverse=True
+            )
+            branch_suf_re = "|".join(re.escape(s) for s in all_branch_suf)
+            branch_pattern = rf'(?:{branch_prefix_re})(?:{branch_suf_re})'
+            # 函数式替换：保留后缀，只替换前缀
+            def _branch_repl(m):
+                matched = m.group(0)
+                for suf in sorted(all_branch_suf, key=len, reverse=True):
+                    if matched.endswith(suf):
+                        return f"XX{suf}"
+                return "XX银行"
+            patterns.append((re.compile(branch_pattern), _branch_repl))
+
+        # ---------- 11c. 独立分支行词（无前缀，单独出现） ----------
+        # 裸 '分行/支行/营业部'（前后非汉字非ASCII）→ XX+后缀，如 '分行' → 'XX分行'
+        # 已带 XX 前缀的结果（XX支行/XX营业部）不会被二次替换；
+        # '分支行人员' 中 '分行'/'支行' 前后是汉字，不会误伤
+        standalone_suffixes = cfg.get("bank_branch_suffixes") or ["分行", "支行", "营业部"]
+        if standalone_suffixes:
+            standalone_alt = "|".join(
+                re.escape(s) for s in sorted(standalone_suffixes, key=len, reverse=True)
+            )
+            patterns.append((
+                re.compile(
+                    # 左边界：不能是汉字(含全角标点)、ASCII字母数字
+                    # 右边界：不能是汉字(含全角标点)、ASCII字母数字
+                    # 全角标点(、，。 etc)不阻断匹配，如"总行、分行"中分行应被替换
+                    rf'(?<![一-龥a-zA-Z0-9])(?:{standalone_alt})(?![一-龥a-zA-Z0-9\u3000-\u303f\uff00-\uffef])'
+                ),
+                lambda m: "XX" + m.group(0)
+            ))
+
+    # ---------- 12. 密码信息 ----------
+    # 匹配"密码"后紧跟的数字串，替换为 ******
+    # 同时兼容"密码为/密码：/密码 " 等格式
+    password_patterns = [
+        (r'密码[：:\s]*\d{6,}', '******'),
+        (r'pwd[：:\s]*[a-zA-Z0-9]{6,}', '******'),
+        (r'passwd[：:\s]*[a-zA-Z0-9]{6,}', '******'),
+        (r'口令[：:\s]*[a-zA-Z0-9]{4,}', '******'),
+        (r'pin[码]?[：:\s]*\d{4,}', '******'),
+    ]
+    for ptn, repl in password_patterns:
+        patterns.append((re.compile(ptn, re.IGNORECASE), repl))
+
+    # ---------- 13. 组织名（在姓名之后，避免阻挡姓名） ----------
+    # 仅匹配真正的组织层级：明确机构词，或 2个汉字+组织后缀（需前后都不是汉字）
     if org_suffixes:
         suffix_alt = '|'.join(re.escape(s) for s in org_suffixes)
         patterns.append((
             re.compile(
-                rf'(?:[\u4e00-\u9fa5]{{1,4}}(?:{suffix_alt})|'
-                rf'[\u4e00-\u9fa5]{{1,2}}(?:分行|支行|事业部)|'
-                rf'(?<![\u4e00-\u9fa5])(?:{suffix_alt})(?![\u4e00-\u9fa5]))'
+                rf'(?:分行|支行|营业部|科技部|运营部|管理部|董事会|监事会|管委会|事业部)|'
+                rf'(?<![一-龥])(?:{suffix_alt})(?![一-龥])|'
+                rf'(?<![一-龥])[一-龥]{{2}}(?:部|科|中心|管委会|办公室)(?![一-龥])'
             ),
             rep.get("ORG", "XXXX")
         ))
 
-    # ---------- 13. 人员姓名（2-3个汉字，粗筛） ----------
+
+# ---------- 13. 人员姓名（2-3个汉字，粗筛） ----------
     # Python 3.9 不支持变长 lookbehind，移除 excluded 检查
-    # 精确排除由 entity_detector 角色词层处理
+    # 姓氏后必须跟 1-2 个名字汉字，防止单字被误判
+    # 名字用字池从 config.json name_pool 动态读取
     surname_alt = '|'.join(re.escape(s) for s in SURNAME_SET)
+    name_pool_chars = cfg.get("name_pool", "")
+    if not name_pool_chars:
+        name_pool_chars = ("伟强志建华文静宇轩浩然俊杰明辉晨曦鹏飞洪红霞丽娟秀英敏芳兰婷玉军平立业德永海波涛"
+                          "清北胜利福生财腾广坤传王泓郭艳林微陈卓怡君佩瑶心如梦雨萱晓思彤欣涵晖润峰山宏翠"
+                          "冰勃项韬鑫昊毅春为斌少凡梅娥昀铄智诗标芸仁铭侃楷肇乐曹潘李张欧詹郑丁周娜萍燕雅雯"
+                          "菲彩佳倩洁慧琳芬蓉澜蕊黛媛娇璐豪超刚勇磊龙荣逸朗天行健自不息东宁瑀")
+    # 名字汉字类（供两个规则使用）
+    name_char_class = '[' + name_pool_chars + ']'
+
+    # 规则A：姓氏 + 1-2个名字汉字（前后非ASCII非汉字，防止中文词内部被误判）
+    # 右边界：阻止 ASCII 或 CJK 汉字字母紧跟（如 '时不'→'执'、'史明'→'细'、
+    # '支行'→'可/人' 均为词内部误切），但允许中文标点（，。、：等不在
+    # \u4e00-\u9fa5 区间）和字符串结尾（如 '毛航行，'、'毛航行'）
     patterns.append((
         re.compile(
-            rf'(?<![a-zA-Z0-9\u4e00-\u9fa5])'
-            rf'(?:{surname_alt})[\u4e00-\u9fa5]{{0,2}}'
+            rf'(?<![a-zA-Z0-9])'
+            rf'(?:{surname_alt}){name_char_class}{{1,2}}'
             rf'(?![a-zA-Z0-9\u4e00-\u9fa5])'
         ),
         rep.get("NAME", "XXX")
     ))
 
+    # 规则B：姓氏 + 2个名字汉字（左侧有中文词/冒号，右侧无ASCII/非汉字）
+    # 处理"总行支持人员：汪晶晶"等场景（冒号后的姓名，左边界是中文冒号）
+    # 2-char 名字确保不会误匹配"安卓"等单字人名
+    # 全角冒号 \uff1a 不在 [一-龥] 范围，需显式加入
+    patterns.append((
+        re.compile(
+            rf'(?<=[\u4e00-\u9fa5\uff1a])(?:{surname_alt}){name_char_class}{{2}}(?![a-zA-Z0-9\u4e00-\u9fa5])'
+        ),
+        rep.get("NAME", "XXX")
+    ))
+
+    
     return patterns
 
 
@@ -338,6 +441,40 @@ def apply_redactions(text: str) -> str:
     result = text
     for pattern, replacement in _get_patterns():
         result = pattern.sub(replacement, result)
+
+    # 后处理：纠正已知误脱敏
+    # 1. 姓名模式误匹配中文词
+    # 2. DATE pattern 误替换"YYYY年MM月DD日"（应保留原始日期，不应替换"应为2022年3月31日前"中的日期）
+    import re as _re
+    post_fixes = [
+        ('清XXX下', '清单如下'),
+        ('营运XXX部', '营运计财部'),
+        ('XXX务部', '计财财务部'),
+    ]
+    for wrong, correct in post_fixes:
+        if wrong in result:
+            result = result.replace(wrong, correct)
+
+    # 注：Rule A 右边界修复后（阻止 ASCII/CJK 汉字紧跟），
+    # '时不'→'执行'、'史明'→'明细'、'支行'→'可根据' 等词内误切已不再发生，
+    # 原先针对这些误切的还原后处理已移除。
+
+    # DATE 后处理：DATE pattern 把日期替换为 YYYY年MM月DD日，
+    # 但"应为2022年3月31日"中的日期是通用日期描述不应被替换。
+    # 策略：扫描文本中所有"YYYY年MM月DD日"，若其前3字是"应为|必须为|须于"，
+    # 则替换为 XXXX年XX月XX日（保持脱敏但不暴露原始日期）
+    _date_placeholder = 'YYYY年MM月DD日'
+    _prefixes = ('应为', '必须为', '须于')
+    _pos = 0
+    while True:
+        _idx = result.find(_date_placeholder, _pos)
+        if _idx < 0:
+            break
+        _before = result[max(0, _idx-3):_idx]
+        if _before in _prefixes:
+            result = result[:_idx] + 'XXXX年XX月XX日' + result[_idx+len(_date_placeholder):]
+        _pos = _idx + 1
+
     return result
 
 

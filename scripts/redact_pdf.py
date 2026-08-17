@@ -17,13 +17,15 @@ import sys
 import io
 import tempfile
 import shutil
+import subprocess
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from common_rules import apply_redactions
 
 # Tesseract 路径自动检测（从 config.json 读取）
-import shutil, platform
+import shutil
+import subprocess, platform
 _tesseract_paths = [
     r"/opt/homebrew/bin/tesseract",
     r"/usr/bin/tesseract",
@@ -33,7 +35,7 @@ _tesseract_paths = [
 for _p in _tesseract_paths:
     if os.path.exists(_p) or _p == 'tesseract':
         try:
-            shutil.run([_p, '--version'], capture_output=True, timeout=5)
+            subprocess.run([_p, '--version'], capture_output=True, timeout=5)
             pytesseract.pytesseract.tesseract_cmd = _p
             break
         except Exception:

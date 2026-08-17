@@ -17,6 +17,7 @@ import sys
 import re
 import zipfile
 import shutil
+import subprocess
 import tempfile
 import platform
 from pathlib import Path
@@ -218,7 +219,7 @@ def _find_converter() -> Optional[str]:
     """查找可用的 PPT 转换工具"""
     # LibreOffice（跨平台）
     for cmd in ["soffice", "libreoffice"]:
-        r = shutil.run(
+        r = subprocess.run(
             ["which", cmd], capture_output=True, text=True
         )
         if r.returncode == 0:
@@ -237,7 +238,7 @@ def redact_ppt_to_pptx(input_path: str, output_pptx: str) -> dict:
     if converter in ("soffice", "libreoffice"):
         tmp_dir = Path(tempfile.mkdtemp(prefix="ppt_convert_"))
         try:
-            result = shutil.run(
+            result = subprocess.run(
                 [
                     converter,
                     "--headless",

@@ -34,9 +34,9 @@ class LLMClient:
     """
 
     def __init__(self, config_path: Optional[str] = None):
+        import json as _json  # Python 3.9 compat: import inside function
         if config_path:
-            import json
-            self.cfg = json.load(open(config_path, encoding="utf-8"))
+            self.cfg = _json.load(open(config_path, encoding="utf-8"))
         else:
             # 尝试加载项目 config.json
             for p in [
@@ -44,7 +44,7 @@ class LLMClient:
                 Path(__file__).parent.parent / "config.json",
             ]:
                 if p.exists():
-                    self.cfg = json.load(open(p, encoding="utf-8"))
+                    self.cfg = _json.load(open(p, encoding="utf-8"))
                     break
             else:
                 self.cfg = {}
@@ -175,7 +175,6 @@ class LLMClient:
         response = self.chat(
             prompt=prompt,
             system=ENTITY_EXTRACTION_SYSTEM_PROMPT,
-            response_format="json",
             temperature=0.05,
         )
 
