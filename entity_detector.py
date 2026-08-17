@@ -127,42 +127,78 @@ class EntityDetector:
         return manifest
 
     def _llm_detect(self, text: str) -> List[SensitiveEntity]:
-        """LLM 智能检测（自动分段 + 重叠）"""
+        """LLM 智能检测：分段并行调用，汇总结果"""
         if not self.llm:
             return []
 
-        entities = []
-        chunks = self._split_for_llm(text)
+        # ---------- 分批策略：每批约 200 字，10 批并行 ----------
+        import threading, time
+        BATCH_SIZE = 200  # 每批字数
+        MAX_BATCHES = 10   # 最多并行批次数
+        TIMEOUT_PER_BATCH = 60  # 每批超时（秒）
 
-        for chunk in chunks:
-            chunk_text = chunk["text"]
-            overlap_suffix = chunk.get("overlap_suffix", "")
+        paragraphs = [p.strip() for p in text.split("\n") if p.strip()]
+        batches = []
+        current_batch = ""
+        for para in paragraphs:
+            if len(current_batch) + len(para) + 1 <= BATCH_SIZE:
+                current_batch += ("\n" if current_batch else "") + para
+            else:
+                if current_batch:
+                    batches.append(current_batch)
+                current_batch = para
+                if len(batches) >= MAX_BATCHES - 1:
+                    break
+        if current_batch and len(batches) < MAX_BATCHES:
+            batches.append(current_batch)
 
-            # 构造带重叠上下文的片段
-            context = f"...{overlap_suffix}" if overlap_suffix else ""
-            full_text = context + chunk_text
+        results = []
+        errors = []
 
+        def call_llm(batch_text, idx, result_list, error_list):
             try:
-                raw = self.llm.detect_sensitive_entities(full_text, context="")
-                for item in raw:
-                    text_val = item.get("text", "")
-                    # 去除重叠部分引入的前缀
-                    if overlap_suffix and text_val.startswith(overlap_suffix[:10]):
-                        text_val = text_val[len(overlap_suffix):]
-                    if not text_val:
-                        continue
-                    entities.append(SensitiveEntity(
-                        text=text_val,
-                        replacement=item.get("replacement", "XXX"),
-                        confidence=float(item.get("confidence", 0.80)),
-                        source="llm",
-                        category=item.get("category", "other"),
-                        evidence=item.get("evidence", ""),
-                    ))
+                raw = self.llm.detect_sensitive_entities(batch_text, context="")
+                result_list.append((idx, raw))
             except Exception as e:
-                logger.warning(f"LLM 检测片段失败: {e}")
+                error_list.append((idx, str(e)))
+
+        threads = []
+        result_holder = []
+        error_holder = []
+
+        for i, batch in enumerate(batches):
+            t = threading.Thread(target=call_llm, args=(batch, i, result_holder, error_holder))
+            t.daemon = True
+            t.start()
+            threads.append(t)
+
+        # 等待所有线程，带单批超时
+        overall_deadline = time.time() + TIMEOUT_PER_BATCH * len(batches)
+        for t in threads:
+            remaining = max(1, overall_deadline - time.time())
+            t.join(timeout=min(remaining, TIMEOUT_PER_BATCH))
+
+        # 解析结果
+        entities = []
+        for idx, raw in sorted(result_holder, key=lambda x: x[0]):
+            for item in raw:
+                text_val = (item.get("text") or "").strip()
+                if not text_val:
+                    continue
+                entities.append(SensitiveEntity(
+                    text=text_val,
+                    replacement=item.get("replacement", "XXX"),
+                    confidence=float(item.get("confidence", 0.80)),
+                    source="llm",
+                    category=item.get("category", "other"),
+                    evidence=item.get("evidence", ""),
+                ))
+
+        if error_holder:
+            logger.warning(f"LLM 分批调用失败: {error_holder}")
 
         return entities
+
 
     def _regex_detect_date_ranges(self, text: str) -> List[SensitiveEntity]:
         """Regex 兜底：日期范围（保留连接符）"""
@@ -257,3 +293,30 @@ class EntityDetector:
             return self.llm.parse_json_response(response)
         except json.JSONDecodeError:
             return {"error": "验证响应解析失败"}
+
+
+# ---------------------------------------------------------------------------
+# 工厂函数：构建 LLM 增强检测器（LLM 不可用时静默降级）
+# ---------------------------------------------------------------------------
+
+def build_llm_detector(config_path: Optional[str] = None) -> EntityDetector:
+    """
+    构建混合实体检测器（LLM + Regex + 角色词 三层）。
+
+    任何初始化失败（缺配置 / 无 API Key / 网络异常）都会静默降级为
+    纯规则检测器，绝不抛异常——保证脱敏流程永远可用。
+    """
+    cfg = None
+    try:
+        if config_path:
+            import json as _json
+            with open(config_path, encoding="utf-8") as f:
+                cfg = _json.load(f)
+        client = LLMClient(config_path=config_path) if config_path else LLMClient()
+        if not client.api_key:
+            logger.warning("LLM API Key 未配置，降级为纯规则检测（LLM 层跳过）")
+            print(f'  [DEBUG build_llm_detector] NO API KEY, returning EntityDetector(None, cfg)'); return EntityDetector(None, cfg)
+        return EntityDetector(client, cfg)
+    except Exception as e:
+        logger.warning("LLM 检测器初始化失败，降级为纯规则检测: %s", e)
+        return EntityDetector(None, cfg)
