@@ -65,7 +65,9 @@ PATTERNS: List[Tuple[re.Pattern, str]] = [
     # 7 固定电话
     (re.compile(r'0\d{2,3}[-\s]?\d{7,8}'), "0XX-XXXXXXXX"),
 
-    # 8 银行名称
+    # 8 银行名称（银行全称前缀 → XX银行）
+    #    策略：优先匹配较长银行名（全称如"海峡银行"），再匹配较短城市前缀（如"华夏"）
+    #    使用非捕获组 + 贪婪匹配确保正确替换顺序
     (re.compile(
         r'(?:(?:中国|交通|招商|浦发|兴业|民生|华夏|平安|光大|广发|浙商|渤海|恒丰|'
         r'农业|建设|工商|南京|宁波|杭州|深圳|上海|北京|广州|郑州|重庆|天津|成都|西安|'
@@ -77,30 +79,66 @@ PATTERNS: List[Tuple[re.Pattern, str]] = [
     ), "XX银行"),
 
     # 9 组织名（关键：在姓名之前！）
-    #    X+组织词：总体组/需求组/运营部/公司 等
-    #    策略：先匹配"汉字+组织词尾"，将"X组/X部/X公司"等整体替换为 XXXX
-    #    单独的组织词（组/部/公司）：替换为非汉字占位符，避免被姓名模式误捕
+    #    策略：仅在独立词边界（前面有分隔符）且前缀为纯汉字时替换
+    #    (a) 前缀必须是2-4个纯汉字（非ASCII/数字）
+    #    (b) 前面必须有分隔符（标点/空格/换行）或文本开头
+    #    (c) 排除"有限公司"、"合作公司"——公司类型后缀，不应脱敏
+    #    (d) 单独"公司"：前面需2+汉字，防止"作公司"误匹配
     (re.compile(
-        r'(?:[\u4e00-\u9fa5]{1,4}(?:组|部|公司|科|室|处|中心|运营(?![部科]))|'
-        r'[\u4e00-\u9fa5]{1,2}(?:分行|支行|事业部)|'
-        r'(?<![\u4e00-\u9fa5])(?:组|部|公司|科|室|处|中心|运营)(?![\u4e00-\u9fa5]))'
+        r'(?:(?:(?:(?<=[^\x00-\xFF])|(?<=^))'
+        r'(?!有限公司)(?!合作公司)(?!UAT)'
+        r'[^\x00-\xFF]{2,4}'
+        r'(?:组|部|科|室|处|中心|运营(?![部科]))))|'
+        r'(?:(?:(?<=[^\x00-\xFF])|(?<=^))'
+        r'(?!有限公司)(?!合作公司)'
+        r'[^\x00-\xFF]{2,4}'
+        r'(?:分行|支行|事业部))|'
+        r'(?:(?:(?<=[^\x00-\xFF])|(?<=^))'
+        r'(?!有限公司)(?!合作公司)'
+        r'[^\x00-\xFF]{2,4}公司(?=公司))'
     ), "XXXX"),
 
-    # 10 人员姓名（2~4个汉字，前后非字母数字，末尾不跟着组织词）
+    # 10 人员姓名（2~4个汉字，前后非字母数字）
+    #    排除以"公司"/"司"结尾的情况，防止"有限公司"等被误识别为姓名
     (re.compile(
         r'(?<![a-zA-Z0-9\u4e00-\u9fa5])'
         r'[\u4e00-\u9fa5]{2,4}'
-        r'(?![a-zA-Z0-9\u4e00-\u9fa5])'
+        r'(?!(?:公司|司))(?:(?![a-zA-Z0-9\u4e00-\u9fa5])|$)'
     ), "XXX"),
 ]
 
 
 def apply_redactions(text: str) -> str:
+    """
+    执行链式脱敏替换。
+    
+    保护性替换策略：
+      1. 先将"合作公司"/"有限公司"等常见误匹配短语临时替换为占位符
+      2. 执行常规 PATTERNS 替换
+      3. 恢复占位符（占位符本身不会被任何 pattern 匹配）
+    """
     if not text or not isinstance(text, str):
         return text
+    
+    # 占位符（UUID，确保不会与原文冲突）
+    _PROTECTED = {
+        '\x00有XXXX': '有限公司',
+        '\x00合作XXXX': '合作公司',
+    }
+    
+    # Step 1: 保护易误匹配短语
     result = text
+    for placeholder, original in _PROTECTED.items():
+        result = result.replace(original, placeholder)
+    
+    # Step 2: 执行常规替换
     for pattern, replacement in PATTERNS:
         result = pattern.sub(replacement, result)
+    
+    # Step 3: 恢复被保护的短语
+    for placeholder, original in _PROTECTED.items():
+        result = result.replace(placeholder, original)
+    
     return result
 
 
