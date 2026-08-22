@@ -84,61 +84,95 @@ PATTERNS: List[Tuple[re.Pattern, str]] = [
     #    (b) 前面必须有分隔符（标点/空格/换行）或文本开头
     #    (c) 排除"有限公司"、"合作公司"——公司类型后缀，不应脱敏
     #    (d) 单独"公司"：前面需2+汉字，防止"作公司"误匹配
+    #    (e) 2-char词组前面须为ASCII/空格/换行/行首，防止"建设"/"总体"等被误匹配
     (re.compile(
-        r'(?:(?:(?:(?<=[^\x00-\xFF])|(?<=^))'
+        r'(?:(?:(?:(?<=[ -~])|(?<=^))'
         r'(?!有限公司)(?!合作公司)(?!UAT)'
         r'[^\x00-\xFF]{2,4}'
         r'(?:组|部|科|室|处|中心|运营(?![部科]))))|'
-        r'(?:(?:(?<=[^\x00-\xFF])|(?<=^))'
+        r'(?:(?:(?<=[ -~])|(?<=^))'
         r'(?!有限公司)(?!合作公司)'
         r'[^\x00-\xFF]{2,4}'
         r'(?:分行|支行|事业部))|'
-        r'(?:(?:(?<=[^\x00-\xFF])|(?<=^))'
+        r'(?:(?:(?<=[ -~])|(?<=^))'
         r'(?!有限公司)(?!合作公司)'
         r'[^\x00-\xFF]{2,4}公司(?=公司))'
     ), "XXXX"),
 
     # 10 人员姓名（2~4个汉字，前后非字母数字）
     #    排除以"公司"/"司"结尾的情况，防止"有限公司"等被误识别为姓名
+    #    新增：排除后跟冒号/顿号的情况，防止"组长："/"成员："被误识别为姓名
     (re.compile(
         r'(?<![a-zA-Z0-9\u4e00-\u9fa5])'
         r'[\u4e00-\u9fa5]{2,4}'
         r'(?!(?:公司|司))(?:(?![a-zA-Z0-9\u4e00-\u9fa5])|$)'
+        r'(?![：、:])'
     ), "XXX"),
+]
+
+
+# ---------------------------------------------------------------------------
+# 三、SKIP_WORDS - 不应被 ORG pattern 误匹配的保护短语
+# ---------------------------------------------------------------------------
+# 这些短语被标准版保留，但当前 ORG pattern 会误匹配。
+# 保护策略：在 apply_redactions 中使用嵌套占位符，防止任何 pattern 匹配。
+SKIP_WORDS: List[str] = [
+    "建设领导小组",
+    "新核心项目建设领导小组",
+    "总体组",
+    "开发一组",
+    "开发二组",
+    "开发三组",
+    "开发四组",
+    "需求组",
+    "数据移植组",
+    "综合保障组",
+    "基础设施组",
+    "配置测试组",
+    "各项目组",
+    "合作公司",
 ]
 
 
 def apply_redactions(text: str) -> str:
     """
     执行链式脱敏替换。
-    
+
     保护性替换策略：
-      1. 先将"合作公司"/"有限公司"等常见误匹配短语临时替换为占位符
+      1. 嵌套占位符：先用 \x00+N 保护 SKIP_WORDS，再用 \x01+N 保护 有限公司/合作公司
       2. 执行常规 PATTERNS 替换
       3. 恢复占位符（占位符本身不会被任何 pattern 匹配）
     """
     if not text or not isinstance(text, str):
         return text
-    
-    # 占位符（UUID，确保不会与原文冲突）
+
+    # Step 1: 嵌套占位符保护
+    # 外层（SKIP_WORDS）：使用 \x00+N，不可被任何 pattern 匹配
+    # 内层（有限公司/合作公司）：使用 \x01+N，在 ORG pattern 之后执行
+    _SKIP = {f'\x00{i:03d}': w for i, w in enumerate(SKIP_WORDS)}
     _PROTECTED = {
-        '\x00有XXXX': '有限公司',
-        '\x00合作XXXX': '合作公司',
+        '\x01有XXXX': '有限公司',
+        '\x01合作XXXX': '合作公司',
     }
-    
-    # Step 1: 保护易误匹配短语
+
     result = text
+    # 先保护 SKIP_WORDS（外层占位符）
+    for placeholder, original in _SKIP.items():
+        result = result.replace(original, placeholder)
+    # 再保护 有限公司/合作公司（内层占位符）
     for placeholder, original in _PROTECTED.items():
         result = result.replace(original, placeholder)
-    
+
     # Step 2: 执行常规替换
     for pattern, replacement in PATTERNS:
         result = pattern.sub(replacement, result)
-    
-    # Step 3: 恢复被保护的短语
+
+    # Step 3: 恢复占位符
     for placeholder, original in _PROTECTED.items():
         result = result.replace(placeholder, original)
-    
+    for placeholder, original in _SKIP.items():
+        result = result.replace(placeholder, original)
+
     return result
 
 
@@ -147,7 +181,7 @@ def add_custom_replacement(old: str, new: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 三、各敏感类型的描述
+# 四、各敏感类型的描述
 # ---------------------------------------------------------------------------
 REDACTION_LABELS = {
     "EMAIL":    "邮箱",
