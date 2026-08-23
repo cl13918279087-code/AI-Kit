@@ -85,7 +85,10 @@ def redact_docx(input_path: str, output_path: str, detector=None) -> dict:
             _process_word_xml_with_llm(comments_xml, detector, "批注")
 
         # ⑤ 处理文本框（wps:txbx / wpg:txbx）
+        # 注意：document.xml 已由 step ② 处理，跳过避免双重处理破坏 XML 结构
         for xml_file in sorted((tmp_dir / "word").glob("*.xml")):
+            if xml_file.name == "document.xml":
+                continue
             _process_txbx_xml(xml_file, counts)
 
         # ⑥ 文档属性（作者、标题、最后修改人）
@@ -157,21 +160,16 @@ def _process_word_xml(path: Path, label: str = "") -> dict:
             continue
 
         # 将脱敏后的文本分配回各 run
-        # 策略：逐 run 按顺序取字符，写入第1个 w:t，后续清空
+        # 策略：逐 run 按 redacted_full 的字符顺序分配到各 run，
+        # 用 _redistribute_text_nodes 确保多 t_node 时文本正确分布
         pos = 0
-        for r, ts in zip(run_nodes, t_nodes):
-            run_len = len(run_texts[len(run_nodes) - len(run_nodes) + run_nodes.index(r)])
-            # 重新计算索引
-            idx = run_nodes.index(r)
+        for idx, (r, ts) in enumerate(zip(run_nodes, t_nodes)):
             run_len = len(run_texts[idx])
-
             redacted_chunk = redacted_full[pos:pos + run_len]
             pos += run_len
 
             if ts:
-                ts[0].text = redacted_chunk
-                for t in ts[1:]:
-                    t.text = None
+                _redistribute_text_nodes(ts, redacted_chunk)
 
         changed = True
         counts["段落/单元格"] = counts.get("段落/单元格", 0) + 1
@@ -212,7 +210,7 @@ def _process_word_xml(path: Path, label: str = "") -> dict:
         if redacted_cell == full_cell_text:
             continue
 
-        # 分配回各 run
+        # 分配回各 run（使用正确的 run 长度计算）
         pos = 0
         for idx, (r, ts) in enumerate(zip(all_runs, all_t_nodes)):
             # 计算该 run 对应的原文长度（跨段落时需正确计算）
@@ -230,9 +228,7 @@ def _process_word_xml(path: Path, label: str = "") -> dict:
             pos += run_len
 
             if ts:
-                ts[0].text = redacted_chunk
-                for t in ts[1:]:
-                    t.text = None
+                _redistribute_text_nodes(ts, redacted_chunk)
 
         changed = True
         counts["段落/单元格"] = counts.get("段落/单元格", 0) + 1
@@ -242,6 +238,55 @@ def _process_word_xml(path: Path, label: str = "") -> dict:
         print(f"  [更新] {label or path.name}")
 
     return counts
+
+
+def _redistribute_text_nodes(t_nodes: list, redacted: str) -> None:
+    """
+    将 redacted 文本正确分配到同 run 的所有 w:t 节点。
+
+    策略：按原始各 w:t 节点的长度比例为依据，将 redacted 文本逐节点填充。
+    若 redacted 比原始总长短，清空后的 w:t 保留空字符串；
+    若 redacted 比原始总长长，溢出追加到最后节点。
+
+    修复说明：
+      旧逻辑只写 t_nodes[0] 后清空其余节点，导致多 t_node 时文本全堆积
+      到第一个 w:t（XML腐败根因之一）。本函数确保 redacted 文本按原始
+      结构分配到各 w:t 节点。
+    """
+    if not t_nodes:
+        return
+
+    if len(t_nodes) == 1:
+        t_nodes[0].text = redacted
+        return
+
+    # 多 t_node：收集每个 t_node 的原始长度
+    original_lens = [len(t.text or "") for t in t_nodes]
+    total_original = sum(original_lens)
+
+    if total_original == 0:
+        # 全空节点，将 redacted 填入第一个，其余清空
+        t_nodes[0].text = redacted
+        for t in t_nodes[1:]:
+            t.text = None
+        return
+
+    # 按比例计算每个节点应得的 redacted 字符数
+    pos = 0
+    num_nodes = len(t_nodes)
+    for i in range(num_nodes):
+        if i < num_nodes - 1:
+            # 非末节点：按比例分配
+            quota = round(len(redacted) * original_lens[i] / total_original)
+            quota = max(0, quota)
+        else:
+            # 末节点：拿剩余全部（避免浮点误差导致字符丢失）
+            quota = len(redacted) - pos
+        chunk = redacted[pos:pos + quota]
+        t_nodes[i].text = chunk
+        pos += len(chunk)
+
+    # 确保所有节点已填充（末节点已处理到这里）
 
 
 def _extract_full_text(root) -> tuple:
@@ -359,6 +404,12 @@ def _process_word_xml_with_llm(path: Path, detector=None, label: str = "") -> di
       4. regex 兜底（保留原有逻辑，保证覆盖率）
 
     detector 为 None 或检测失败时，自动退化为纯 regex 脱敏（不抛异常）。
+
+    修复记录（v2 - 2026-08-23）：
+      - 修复双加工问题：LLM步骤修改节点后，regex步骤跳过已处理节点，避免
+        重复修改导致文本分配错位（XML腐败根因之一）
+      - 修复多t节点文本分配错误：regex步骤现在正确将redacted文本分配到
+        同run的所有w:t节点，而非只写ts[0]后清空其余
     """
     from lxml import etree
 
@@ -369,6 +420,8 @@ def _process_word_xml_with_llm(path: Path, detector=None, label: str = "") -> di
 
     full_text, nodes, ranges = _extract_full_text(root)
 
+    # 追踪LLM已修改的节点（用于避免regex步骤双加工）
+    llm_modified_nodes = set()
 
     # ① LLM 智能检测（失败静默降级，不阻断脱敏）
     # 策略：只把含姓名特征的段落送 LLM（regex 预筛），避免全量超时
@@ -431,14 +484,25 @@ def _process_word_xml_with_llm(path: Path, detector=None, label: str = "") -> di
     # ② offset 精确替换（优先）
     changed = False
     if spans:
+        # 追踪哪些节点被LLM修改了
+        before_texts = {node: (node.text or "") for node in nodes}
         n_replaced = _apply_spans_to_nodes(nodes, ranges, spans)
+        for node in nodes:
+            if node.text != before_texts.get(node):
+                llm_modified_nodes.add(node)
         if n_replaced:
             changed = True
             counts["LLM实体"] = counts.get("LLM实体", 0) + n_replaced
 
-    # ③ regex 兜底（per-run 处理保持不变；跨 run 日期等模式由 step ② LLM offset 处理）
+    # ③ regex 兜底（per-run 处理，跳过LLM已处理的节点避免双加工）
+    # 修复：多t节点时，将redacted文本正确分配到所有t节点，而非只写ts[0]
     for r in root.iter(f"{W}r"):
-        texts = [t.text or "" for t in r.iter(f"{W}t")]
+        t_nodes = list(r.iter(f"{W}t"))
+        # 跳过LLM已修改的节点（避免双加工导致文本错位）
+        if any(t in llm_modified_nodes for t in t_nodes):
+            continue
+
+        texts = [t.text or "" for t in t_nodes]
         combined = "".join(texts)
         if not combined:
             continue
@@ -447,13 +511,10 @@ def _process_word_xml_with_llm(path: Path, detector=None, label: str = "") -> di
         if redacted == combined:
             continue
 
-        t_nodes = list(r.iter(f"{W}t"))
-        if t_nodes:
-            t_nodes[0].text = redacted
-            for t in t_nodes[1:]:
-                t.text = None
-            changed = True
-            counts["段落/单元格"] = counts.get("段落/单元格", 0) + 1
+        # 文本分配：将redacted文本逐节点填充（修复：分配到所有t_nodes而非仅ts[0]）
+        _redistribute_text_nodes(t_nodes, redacted)
+        changed = True
+        counts["段落/单元格"] = counts.get("段落/单元格", 0) + 1
 
     if changed:
         # 写回文件（保持原有编码声明）
@@ -467,14 +528,27 @@ def _process_txbx_xml(path: Path, counts: dict) -> None:
     """
     处理文本框（wps:txbx / wpg:txbx）内的 XML。
     这些元素内嵌了完整的 <w:document> 片段。
+    使用 lxml 解析 XML，只对 w:t 文本节点执行 apply_redactions，避免破坏 XML 结构。
     """
     from lxml import etree
 
     try:
-        content = path.read_text("utf-8")
-        redacted = apply_redactions(content)
-        if redacted != content:
-            path.write_text(redacted, "utf-8")
+        parser = etree.XMLParser(remove_blank_text=False, recover=True)
+        tree = etree.parse(str(path), parser)
+        root = tree.getroot()
+
+        changed = False
+        for t_elem in root.iter(f"{W}t"):
+            original = t_elem.text or ""
+            if not original:
+                continue
+            redacted = apply_redactions(original)
+            if redacted != original:
+                t_elem.text = redacted
+                changed = True
+
+        if changed:
+            tree.write(str(path), xml_declaration=True, encoding="UTF-8", standalone=True)
             print(f"  [更新] 文本框 {path.name}")
             counts["文本框"] = counts.get("文本框", 0) + 1
     except Exception as e:
@@ -494,18 +568,53 @@ def _process_xml_file(path: Path, label: str = "") -> None:
 
 
 def _redact_bank_logos(media_dir: Path) -> None:
-    """将含银行 Logo 关键词的图片替换为纯黑图"""
-    from PIL import Image
+    """
+    将银行 Logo 图片替换为纯黑图。
 
-    keywords = ["bank", "logo", "银行", "brand", "logo"]
+    检测策略：
+      1. 文件名含银行相关关键词（精确匹配）
+      2. 小面积图片（宽 x 高 <= 60000 px，且宽>高，典型logo比例）
+         用于检测页眉/页脚中的银行标识图片
+    """
+    from PIL import Image
+    import tempfile, os
+
+    keywords = ["bank", "logo", "银行", "brand"]
     for img_file in media_dir.iterdir():
+        redact = False
+        reason = ""
+
+        # 策略1：文件名含银行相关关键词
         if any(k in img_file.name.lower() for k in keywords):
+            redact = True
+            reason = "文件名含关键词"
+
+        # 策略2：小面积横向图片（典型logo特征：宽>高，面积适中）
+        if not redact:
             try:
-                img = Image.open(img_file)
-                w, h = img.size
-                black = Image.new("RGB", (max(w, 10), max(h, 10)), (0, 0, 0))
-                black.save(img_file)
-                print(f"  [银行Logo遮盖] {img_file.name} → 纯黑图")
+                with Image.open(img_file) as img:
+                    w, h = img.size
+                    area = w * h
+                    # logo典型：宽高比大(>2:1)，面积适中(1万~10万px)
+                    # image3.jpeg: 362x33=11946px, ratio~11:1 → logo
+                    if 5000 <= area <= 100000 and w > h * 2:
+                        redact = True
+                        reason = f"尺寸{w}x{h}(面积{area})符合logo特征"
+            except Exception:
+                pass
+
+        if redact:
+            try:
+                with Image.open(img_file) as img:
+                    w, h = img.size
+                    # 创建纯黑图，保留原始尺寸
+                    black = Image.new("RGB", (w, h), (0, 0, 0))
+                    # 先写到临时文件，再覆盖原文件（避免文件句柄冲突）
+                    tmp = tempfile.NamedTemporaryFile(suffix=img_file.suffix, delete=False)
+                    tmp.close()
+                    black.save(tmp.name, format=img.format or "PNG")
+                    os.replace(tmp.name, str(img_file))
+                    print(f"  [银行Logo遮盖] {img_file.name}（{reason}）→ 纯黑图")
             except Exception as e:
                 print(f"  [警告] 无法遮盖 {img_file.name}: {e}")
 

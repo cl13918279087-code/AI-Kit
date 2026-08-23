@@ -21,6 +21,7 @@ import subprocess
 import tempfile
 import platform
 from pathlib import Path
+from PIL import Image
 
 import sys
 from pathlib import Path

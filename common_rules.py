@@ -388,9 +388,20 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
     name_char_class = '[' + name_pool_chars + ']'
 
     # 规则A：姓氏 + 1-2个名字汉字（前后非ASCII非汉字，防止中文词内部被误判）
-    # 右边界：阻止 ASCII 或 CJK 汉字字母紧跟（如 '时不'→'执'、'史明'→'细'、
-    # '支行'→'可/人' 均为词内部误切），但允许中文标点（，。、：等不在
-    # \u4e00-\u9fa5 区间）和字符串结尾（如 '毛航行，'、'毛航行'）
+    # 右边界：阻止 ASCII 或 CJK 汉字紧跟，防止"安卓"/"时不"等词内部误切，
+    # 但中文标点（，。、：等）和字符串结尾不受影响。
+    # 复姓优先：2字复姓 + 1-2个名字汉字（防止复姓第二字被单姓规则误匹配）
+    compound_surnames = cfg.get("compound_surnames", [])
+    if compound_surnames:
+        compound_alt = '|'.join(re.escape(s) for s in sorted(compound_surnames, key=len, reverse=True))
+        patterns.append((
+            re.compile(
+                rf'(?<![a-zA-Z0-9])'
+                rf'(?:{compound_alt}){name_char_class}{{1,2}}'
+                rf'(?![a-zA-Z0-9\u4e00-\u9fa5])'
+            ),
+            rep.get("NAME", "XXX")
+        ))
     patterns.append((
         re.compile(
             rf'(?<![a-zA-Z0-9])'
@@ -401,17 +412,30 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
     ))
 
     # 规则B：姓氏 + 2个名字汉字（左侧有中文词/冒号，右侧无ASCII/非汉字）
-    # 处理"总行支持人员：汪晶晶"等场景（冒号后的姓名，左边界是中文冒号）
-    # 2-char 名字确保不会误匹配"安卓"等单字人名
+    # 处理"总行支持人员：汪晶晶"和"组长：樊霖副组长"等场景
+    # 放宽右边界：允许 CJK 汉字跟随（因为中文名字常被标题/职务词跟随）
+    # 但阻止纯 ASCII 跟随（英文单词残段）
     # 全角冒号 \uff1a 不在 [一-龥] 范围，需显式加入
     patterns.append((
         re.compile(
-            rf'(?<=[\u4e00-\u9fa5\uff1a])(?:{surname_alt}){name_char_class}{{2}}(?![a-zA-Z0-9\u4e00-\u9fa5])'
+            rf'(?<=[\u4e00-\u9fa5\uff1a])(?:{surname_alt}){name_char_class}{{2}}(?![a-zA-Z0-9])'
         ),
         rep.get("NAME", "XXX")
     ))
 
-    
+    # 规则C：姓氏 + 1个名字汉字（左侧必须是全角冒号，解决"组长：樊霖"型漏检）
+    # Rule B 要求 surname+2名字汉字，但"樊霖"只有 surname+1名字汉字，
+    # 在"组长：樊霖副组长"中 Rule B 无法匹配（霖后跟CJK"副"），
+    # Rule A 也无法匹配（霖后跟CJK"副"违反右边界）。
+    # 本规则专门处理：全角冒号后紧跟「姓氏+1名字汉字」的场景，右边界允许CJK跟随。
+    patterns.append((
+        re.compile(
+            rf'(?<=：)(?:{surname_alt}){name_char_class}(?![a-zA-Z0-9])'
+        ),
+        rep.get("NAME", "XXX")
+    ))
+
+
     return patterns
 
 
