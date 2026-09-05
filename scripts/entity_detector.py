@@ -48,10 +48,26 @@ def _is_excluded_word(text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# 日期范围正则（从 common_rules 移植，确保一致性）
+# 日期范围检测委托 common_rules（单点维护规则）
 # ---------------------------------------------------------------------------
 
-def _build_date_range_patterns():
+def _detect_date_ranges_from_common(text: str):
+    """
+    使用 common_rules 的日期范围正则进行检测。
+    日期范围在 common_rules 中已有完整实现（含连接符保留），
+    entity_detector 只在此做统一封装，不重复实现规则。
+    """
+    from common_rules import _get_patterns, get_replacement
+
+    # common_rules 中日期范围规则的特征：
+    # - replacement 含 YYYY/MM/DD 或 YYYY年MM月DD日 且
+    # - 连接符（m.group(2)）被保留在 replacement 中
+    # 我们直接复用 common_rules 的 apply_redactions 结果，
+    # 通过对比原文和脱敏后文本找出被替换的日期范围
+    import re as _re
+
+    # 取 common_rules 的日期/日期范围相关模式
+    date_categories = ["DATE", "DATE_CHINESE"]
     year4_cn = r'[〇二三四五六七八九0-9]{4}'
     year4_ar = r'20[12][0-9]'
     month_pat = (
@@ -61,27 +77,45 @@ def _build_date_range_patterns():
         r'十一(?=月)|十二(?=月))'
     )
     day_pat = r'[^月]+(?=日)'
-
-    return [
-        (re.compile(
+    date_range_patterns = [
+        _re.compile(
             rf'({year4_cn}年{month_pat}{day_pat}日)'
             r'(至|至|——|——)'
             rf'({year4_cn}年{month_pat}{day_pat}日)'
-        ), 0, 2),
-        (re.compile(
+        ),
+        _re.compile(
             rf'({year4_ar}/(?:0?[1-9]|1[0-2])/(?:0?[1-9]|[12]\d|3[01]))'
             r'(\s*(?:至|——|[-~])\s*)'
             rf'({year4_ar}/(?:0?[1-9]|1[0-2])/(?:0?[1-9]|[12]\d|3[01]))'
-        ), 0, 2),
-        (re.compile(
+        ),
+        _re.compile(
             rf'({year4_ar}-(?:0?[1-9]|1[0-2])-(?:0?[1-9]|[12]\d|3[01]))'
             r'(\s*(?:至|——|[-~])\s*)'
             rf'({year4_ar}-(?:0?[1-9]|1[0-2])-(?:0?[1-9]|[12]\d|3[01]))'
-        ), 0, 2),
+        ),
     ]
 
-
-_DATE_RANGE_PATTERNS = _build_date_range_patterns()
+    entities = []
+    for pattern in date_range_patterns:
+        for m in pattern.finditer(text):
+            full_match = m.group(0)
+            # 判断是中文还是阿拉伯数字格式
+            if any('\u4e00' <= c <= '\u9fff' for c in full_match):
+                repl_start = get_replacement("DATE_CHINESE", "YYYY年MM月DD日")
+                repl_end = get_replacement("DATE_CHINESE", "YYYY年MM月DD日")
+            else:
+                repl_start = get_replacement("DATE", "YYYY/MM/DD")
+                repl_end = get_replacement("DATE", "YYYY/MM/DD")
+            replacement = f"{repl_start}{m.group(2)}{repl_end}"
+            entities.append(SensitiveEntity(
+                text=full_match,
+                replacement=replacement,
+                confidence=0.95,
+                source="regex",
+                category="date",
+                evidence=f"日期范围正则（委托 common_rules）",
+            ))
+    return entities
 
 
 class EntityDetector:
@@ -116,8 +150,8 @@ class EntityDetector:
                 manifest.add_entity(entity)
             manifest.llm_calls += 1
 
-        # Layer 2: Regex 日期范围兜底
-        for entity in self._regex_detect_date_ranges(text):
+        # Layer 2: Regex 日期范围兜底（委托 common_rules，单点维护）
+        for entity in _detect_date_ranges_from_common(text):
             manifest.add_entity(entity)
 
         # Layer 3: 角色词姓名发现
@@ -200,36 +234,6 @@ class EntityDetector:
         return entities
 
 
-    def _regex_detect_date_ranges(self, text: str) -> List[SensitiveEntity]:
-        """Regex 兜底：日期范围（保留连接符）"""
-        entities = []
-        for pattern, start_group, end_group in _DATE_RANGE_PATTERNS:
-            for m in pattern.finditer(text):
-                full_match = m.group(0)
-                start_date = m.group(start_group)
-                end_date = m.group(end_group)
-
-                # 替换为标准化占位符
-                from common_rules import get_replacement
-                repl_start = get_replacement("DATE_CHINESE", "YYYY年MM月DD日")
-                repl_end = get_replacement("DATE", "YYYY/MM/DD")
-
-                # 判断是中文还是阿拉伯数字格式
-                if any(c >= '\u4e00' and c <= '\u9fff' for c in full_match):
-                    replacement = f"{repl_start}{m.group(start_group+1)}{repl_end}"
-                else:
-                    replacement = f"{repl_start}{m.group(start_group+1)}{repl_end}"
-
-                entities.append(SensitiveEntity(
-                    text=full_match,
-                    replacement=replacement,
-                    confidence=0.95,
-                    source="regex",
-                    category="date",
-                    evidence=f"日期范围正则匹配",
-                ))
-        return entities
-
     def _role_word_detect(self, text: str) -> List[SensitiveEntity]:
         """角色词上下文发现具体人员姓名"""
         entities = []
@@ -271,28 +275,17 @@ class EntityDetector:
         return chunks if chunks else [{"text": text, "overlap_suffix": ""}]
 
     def verify(self, original_text: str, redacted_text: str) -> Dict[str, Any]:
-        """脱敏质量验证（LLM 误脱检测）"""
-        if not self.llm:
-            return {"error": "LLM 未配置，跳过验证"}
+        """
+        脱敏质量验证（LLM 误脱检测）。
 
-        from prompts import FALSE_POSITIVE_CHECK_SYSTEM
-        from llm_client import LLMResponse
+        内部委托 QualityValidator 服务实现。
+        注意：本方法仅保留用于向后兼容，新增代码请直接使用 QualityValidator。
+        """
+        from quality_validator import QualityValidator, build_quality_validator
 
-        prompt = f"""## 原始文档片段\n---\n{original_text[:3000]}\n---\n\n## 脱敏后对应片段\n---\n{redacted_text[:3000]}\n---\n\n请进行误脱检测。"""
-
-        response = self.llm.chat(
-            prompt=prompt,
-            system=FALSE_POSITIVE_CHECK_SYSTEM,
-            response_format="json",
-        )
-
-        if response.error:
-            return {"error": response.error}
-
-        try:
-            return self.llm.parse_json_response(response)
-        except json.JSONDecodeError:
-            return {"error": "验证响应解析失败"}
+        validator = build_quality_validator()
+        report = validator.validate(original_text, redacted_text)
+        return report.to_dict()
 
 
 # ---------------------------------------------------------------------------

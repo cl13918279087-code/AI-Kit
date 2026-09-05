@@ -107,10 +107,136 @@ EXCLUDED_COMMON_WORDS: set = {
 
 
 # ---------------------------------------------------------------------------
+# 回溯式地址脱敏通道（省/市/县/区/街道/路/楼盘/大厦/支行/门牌号）
+#
+# 设计：从后缀（如"市""街道""大厦""支行""号"）向左回溯收集地名前缀，
+#   替换为 "XX+后缀"。相比纯正则方案的优势：
+#   1) 完整地址链（"福建省福州市鼓楼区湖东街道"）逐级脱敏，不受右边界限制
+#   2) 不依赖地名库，覆盖"金水区""中牟县""湖东街道"等地名库外的名称
+#   3) 虚词/指示词保护：市场部/城市/这栋大楼/一栋楼/办公大楼 等不误伤
+# ---------------------------------------------------------------------------
+
+_ADDRESS_SUFFIXES: List[str] = [
+    "街道", "大道", "大街", "写字楼", "楼盘", "小区", "公寓", "广场", "大厦", "大楼",
+    "省", "市", "县", "区", "镇", "乡", "村", "街", "路", "巷", "弄", "支行", "分行", "号",
+]
+# 指示词/量词字符：回溯遇到即停止，且视为"非地名"场景（如"这栋大楼"）
+_ADDRESS_DEMO_CHARS = set("这那该本各每某数几第其此另")
+# 虚词/动词/通用词字符：回溯遇到即停止（作为前缀边界，如"在湖东街道""位于郑州市""银行金水支行"）
+_ADDRESS_STOP_CHARS = set(
+    "的了在是和与或及到从去进被把将已会能可要很更最都也就还又再才只等着过"
+    "其此每各某数几第办发级分场面临于位行至向往距沿中"
+    "们我你他她它"
+)
+# 行政区划/道路后缀字符：回溯遇到即停止（地名前缀边界，如"金水区花园路"在"区"处切分、
+# "湖东街道恒力大厦"在"道"处切分）
+_ADDRESS_ADMIN_BOUNDARY = set("省市县区镇乡村街路巷弄道")
+# 支行/分行 允许跨越一个行政后缀（如"中牟县支行"的"县"），跨过后需再收集到地名前缀
+_ADDRESS_CROSSABLE_SUFFIXES = {"支行", "分行"}
+# 后缀+下一字 的组合保护：避免"市场部/区别/县长/省委"等误伤
+_ADDRESS_GUARDS = {
+    ("市", "场"), ("市", "面"), ("市", "委"),
+    ("区", "别"), ("区", "分"), ("区", "间"),
+    ("省", "长"), ("省", "级"), ("省", "委"),
+    ("县", "长"), ("县", "委"),
+    ("镇", "长"), ("镇", "委"),
+    ("村", "民"),
+}
+_ADDRESS_SUFFIX_RE = re.compile(
+    "|".join(re.escape(s) for s in sorted(_ADDRESS_SUFFIXES, key=len, reverse=True))
+)
+
+
+def _apply_address_pass(text: str) -> str:
+    """回溯式地址脱敏：扫描后缀 → 向左收集地名前缀 → XX+后缀。"""
+    if not text or not isinstance(text, str):
+        return text
+
+    out: List[str] = []
+    last = 0
+    replaced = False
+    consumed_until = -1  # 已替换区间右端（替换按从左到右进行，无重叠）
+
+    for m in _ADDRESS_SUFFIX_RE.finditer(text):
+        s_start, s_end = m.span()
+        if s_start < consumed_until:
+            continue  # 落在已替换区间内（如"XX省"中的字），跳过
+        suf = m.group(0)
+
+        # 门牌号：数字+号 → XX号（如"花园路39号"、"2号楼"）
+        if suf == "号":
+            j = s_start
+            while j - 1 >= 0 and text[j - 1] in "0123456789０１２３４５６７８９":
+                j -= 1
+            digit_len = s_start - j
+            if 1 <= digit_len <= 6:
+                # 门牌号前面应是汉字（路名/楼名）或行首
+                if j == 0 or ("\u4e00" <= text[j - 1] <= "\u9fff"):
+                    out.append(text[last:j])
+                    out.append("XX号")
+                    consumed_until = s_end
+                    last = s_end
+                    replaced = True
+            continue
+
+        # 向左回溯收集地名前缀（最多5个汉字）
+        i = s_start
+        collected: List[str] = []
+        stopped_by_demo = False
+        crossed_admin = ""  # 支行/分行 跨越的行政后缀（如"中牟县支行"的"县"）
+        while i - 1 >= 0 and len(collected) < 5:
+            ch = text[i - 1]
+            if not ("\u4e00" <= ch <= "\u9fff"):
+                break
+            if ch in _ADDRESS_DEMO_CHARS:
+                stopped_by_demo = True
+                break
+            if ch in _ADDRESS_STOP_CHARS:
+                break
+            if ch in _ADDRESS_ADMIN_BOUNDARY:
+                # 支行/分行 允许跨越一个行政后缀（县支行/市分行），其余作为边界
+                if (suf in _ADDRESS_CROSSABLE_SUFFIXES and not crossed_admin
+                        and ch in ("省", "市", "县", "区")):
+                    crossed_admin = ch
+                    i -= 1
+                    continue
+                break
+            collected.append(ch)
+            i -= 1
+        prefix = "".join(reversed(collected))
+
+        # 保护条件：指示词场景（这栋大楼）/ 前缀不足2字（城市/超市/山区）/ 跨行政后缀但无地名
+        if stopped_by_demo or len(prefix) < 2 or (crossed_admin and len(prefix) < 2):
+            continue
+        # 保护：回溯后的替换起点若落入已替换区间（如"中牟县支行"的"县"已替换），跳过
+        if i < consumed_until:
+            continue
+        # 保护：前缀紧邻已替换的 XX 占位符（避免对 "XX支行" 二次替换）
+        if i - 1 >= 0 and text[i - 1] == "X":
+            continue
+        # 保护：后缀+下一字组合（市场部/区别/县长等）
+        nxt = text[s_end] if s_end < len(text) else ""
+        if (suf[-1], nxt) in _ADDRESS_GUARDS:
+            continue
+
+        out.append(text[last:i])
+        out.append("XX" + crossed_admin + suf)
+        consumed_until = s_end
+        last = s_end
+        replaced = True
+
+    if not replaced:
+        return text
+    out.append(text[last:])
+    return "".join(out)
+
+
+# ---------------------------------------------------------------------------
 # 正则规则构建（从 config.json 动态加载，支持扩展）
 # ---------------------------------------------------------------------------
 
 def _build_patterns() -> List[Tuple[re.Pattern, str]]:
+    global _PATTERNS_PRE, _PATTERNS_NAME
     cfg = _load_config()
     rep = cfg.get("replacement", {})
     bank_names: List[str] = cfg.get("bank_names", [])
@@ -346,6 +472,77 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
                 lambda m: "XX" + m.group(0)
             ))
 
+        # ---------- 11d. 地址/城市名（如海峡、郑州 → XX） ----------
+        # 覆盖三类模式：
+        #   1) 地名+行政后缀：郑州市 → XX市，福建省 → XX省，龙岩市 → XX市
+        #   2) 地名+道路后缀：福州路 → XX路，厦门街 → XX街
+        #   3) 独立地名（无后缀）：海峡 → XX，齐鲁 → XX（前后非汉字/ASCII）
+        # "海峡银行"、"郑州银行" 等已由银行名规则覆盖，不受本规则影响
+        # "台湾海峡" 等受 EXCLUDED_COMMON_WORDS 保护
+        location_names: List[str] = cfg.get("location_names", [])
+        if location_names:
+            loc_alt = "|".join(
+                re.escape(loc) for loc in sorted(location_names, key=len, reverse=True)
+            )
+
+            # 后缀总表（供 _loc_repl 保留后缀、仅替换地名前缀）
+            compound_branch = [
+                "省分行", "省支行", "省营业部",
+                "市分行", "市支行", "市营业部",
+                "县支行", "县营业部",
+                "区支行", "区营业部",
+            ]
+            simple_admin = ["省", "市", "县", "区", "镇", "乡", "村", "街道", "路", "街", "道", "巷", "弄", "号", "栋", "楼", "大道", "大街", "东路", "西路", "南路", "北路"]
+
+            def _loc_repl(m):
+                full = m.group(0)
+                for suf in sorted(set(compound_branch + simple_admin), key=len, reverse=True):
+                    if full.endswith(suf) and len(full) > len(suf):
+                        return "XX" + suf
+                return rep.get("LOCATION", "XX")
+
+            # 子规则1：地名 + 复合行政/银行后缀（无需右边界，如"市分行营业部"）
+            # 先匹配长的复合后缀（无右边界），再匹配行政后缀
+            compound_alt = "|".join(re.escape(s) for s in sorted(compound_branch, key=len, reverse=True))
+            patterns.append((
+                re.compile(
+                    rf'(?<![一-龥a-zA-Z0-9])'
+                    rf'(?:{loc_alt})(?:{compound_alt})'
+                ),
+                _loc_repl
+            ))
+
+            # 子规则2：地名 + 行政/道路后缀（带右边界）
+            simple_admin_alt = "|".join(re.escape(s) for s in sorted(simple_admin, key=len, reverse=True))
+            patterns.append((
+                re.compile(
+                    rf'(?<![一-龥a-zA-Z0-9])'
+                    rf'(?:{loc_alt})(?:{simple_admin_alt})'
+                    rf'(?![一-龥a-zA-Z0-9])'
+                ),
+                _loc_repl
+            ))
+            patterns.append((
+                re.compile(
+                    rf'(?<![一-龥a-zA-Z0-9])'
+                    rf'(?:{loc_alt})'
+                    rf'(?![一-龥a-zA-Z0-9\u3000-\u303f\uff00-\uffef])'
+                ),
+                rep.get("LOCATION", "XX")
+            ))
+            # 子规则4：地名 + "XX"占位符（银行名/支行名已脱敏后残留的地名前缀，
+            # 如"福建XX银行" → "XXXX银行"，避免省市信息经替换结构残留）
+            patterns.append((
+                re.compile(
+                    rf'(?<![一-龥a-zA-Z0-9])(?:{loc_alt})(?=X{{2}})'
+                ),
+                rep.get("LOCATION", "XX")
+            ))
+
+    # ---------- 11e/11f. 地址信息（省/市/县/区/街道/路/楼盘/大厦/支行/门牌） ----------
+    # 采用回溯式地址脱敏通道 _apply_address_pass()（见下方函数定义），
+    # 在 apply_redactions 中于姓名规则之前执行，此处不再注册正则规则。
+
     # ---------- 12. 密码信息 ----------
     # 匹配"密码"后紧跟的数字串，替换为 ******
     # 同时兼容"密码为/密码：/密码 " 等格式
@@ -374,6 +571,8 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
 
 
 # ---------- 13. 人员姓名（2-3个汉字，粗筛） ----------
+    # ↓↓↓ 姓名规则从本行开始单独归组：apply_redactions 中地址通道在其之前执行 ↓↓↓
+    _pre_pattern_count = len(patterns)
     # Python 3.9 不支持变长 lookbehind，移除 excluded 检查
     # 姓氏后必须跟 1-2 个名字汉字，防止单字被误判
     # 名字用字池从 config.json name_pool 动态读取
@@ -387,9 +586,9 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
     # 名字汉字类（供两个规则使用）
     name_char_class = '[' + name_pool_chars + ']'
 
-    # 规则A：姓氏 + 1-2个名字汉字（前后非ASCII非汉字，防止中文词内部被误判）
-    # 右边界：阻止 ASCII 或 CJK 汉字紧跟，防止"安卓"/"时不"等词内部误切，
-    # 但中文标点（，。、：等）和字符串结尾不受影响。
+    # 规则A：姓氏 + 1-2个名字汉字
+    # 左边界：阻止 ASCII/数字前缘（防止英文单词残段匹配）
+    # 右边界：仅阻止 ASCII/数字跟随，释放 CJK 跟随（使"柳长春主持"可匹配）
     # 复姓优先：2字复姓 + 1-2个名字汉字（防止复姓第二字被单姓规则误匹配）
     compound_surnames = cfg.get("compound_surnames", [])
     if compound_surnames:
@@ -398,7 +597,7 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
             re.compile(
                 rf'(?<![a-zA-Z0-9])'
                 rf'(?:{compound_alt}){name_char_class}{{1,2}}'
-                rf'(?![a-zA-Z0-9\u4e00-\u9fa5])'
+                rf'(?![a-zA-Z0-9])'
             ),
             rep.get("NAME", "XXX")
         ))
@@ -406,7 +605,7 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
         re.compile(
             rf'(?<![a-zA-Z0-9])'
             rf'(?:{surname_alt}){name_char_class}{{1,2}}'
-            rf'(?![a-zA-Z0-9\u4e00-\u9fa5])'
+            rf'(?![a-zA-Z0-9])'
         ),
         rep.get("NAME", "XXX")
     ))
@@ -435,12 +634,39 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
         rep.get("NAME", "XXX")
     ))
 
+    # 规则D：姓氏 + 名字汉字（左侧是常见介词/动词，解决"由XXX负责"型漏检）
+    # 仅添加最可靠的上下文：左侧为"由"时，人名概率最高。
+    # 右边界：允许CJK汉字跟随（如"由XXX负责"），阻止ASCII/数字跟随。
+    patterns.append((
+        re.compile(
+            rf'(?<=由)(?:{surname_alt}){name_char_class}{{1,2}}(?![a-zA-Z0-9])'
+        ),
+        rep.get("NAME", "XXX")
+    ))
+
+    # 规则E：姓氏 + 名字汉字（左侧是常见动词如"由、为、对"等）
+    # 覆盖"为XXX安排"、"对XXX负责"等场景。
+    _name_follow_verbs = ['由', '为', '对', '让', '请', '告', '诉', '见', '任', '选', '用', '调', '指', '派', '承', '责', '主', '抓', '干', '经', '协']
+    _verb_alt = '|'.join(re.escape(v) for v in _name_follow_verbs)
+    patterns.append((
+        re.compile(
+            rf'(?<=(?:{_verb_alt}))(?:{surname_alt}){name_char_class}{{1,2}}(?![a-zA-Z0-9])'
+        ),
+        rep.get("NAME", "XXX")
+    ))
+
+
+    # 拆分：姓名规则单独归组，供 apply_redactions 在地址通道之后执行
+    _PATTERNS_PRE = patterns[:_pre_pattern_count]
+    _PATTERNS_NAME = patterns[_pre_pattern_count:]
 
     return patterns
 
 
 # 全局规则（延迟构建）
 _PATTERNS: Optional[List[Tuple[re.Pattern, str]]] = None
+_PATTERNS_PRE: List[Tuple[re.Pattern, str]] = []
+_PATTERNS_NAME: List[Tuple[re.Pattern, str]] = []
 
 
 def _get_patterns() -> List[Tuple[re.Pattern, str]]:
@@ -448,6 +674,12 @@ def _get_patterns() -> List[Tuple[re.Pattern, str]]:
     if _PATTERNS is None:
         _PATTERNS = _build_patterns()
     return _PATTERNS
+
+
+def _get_pattern_groups() -> Tuple[List[Tuple[re.Pattern, str]], List[Tuple[re.Pattern, str]]]:
+    """返回（姓名前规则组, 姓名规则组）。地址通道需在两组之间执行。"""
+    _get_patterns()
+    return _PATTERNS_PRE, _PATTERNS_NAME
 
 
 # ---------------------------------------------------------------------------
@@ -462,26 +694,35 @@ def apply_redactions(text: str) -> str:
     if not text or not isinstance(text, str):
         return text
 
+    pre_patterns, name_patterns = _get_pattern_groups()
+
     result = text
-    for pattern, replacement in _get_patterns():
+    # 第一阶段：姓名之前的规则（邮箱/日期/银行/支行/地名等）
+    for pattern, replacement in pre_patterns:
+        result = pattern.sub(replacement, result)
+
+    # 第二阶段：回溯式地址脱敏通道（省/市/县/区/街道/路/楼盘/大厦/支行/门牌）
+    # 必须在姓名规则之前执行，防止"金水/花园"等地址成分被姓名规则误吞
+    result = _apply_address_pass(result)
+
+    # 第三阶段：姓名规则
+    for pattern, replacement in name_patterns:
         result = pattern.sub(replacement, result)
 
     # 后处理：纠正已知误脱敏
-    # 1. 姓名模式误匹配中文词
-    # 2. DATE pattern 误替换"YYYY年MM月DD日"（应保留原始日期，不应替换"应为2022年3月31日前"中的日期）
+    # 1. 姓名模式误匹配中文词（Rule A 右边界放宽后，可能对常用词造成误匹配）
+    # 2. DATE pattern 误替换（策略：替换为 XXXX年XX月XX日 保持脱敏但不暴露原始值）
     import re as _re
     post_fixes = [
         ('清XXX下', '清单如下'),
         ('营运XXX部', '营运计财部'),
         ('XXX务部', '计财财务部'),
+        # Rule A 右边界放宽后新增：时不我待（时不+我=误匹配）
+        ('XXX我待', '时不我待'),
     ]
     for wrong, correct in post_fixes:
         if wrong in result:
             result = result.replace(wrong, correct)
-
-    # 注：Rule A 右边界修复后（阻止 ASCII/CJK 汉字紧跟），
-    # '时不'→'执行'、'史明'→'明细'、'支行'→'可根据' 等词内误切已不再发生，
-    # 原先针对这些误切的还原后处理已移除。
 
     # DATE 后处理：DATE pattern 把日期替换为 YYYY年MM月DD日，
     # 但"应为2022年3月31日"中的日期是通用日期描述不应被替换。
@@ -534,6 +775,7 @@ REDACTION_LABELS: Dict[str, str] = {
     "MOBILE":    "手机",
     "PHONE":     "固话",
     "BANK":      "银行名",
+    "LOCATION":   "地址",
     "ORG":       "组织名",
     "NAME":      "姓名",
     "IP":        "IP地址",
@@ -571,3 +813,73 @@ def count_redactions(text: str) -> Dict[str, int]:
 def get_redaction_map() -> List[Tuple[str, str]]:
     """返回当前 (pattern, replacement) 列表，用于外部展示"""
     return _get_patterns()
+
+
+# ---------------------------------------------------------------------------
+# 实体检测接口（供 entity_detector 调用，避免重复实现规则）
+# ---------------------------------------------------------------------------
+
+def detect_by_patterns(text: str, patterns: List[Tuple[re.Pattern, str]]) -> List[Dict[str, Any]]:
+    """
+    使用指定正则模式列表从文本中检测敏感实体。
+
+    返回格式：
+        [{"text": "...", "replacement": "...", "category": "...", "source": "regex"}, ...]
+
+    用途：entity_detector.py 的日期检测等规则层检测委托本函数，
+          保证 common_rules.py 是规则的单一来源。
+    """
+    import re as _re
+
+    results = []
+    # 去重：同类模式已按优先级排列，同一文本段只记录首次匹配
+    seen_spans = set()
+
+    for pattern, replacement in patterns:
+        for m in pattern.finditer(text):
+            full = m.group(0)
+            # 跳过已匹配过的区间（优先保留先匹配到的规则）
+            span_key = (m.start(), m.end())
+            if span_key in seen_spans:
+                continue
+            seen_spans.add(span_key)
+
+            # 判断 category
+            cat = _infer_category(replacement, full)
+            results.append({
+                "text": full,
+                "replacement": replacement,
+                "category": cat,
+                "source": "regex",
+                "confidence": 0.95,
+                "evidence": f"正则匹配: {pattern.pattern[:50]}",
+            })
+
+    return results
+
+
+def _infer_category(replacement: str, original: str) -> str:
+    """从 replacement/原始文本推断敏感类型"""
+    if "XXXXX@XXXXX" in replacement:
+        return "邮箱"
+    if "X.X.X.X" in replacement:
+        return "IP地址"
+    if "XX:XX:XX:XX:XX:XX" in replacement:
+        return "MAC地址"
+    if "XXXXXXXXXXXXXXXXXX" in replacement:
+        return "身份证"
+    if "XXXXXXXXXXXXXXXX" in replacement:
+        return "银行卡"
+    if "YYYY" in replacement or "MM" in replacement or "DD" in replacement:
+        return "日期"
+    if "XXX" in replacement and len(original) <= 4:
+        return "姓名"
+    if "XX银行" in replacement:
+        return "银行名称"
+    if "XXXX" in replacement and len(original) <= 10:
+        return "组织名"
+    if "XXXX" in replacement:
+        return "组织名"
+    if "******" in replacement:
+        return "密码"
+    return "其他"

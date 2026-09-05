@@ -25,3 +25,14 @@ build/
 # JSON content dumps (contain document content, keep source doc)
 _full_doc_content.json
 _v3_doc_content.json
+
+# Redaction outputs (deliverables, not source)
+output/
+
+# Agent workspace memory
+.workbuddy/
+
+# Work documents (client files, never commit binaries)
+工作目录/
+共建项目/
+!工作目录/*.md

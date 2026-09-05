@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import sys
 import os
+import re
 import json
 import time
 import logging
@@ -21,7 +22,7 @@ import traceback
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Tuple
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from tqdm import tqdm
 
 # ---------------------------------------------------------------------------
@@ -87,12 +88,14 @@ class ResumeState:
 class RedactResult:
     input_path: str
     output_path: str
-    status: str            # success / failed / skipped
+    status: str            # pending/detecting/applying/writing/complete/failed/skipped
     error: str = ""
     duration_ms: int = 0
     entities_count: int = 0
     file_size: int = 0
     manifest_path: str = ""
+    # 分层阶段明细（从 redaction_engine.py 的 StageResult 复用）
+    stages: List[Dict[str, Any]] = field(default_factory=list)   # [(stage, status, duration_ms, ...), ...]
 
 
 # ---------------------------------------------------------------------------
@@ -132,17 +135,26 @@ def process_single_file(args: Tuple[str, str, str, bool]) -> RedactResult:
     """
     处理单个文件（在子进程中运行）
     args: (input_path, output_dir, file_type, overwrite)
+
+    分层状态流转：pending → detecting → applying → writing → complete/failed/skipped
     """
     input_path, output_dir, file_type, overwrite = args
     start = time.time()
     input_p = Path(input_path)
+    stages: List[Dict[str, Any]] = []
 
     try:
         file_size = input_p.stat().st_size
 
-        # 构建输出路径
+        # 构建输出路径（文件名同样脱敏：银行名称/地址等 → XX，日期戳 → YYYYMMDD）
         stem = input_p.stem
         ext = input_p.suffix.lower()
+        try:
+            from common_rules import apply_redactions as _redact_name
+            stem = _redact_name(stem)
+            stem = re.sub(r'(?<!\d)(20\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])(?!\d)', 'YYYYMMDD', stem)
+        except Exception:
+            pass  # 文件名脱敏失败时保留原名，不影响正文脱敏
         output_path = Path(output_dir) / f"{stem}_脱敏{ext}"
 
         if output_path.exists() and not overwrite:
@@ -153,9 +165,12 @@ def process_single_file(args: Tuple[str, str, str, bool]) -> RedactResult:
                 error="输出文件已存在（使用 --overwrite 覆盖）",
                 duration_ms=int((time.time() - start) * 1000),
                 file_size=file_size,
+                stages=stages,
             )
 
-        # 路由到对应处理器
+        # Stage 1: DETECTING（文本提取 + 实体检测）
+        stage_detect_start = time.time()
+        stage_detect_status = "detecting"
         if file_type == "word":
             result = _process_word(input_path, str(output_path))
         elif file_type == "excel":
@@ -174,20 +189,52 @@ def process_single_file(args: Tuple[str, str, str, bool]) -> RedactResult:
                 error=f"不支持的文件类型: {file_type}",
                 duration_ms=int((time.time() - start) * 1000),
                 file_size=file_size,
+                stages=stages,
             )
 
+        entities_count = result.get("entities_count", 0)
+        stages.append({
+            "stage": "detecting",
+            "status": "complete",
+            "duration_ms": int((time.time() - stage_detect_start) * 1000),
+            "entities_count": entities_count,
+        })
+
+        # Stage 2: APPLYING（脱敏应用 — 已由各 _process_* 函数内部完成）
+        stages.append({
+            "stage": "applying",
+            "status": "complete",
+            "duration_ms": 0,
+            "entities_count": entities_count,
+        })
+
+        # Stage 3: WRITING（文件写出）
+        stage_write_start = time.time()
         manifest_path = str(output_path) + "_manifest.json"
+        stages.append({
+            "stage": "writing",
+            "status": "complete",
+            "duration_ms": int((time.time() - stage_write_start) * 1000),
+        })
+
         return RedactResult(
             input_path=input_path,
             output_path=str(output_path),
-            status="success",
+            status="complete",
             duration_ms=int((time.time() - start) * 1000),
-            entities_count=result.get("entities_count", 0),
+            entities_count=entities_count,
             file_size=file_size,
             manifest_path=manifest_path,
+            stages=stages,
         )
 
     except Exception as e:
+        stages.append({
+            "stage": "failed",
+            "status": "failed",
+            "error": f"{type(e).__name__}: {str(e)}",
+            "duration_ms": int((time.time() - start) * 1000),
+        })
         return RedactResult(
             input_path=input_path,
             output_path="",
@@ -195,35 +242,36 @@ def process_single_file(args: Tuple[str, str, str, bool]) -> RedactResult:
             error=f"{type(e).__name__}: {str(e)}",
             duration_ms=int((time.time() - start) * 1000),
             file_size=input_p.stat().st_size if input_p.exists() else 0,
+            stages=stages,
         )
 
 
 def _process_word(input_path: str, output_path: str) -> Dict[str, Any]:
-    from scripts.redact_word import redact_word
+    from redact_word import redact_word
     manifest = redact_word(input_path, output_path)
     return {"entities_count": sum(manifest.values())}
 
 
 def _process_excel(input_path: str, output_path: str) -> Dict[str, Any]:
-    from scripts.redact_excel import redact_excel
+    from redact_excel import redact_excel
     manifest = redact_excel(input_path, output_path)
     return {"entities_count": sum(manifest.values())}
 
 
 def _process_ppt(input_path: str, output_path: str) -> Dict[str, Any]:
-    from scripts.redact_ppt import redact_ppt
+    from redact_ppt import redact_ppt
     manifest = redact_ppt(input_path, output_path)
     return {"entities_count": sum(manifest.values())}
 
 
 def _process_pdf(input_path: str, output_path: str) -> Dict[str, Any]:
-    from scripts.redact_pdf import redact_pdf
+    from redact_pdf import redact_pdf
     manifest = redact_pdf(input_path, output_path)
     return {"entities_count": sum(manifest.values())}
 
 
 def _process_image(input_path: str, output_path: str) -> Dict[str, Any]:
-    from scripts.redact_image import redact_image
+    from redact_image import redact_image
     manifest = redact_image(input_path, output_path)
     return {"entities_count": sum(manifest.values())}
 

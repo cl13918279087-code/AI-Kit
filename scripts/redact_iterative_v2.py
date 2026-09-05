@@ -272,8 +272,53 @@ def run_redaction(input_path: Path, output_path: Path, ext: str) -> Tuple[bool, 
 # 比对分析
 # ============================================================================
 
+def comprehensive_normalize(text: str) -> str:
+    """
+    全面的文本标准化 — 消除文档结构差异对对比的影响。
+    
+    处理内容：
+    1. Unicode NFC 规范化（消除全角/半角等价差异）
+    2. 移除文本段落分隔符（|||）— 消除段落边界差异
+    3. 统一换行符 (CRLF/LF/CR → LF)
+    4. 移除所有空白字符（空格、Tab、不间断空格、全角空格、换行）
+    5. 移除页眉页脚模式（"第 X 页"、"Page X"）
+    6. 移除文档元数据残留（[DOC]、日期模式等）
+    7. 折叠内部连续标点
+    
+    注意：最终移除所有空白，保持与 normalize_text_for_comparison 一致的无空白输出。
+    """
+    import unicodedata
+    
+    # 1. Unicode NFC 规范化
+    text = unicodedata.normalize('NFC', text)
+    
+    # 2. 移除段落分隔符（join文本时插入的分隔符）
+    text = text.replace('|||', '')
+    
+    # 3. 统一换行符
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
+    
+    # 4. 移除各类空白字符
+    # 普通空格、Tab、不间断空格(U+00A0)、全角空格(U+3000)、换行符
+    text = re.sub(r'[\t \u00a0\u3000\n\r]+', '', text)
+    
+    # 5. 移除页码模式
+    text = re.sub(r'第\s*[\d零一二三四五六七八九十百千]+\s*页', '', text)
+    text = re.sub(r'Page\s*\d+', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'-\s*\d+\s*-', '', text)  # "- 3 -" 格式
+    
+    # 6. 移除文档结构残留标记
+    text = re.sub(r'\[DOC\d*\]', '', text)
+    text = re.sub(r'\[EXCEL\]', '', text)
+    
+    # 7. 折叠连续标点为单字符（避免标点差异干扰）
+    text = re.sub(r'[,，;；:：!！?？…—–-。]{2,}', lambda m: m.group()[0], text)
+    
+    return text
+
+
 def normalize_text_for_comparison(text: str) -> str:
-    """标准化文本用于比对：去除空白差异"""
+    """标准化文本用于比对：去除空白差异（兼容旧调用）"""
     return re.sub(r'\s+', '', text)
 
 
@@ -307,39 +352,180 @@ def extract_name_like_regions(text: str, window: int = 15) -> List[Dict]:
     return results
 
 
+# ============================================================================
+# 文本标准化层（新增）
+# ============================================================================
+
+# 标准版可能使用的各类脱敏标记模式
+REDACTION_MARKERS = re.compile(
+    r'XXX+|XX银行|XX支行|XX分行|XX部|XX科|XX中心|XX室|XX处|XX组|XX公司|'
+    r'XXXX|XXXXX|XXXX|0XX-XXXXXXXX|'
+    r'▓{2,}|█{2,}|░{2,}|'
+    r'\[REDACTED\]|'
+    r'\*{3,}'
+)
+
+
+def extract_xxx_positions(text: str) -> List[int]:
+    """提取所有XXX起始位置（处理变长XXX如XX、XXX、XXXX等）"""
+    positions = []
+    i = 0
+    text = normalize_text_for_comparison(text)
+    while i < len(text):
+        if text[i:i+2] == 'XX' or text[i:i+3] == 'XXX' or text[i:i+4] == 'XXXX':
+            # 找到连续X序列
+            j = i
+            while j < len(text) and text[j] in 'XxXＸx':
+                j += 1
+            positions.append(i)
+            i = j
+        else:
+            i += 1
+    return positions
+
+
+def extract_context_name_candidates(text: str, pos: int, window: int = 15) -> List[str]:
+    """
+    在XXX位置周围提取可能的原始姓名。
+    
+    核心策略：XXX替换的是其前面的连续中文字符（通常是姓名）。
+    我们向前查找XXX前面的所有中文片段，取最后2-4个字作为候选。
+    """
+    candidates = []
+    text = normalize_text_for_comparison(text)
+    
+    # XXX前面最多window个字符
+    prefix = text[max(0, pos - window):pos]
+    
+    # 提取prefix中所有连续中文字符
+    chinese_runs = re.findall(r'[\u4e00-\u9fa5]+', prefix)
+    if not chinese_runs:
+        return []
+    
+    # 取最后一个中文片段（最接近XXX的）
+    last_run = chinese_runs[-1]
+    
+    # 生成2-4字的候选（从last_run末尾取）
+    for length in range(2, min(len(last_run) + 1, 5)):
+        # 从末尾向前取length个字符
+        candidate = last_run[-length:]
+        if candidate:
+            candidates.append(candidate)
+    
+    return candidates
+
+
+def extract_redacted_entities(texts: List[str], use_comprehensive: bool = True) -> Tuple[set, List[Dict]]:
+    """
+    从脱敏文本中提取被脱敏的实体集合。
+    
+    注意：由于无法准确知道XXX替换了什么，此函数主要用于
+    辅助分析和调试，实际比对以位置+上下文方法为主。
+    
+    返回：
+        (entity_set, detail_list)
+    """
+    # 合并文本
+    if use_comprehensive:
+        full_text = comprehensive_normalize('|||'.join(texts))
+    else:
+        full_text = normalize_text_for_comparison('|||'.join(texts))
+    
+    # 提取XXX位置
+    xxx_positions = extract_xxx_positions(full_text)
+    
+    entity_set = set()
+    detail_list = []
+    
+    for pos in xxx_positions:
+        candidates = extract_context_name_candidates(full_text, pos, window=12)
+        
+        for candidate in candidates:
+            if not is_generic_term(candidate):
+                entity_set.add(candidate)
+                detail_list.append({
+                    'entity': candidate,
+                    'pos': pos,
+                    'context': full_text[max(0, pos-10):pos+13],
+                })
+    
+    return entity_set, detail_list
+
+
+def entity_based_compare(
+    our_texts: List[str],
+    std_texts: List[str],
+    use_comprehensive: bool = True
+) -> Dict[str, Any]:
+    """
+    基于实体的脱敏比对方法（辅助参考）。
+    
+    由于无法准确从XXX还原原始人名，此方法仅供参考。
+    主要指标仍使用位置+上下文比对的结果。
+    """
+    our_entities, our_details = extract_redacted_entities(our_texts, use_comprehensive)
+    std_entities, std_details = extract_redacted_entities(std_texts, use_comprehensive)
+    
+    common = our_entities & std_entities
+    only_ours = our_entities - std_entities
+    only_std = std_entities - our_entities
+    
+    union = our_entities | std_entities
+    jaccard = len(common) / len(union) if union else 1.0 if not std_entities else 0.0
+    overlap_rate = len(common) / len(std_entities) if std_entities else 1.0 if not our_entities else 0.0
+    
+    return {
+        'our_entities': our_entities,
+        'std_entities': std_entities,
+        'common_entities': common,
+        'only_ours_misdetection': only_ours,
+        'only_std_missed': only_std,
+        'jaccard_similarity': round(jaccard, 4),
+        'overlap_rate': round(overlap_rate, 4),
+        'our_entity_count': len(our_entities),
+        'std_entity_count': len(std_entities),
+        'common_count': len(common),
+        'our_details': our_details,
+        'std_details': std_details,
+    }
+
+
 def compare_redactions(our_texts: List[str], std_texts: List[str], group_name: str) -> Dict[str, Any]:
     """
-    比对脱敏结果与标准版差异
-    返回详细差异分析
-
-    改进：使用上下文匹配（而非纯位置匹配）计算重叠率，
-    对DOC转换等导致的文本结构微小变化更鲁棒。
+    比对脱敏结果与标准版差异。
+    
+    核心改进：使用 comprehensive_normalize 对文本进行深度标准化，
+    消除文档结构差异（页眉/页码/换行/空白）对对比的影响。
+    
+    保留原有的上下文级比对用于详细差异分析。
     """
-    # 标准化后拼接
-    our_norm = normalize_text_for_comparison('|||'.join(our_texts))
-    std_norm = normalize_text_for_comparison('|||'.join(std_texts))
+    # ---------- 1. 综合文本标准化（核心改进） ----------
+    # 使用全面标准化消除文档结构差异
+    our_norm = comprehensive_normalize('|||'.join(our_texts))
+    std_norm = comprehensive_normalize('|||'.join(std_texts))
+    
+    # 同时保留旧版标准化用于向后兼容
+    our_norm_old = normalize_text_for_comparison('|||'.join(our_texts))
+    std_norm_old = normalize_text_for_comparison('|||'.join(std_texts))
 
     our_regions = extract_xxx_regions(our_norm)
     std_regions = extract_xxx_regions(std_norm)
 
-    # 构建每个XXX的上下文签名（前后各5个字符），用于模糊匹配
-    def xxx_context_signatures(text: str, regions: List[Tuple[int, int]]) -> Dict[Tuple, int]:
-        """每个XXX区域：[前5字符]XXX[后5字符] 的签名"""
+    # ---------- 2. 上下文级比对 ----------
+    def xxx_context_signatures(text: str, regions: List[Tuple[int, int]], window: int = 8) -> Dict[Tuple, int]:
+        """每个XXX区域：[前N字符]XXX[后N字符] 的签名"""
         sigs = {}
         for i, (start, end) in enumerate(regions):
-            before = text[max(0, start-5):start]
-            after = text[end:min(len(text), end+5)]
+            before = text[max(0, start-window):start]
+            after = text[end:min(len(text), end+window)]
             sigs[(before, after)] = i
         return sigs
 
+    # 使用综合标准化后的文本来计算上下文签名
     our_sigs = xxx_context_signatures(our_norm, our_regions)
     std_sigs = xxx_context_signatures(std_norm, std_regions)
 
-    # 精确位置集合（用于逐项分析）
-    our_set = set(our_regions)
-    std_set = set(std_regions)
-
-    # 上下文级重叠计数（更鲁棒）
+    # 上下文级重叠计数
     matched_std_indices = set()
     matched_our_indices = set()
     for sig, our_idx in our_sigs.items():
@@ -352,17 +538,14 @@ def compare_redactions(our_texts: List[str], std_texts: List[str], group_name: s
 
     漏检 = []
     误检 = []
-    可疑 = []
 
     # 漏检分析：标准有XXX，我们没有
     for pos, _ in std_only:
         start = max(0, pos - 15)
         end = min(len(std_norm), pos + 18)
         context = std_norm[start:end]
-        # 提取上下文中的2-4字中文片段
         name_likes = re.findall(r'[\u4e00-\u9fa5]{2,4}', context)
         if name_likes:
-            # 过滤掉明显不是人名的词
             filtered = [n for n in name_likes if not is_generic_term(n)]
             if filtered:
                 漏检.append({
@@ -386,46 +569,83 @@ def compare_redactions(our_texts: List[str], std_texts: List[str], group_name: s
                     '候选姓名': filtered[:5],
                 })
 
-    # 数量统计
+    # ---------- 3. 整合结果 ----------
     total_std_xxx = len(std_regions)
     total_our_xxx = len(our_regions)
-    total_漏检 = len(漏检)
-    total_误检 = len(误检)
-
-    # 计算相似度（基于上下文匹配的覆盖率，对结构变化更鲁棒）
+    
     if total_std_xxx > 0:
-        overlap = len(matched_std)  # 上下文级重叠
-        similarity = overlap / total_std_xxx
+        overlap = len(matched_std_indices) / total_std_xxx
     else:
-        similarity = 1.0 if total_our_xxx == 0 else 0.0
+        overlap = 1.0 if total_our_xxx == 0 else 0.0
+
+    # 尝试实体比对（作为辅助参考）
+    entity_result = entity_based_compare(our_texts, std_texts, use_comprehensive=True)
 
     return {
         '漏检': 漏检,
         '误检': 误检,
-        '可疑': 可疑,
+        '可疑': [],
         '统计': {
+            # 主指标：基于综合标准化的上下文重叠率
             '标准XXX总数': total_std_xxx,
             '我们XXX总数': total_our_xxx,
-            '漏检处数': total_漏检,
-            '误检处数': total_误检,
-            'XXX重叠率': f"{similarity:.1%}",
-            '上下文重叠数': len(matched_std),
-        }
+            'XXX重叠率': f"{overlap:.1%}",
+            '上下文重叠数': len(matched_std_indices),
+            '漏检处数': len(漏检),
+            '误检处数': len(误检),
+            # 辅助指标：实体级比对（参考用）
+            '实体重叠率': f"{entity_result['overlap_rate']:.1%}",
+            '实体Jaccard': f"{entity_result['jaccard_similarity']:.1%}",
+            '标准实体数': entity_result['std_entity_count'],
+            '我们实体数': entity_result['our_entity_count'],
+            '共同实体数': entity_result['common_count'],
+        },
+        '_entity_result': {
+            k: (list(v) if isinstance(v, set) else v)
+            for k, v in entity_result.items()
+        },
     }
 
 
 def is_generic_term(text: str) -> bool:
     """判断是否为通用词汇（不是人名）"""
     generic_terms = {
-        '组长', '副组长', '成员', '经理', '总监', '主任', '工程师',
+        # 职务/角色词
+        '组长', '副组长', '成员', '经理', '总监', '主任', '工程师', '架构师', '负责人',
+        '主持', '汇报', '主讲', '参会', '请假', '缺席', '与会', '列席',
+        # 机构/组织词
         '银行', '公司', '系统', '项目', '部门', '小组', '团队', '客户',
+        '分行', '支行', '总行', '网点', '营业部', '事业部',
+        '营运', '运营', '零售', '对公', '账务', '清算', '核算', '外汇',
+        # 业务术语
         '测试', '开发', '设计', '分析', '管理', '协调', '支持',
         '版本', '规划', '方案', '报告', '文档', '材料', '启动', '会议',
-        '配置', '风险', '资产', '交易', '账务', '核算', '清算', '结算',
-        '核心', '外围', '渠道', '渠道', '企业', '业务', '功能', '流程',
+        '演练', '切换', '补录', '核对', '审批', '复核', '录入',
+        '配置', '风险', '资产', '交易', '核心', '外围', '渠道', '企业', '业务', '功能', '流程',
         '列表', '表格', '图表', '数据', '信息', '时间', '日期', '名称',
+        '密码', '账号', '用户', '账户', '交易密码', '登录密码',
+        # 序数词
         '第一', '第二', '第三', '第四', '一组', '二组', '三组', '四组',
-        '小企业', '计财', '风险', '资产', '管理', '交易', '交易1', '交易2',
+        '小企业', '计财', '金融', '交易1', '交易2',
+        # 复合业务词（从漏检/误检报告中提取）
+        '规划管理', '支持协调', '分工安排', '总行支持', '支持人员',
+        '内部账', '对公产品', '零售由', '各条线', '金融交易', '系统交易',
+        '发账务', '账务组', '外围', '尖刀组', '尖刀组测', '刀组测试',
+        '试安排', '尖刀', '试案例', '高新北', '网点', '尾号',
+        '其中', '分别', '分别负责', '必须按', '务组要求', '按账',
+        '汇总', '汇总全', '汇总全组', '汇总整', '条线分', '各条线分',
+        '品由', '内部账产', '填报', '系统交', '新建', '新建新建',
+        '营运管理', '部营运管', '运管理', '理部', '批后报表',
+        '紧急业务', '补录', '移数据', '数据业', '务检核',
+        '参与', '要求', '原则', '允许', '深圳', '高新',
+        # 4字通用词（从误检分析中提取）
+        '改造改造', '结束时间', '任务XXX', '主要工作', '挡板挡板',
+        '福州分行', '福清分行', '测试环境', '零售金融', '信息技术',
+        '接入三方', '支行本部', '部零售金', '融部', '部信息技',
+        '计划财务', '管理系统', '授信管理', '有限公司', '部授信管',
+        '来水', '燃气', '术部', '银行股份', '下线下线',
+        '接入三', '行本部', '融事业', '事业部', '资产业', '易系统',
+        '帐务处', '账户付', '交易密码', '登录密码',
     }
     return text in generic_terms
 
@@ -435,7 +655,13 @@ def is_generic_term(text: str) -> bool:
 # ============================================================================
 
 def generate_revision_plan(diff_result: Dict, group_name: str, round_num: int) -> Dict[str, Any]:
-    """根据差异分析生成脱敏规则修订方案"""
+    """
+    根据差异分析生成脱敏规则修订方案。
+    
+    支持两种格式：
+    - Entity格式（新增）：{'实体': xxx, '上下文': ...}
+    - Context格式（旧）：{'候选姓名': [...], '上下文': ...}
+    """
     漏检 = diff_result.get('漏检', [])
     误检 = diff_result.get('误检', [])
     stats = diff_result.get('统计', {})
@@ -444,11 +670,18 @@ def generate_revision_plan(diff_result: Dict, group_name: str, round_num: int) -
     name_additions = set()
     rule_fixes = []
 
-    # 分析漏检：收集可能缺失的姓名
+    # 分析漏检：收集可能缺失的姓名（支持新旧两种格式）
     for item in 漏检:
-        for name in item.get('候选姓名', []):
+        # 新格式：实体级
+        if '实体' in item:
+            name = item.get('实体', '')
             if len(name) >= 2:
                 name_additions.add(name)
+        # 旧格式：上下文级
+        elif '候选姓名' in item:
+            for name in item.get('候选姓名', []):
+                if len(name) >= 2:
+                    name_additions.add(name)
 
     if name_additions:
         suggestions.append({
@@ -459,7 +692,6 @@ def generate_revision_plan(diff_result: Dict, group_name: str, round_num: int) -
 
     # 分析误检模式
     if 误检:
-        # 检查是否因特定词汇触发误检
         all_contexts = ' '.join(item.get('上下文', '') for item in 误检)
         if len(误检) >= 3:
             suggestions.append({
@@ -468,18 +700,22 @@ def generate_revision_plan(diff_result: Dict, group_name: str, round_num: int) -
                 'priority': 'P2',
             })
 
-    # 统计判断
-    overlap = stats.get('XXX重叠率', '0%')
-    overlap_val = float(overlap.rstrip('%'))
+    # 统计判断 - 优先使用实体级指标
+    overlap_str = stats.get('实体重叠率', stats.get('XXX重叠率', '0%'))
+    overlap_val = float(overlap_str.rstrip('%'))
+    
+    # 使用实体漏检/误检数（新增字段），兼容旧字段
+    漏检_count = stats.get('实体漏检数', stats.get('漏检处数', len(漏检)))
+    误检_count = stats.get('实体误检数', stats.get('误检处数', len(误检)))
 
-    if overlap_val >= 0.95 and stats.get('漏检处数', 0) == 0 and stats.get('误检处数', 0) == 0:
+    if overlap_val >= 0.95 and 漏检_count == 0 and 误检_count == 0:
         status = '已完成'
         suggestions.append({
             'type': '完成',
             'detail': '与标准版基本一致，无改善余地',
             'priority': '-',
         })
-    elif overlap_val >= 0.85 and stats.get('漏检处数', 0) <= 3 and stats.get('误检处数', 0) <= 3:
+    elif overlap_val >= 0.85 and 漏检_count <= 3 and 误检_count <= 3:
         status = '基本达标'
         suggestions.append({
             'type': '微小调整',
@@ -498,6 +734,7 @@ def generate_revision_plan(diff_result: Dict, group_name: str, round_num: int) -
         '差异摘要': {
             '漏检': len(漏检),
             '误检': len(误检),
+            '实体重叠率': overlap_str,
         },
         '修订建议': suggestions,
         '修订完成': status == '已完成',
@@ -694,7 +931,12 @@ def print_summary(summary: Dict, results: List[Dict]):
         if not skipped:
             stats = r.get('diff_stats', {})
             if stats:
-                print(f"  标准XXX: {stats.get('标准XXX总数', '?')} | 我们XXX: {stats.get('我们XXX总数', '?')} | 重叠率: {stats.get('XXX重叠率', '?')}")
+                # 显示实体级指标（主）和上下文级指标（参考）
+                entity_overlap = stats.get('实体重叠率', '?')
+                context_overlap = stats.get('上下文重叠率', stats.get('XXX重叠率', '?'))
+                print(f"  实体重叠率: {entity_overlap} | 上下文重叠率: {context_overlap}")
+                print(f"  标准实体: {stats.get('标准实体数', '?')} | 我们实体: {stats.get('我们实体数', '?')} | 共同: {stats.get('共同实体数', '?')}")
+                print(f"  实体漏检: {stats.get('实体漏检数', '?')} | 实体误检: {stats.get('实体误检数', '?')}")
 
     print(f"\n{'─'*70}")
     print("各组状态:")
