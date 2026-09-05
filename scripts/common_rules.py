@@ -103,6 +103,21 @@ EXCLUDED_COMMON_WORDS: set = {
     "牵头行", "主办行", "参加行",
     # 地理词（需上下文判断，"台湾海峡"保留，"海峡银行"触发替换）
     "台湾海峡", "海峡两岸", "海峡地区",
+    # 常见二字词（Rule A 误捕防护：姓氏+常用字构成的非姓名词）
+    # 姓+名用字池中的字 → 但整体非姓名（如"骨干"/"成功"/"创业"等）
+    "骨干", "成员", "成功", "创业", "兴业", "恒信", "隆昌",
+    "腾飞", "卓越", "领先", "领先", "稳健", "合规", "风控",
+    "运营", "管理", "发展", "建设", "推进", "落实", "完善",
+    "深化", "提升", "优化", "创新", "改革", "转型", "突破",
+    "协同", "联动", "共享", "共建", "共赢", "互利", "互惠",
+    "有序", "有效", "有力", "全面", "整体", "系统", "重点",
+    "核心", "关键", "主要", "重要", "基本", "根本", "本质",
+    "主体", "主题", "主线", "主流", "主动", "主力", "主导",
+    "主线", "主力", "主导", "主责", "主抓", "主办", "主推",
+    # 分组标签（如 Excel 中"第六排\n（临时新增）"，姓+量词结构非人名）
+    "第一", "第二", "第三", "第四", "第五", "第六", "第七",
+    "第八", "第九", "第十", "第十一", "第十二",
+    "排", "组", "批", "批注", "列", "行", "号",
 }
 
 
@@ -213,6 +228,17 @@ def _apply_address_pass(text: str) -> str:
             continue
         # 保护：前缀紧邻已替换的 XX 占位符（避免对 "XX支行" 二次替换）
         if i - 1 >= 0 and text[i - 1] == "X":
+            continue
+        # 保护：前缀从文本开头开始（i==0）且后缀为单字地址词（镇/街/路/村/县/市/区/省/楼/栋）
+        # 此时 text[last:i] = text[0:0] = ''，姓氏会被丢失，且单字后缀在人名中更常见 → 跳过
+        if i == 0 and len(suf) == 1:
+            continue
+        # 保护：回溯跨越了 XML/HTML 关闭标签边界（'>'），如 <t>黄日镇</t> 中 '>' 在 collected 外
+        # 若回溯停止位置 i>0 且 text[i-1] 是 '>'，说明前缀跨越了 </t> 等关闭标签，不应视为地址
+        if i > 0 and text[i - 1] == ">":
+            continue
+        # 保护：后缀紧邻 '<'（XML 关闭标签如 </t>镇），跳过
+        if s_start > 0 and text[s_start - 1] == "<":
             continue
         # 保护：后缀+下一字组合（市场部/区别/县长等）
         nxt = text[s_end] if s_end < len(text) else ""
@@ -588,17 +614,17 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
     # 名字汉字类（供两个规则使用）
     name_char_class = '[' + name_pool_chars + ']'
 
-    # 规则A：姓氏 + 1-2个名字汉字
+    # 规则A：姓氏 + 1-3个名字汉字（支持二字和三字人名如"陈斌""郑学钟"）
     # 左边界：阻止 ASCII/数字前缘（防止英文单词残段匹配）
     # 右边界：仅阻止 ASCII/数字跟随，释放 CJK 跟随（使"柳长春主持"可匹配）
-    # 复姓优先：2字复姓 + 1-2个名字汉字（防止复姓第二字被单姓规则误匹配）
+    # 复姓优先：2字复姓 + 1-3个名字汉字（防止复姓第二字被单姓规则误匹配）
     compound_surnames = cfg.get("compound_surnames", [])
     if compound_surnames:
         compound_alt = '|'.join(re.escape(s) for s in sorted(compound_surnames, key=len, reverse=True))
         patterns.append((
             re.compile(
                 rf'(?<![a-zA-Z0-9])'
-                rf'(?:{compound_alt}){name_char_class}{{1,2}}'
+                rf'(?:{compound_alt}){name_char_class}{{1,3}}'
                 rf'(?![a-zA-Z0-9])'
             ),
             rep.get("NAME", "XXX")
@@ -606,7 +632,7 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
     patterns.append((
         re.compile(
             rf'(?<![a-zA-Z0-9])'
-            rf'(?:{surname_alt}){name_char_class}{{1,2}}'
+            rf'(?:{surname_alt}){name_char_class}{{1,3}}'
             rf'(?![a-zA-Z0-9])'
         ),
         rep.get("NAME", "XXX")
@@ -628,7 +654,7 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
     # 全角冒号已由 Rule C 处理；半角冒号(:)ASCII 不在 [\u4e00-\u9fa5] 范围，需单独处理
     patterns.append((
         re.compile(
-            rf'(?<=:)(?:{surname_alt}){name_char_class}{{1,2}}(?![a-zA-Z0-9])'
+            rf'(?<=:)(?:{surname_alt}){name_char_class}{{1,3}}(?![a-zA-Z0-9])'
         ),
         rep.get("NAME", "XXX")
     ))
@@ -650,7 +676,7 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
     # 右边界：允许CJK汉字跟随（如"由XXX负责"），阻止ASCII/数字跟随。
     patterns.append((
         re.compile(
-            rf'(?<=由)(?:{surname_alt}){name_char_class}{{1,2}}(?![a-zA-Z0-9])'
+            rf'(?<=由)(?:{surname_alt}){name_char_class}{{1,3}}(?![a-zA-Z0-9])'
         ),
         rep.get("NAME", "XXX")
     ))
@@ -661,7 +687,7 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
     _verb_alt = '|'.join(re.escape(v) for v in _name_follow_verbs)
     patterns.append((
         re.compile(
-            rf'(?<=(?:{_verb_alt}))(?:{surname_alt}){name_char_class}{{1,2}}(?![a-zA-Z0-9])'
+            rf'(?<=(?:{_verb_alt}))(?:{surname_alt}){name_char_class}{{1,3}}(?![a-zA-Z0-9])'
         ),
         rep.get("NAME", "XXX")
     ))
@@ -730,10 +756,41 @@ def apply_redactions(text: str) -> str:
         ('XXX务部', '计财财务部'),
         # Rule A 右边界放宽后新增：时不我待（时不+我=误匹配）
         ('XXX我待', '时不我待'),
+        # Rule A 误捕二字常用词（如"骨干成员"→"骨XXX员"）
+        # 策略：将 XXX 替换回原始词（XXX 前后必须是原字符，且构成完整误脱词）
+        ('骨干XXX员', '骨干成员'),
+        # 扩大：姓氏+XXX+常用后缀 的误脱恢复
     ]
     for wrong, correct in post_fixes:
         if wrong in result:
             result = result.replace(wrong, correct)
+
+    # 恢复被地址通道误截断的姓名（如"黄日镇"被地址通道处理为"XX镇"）
+    # 策略：扫描 "姓氏+XX+名字池单字" 模式，如"黄XX镇" → "XXX"
+    # 姓氏后面紧跟 XX（地址占位符），XX后是名字池中的单字（镇/璇/钟等）
+    cfg = _load_config()
+    name_pool_chars = cfg.get("name_pool", "")
+    _surname_set_recovery = SURNAME_SET  # 引用全局姓氏集
+    _name_chars = set(name_pool_chars)  # 名字用字集合
+    # 扫描所有 XX{single_name_char} 的位置
+    _pos = 0
+    while True:
+        _idx = result.find('XX', _pos)
+        if _idx < 0:
+            break
+        # 检查 XX 前一个字符是否是姓氏
+        if _idx > 0:
+            _ch_before = result[_idx - 1]
+            if _ch_before in _surname_set_recovery:
+                # 检查 XX 后是否紧跟名字池单字
+                if _idx + 2 < len(result):
+                    _ch_after = result[_idx + 2]
+                    if _ch_after in _name_chars:
+                        # 姓氏 + XX + 名字单字 → 姓氏 + XXX（完整姓名）
+                        result = result[:_idx - 1] + 'XXX' + result[_idx + 3:]
+                        _pos = _idx - 1  # 从 XXX 后继续扫描
+                        continue
+        _pos = _idx + 1
 
     # DATE 后处理：DATE pattern 把日期替换为 YYYY年MM月DD日，
     # 但"应为2022年3月31日"中的日期是通用日期描述不应被替换。
