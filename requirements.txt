@@ -3,6 +3,7 @@
 
 # 核心依赖
 lxml           # Word/Excel/PPT XML 操作（所有脚本共用）
+requests       # LLM 客户端（llm_client.py 调用 MiniMax API）
 
 # Word 文档
 python-docx    # 辅助解析（可选，主要用 lxml）

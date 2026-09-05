@@ -310,11 +310,13 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
         rep.get("MOBILE", "XXXXXXXXXXX")
     ))
 
-    # ---------- 8. 固定电话（已禁用：标准版不使用） ----------
-    # patterns.append((
-    #     re.compile(r"0\d{2,3}[-\s]?\d{7,8}"),
-    #     rep.get("PHONE", "0XX-XXXXXXXX")
-    # ))
+    # ---------- 8. 固定电话（已启用：精确等长替换） ----------
+    # 策略：分两段替换，0XX- 占3位 + 8位数字 = 11位，与原区号-号码格式等长
+    # 例如：0371-85519208(12位) → 0XX-85519208(11位)，避免替换后长度变化导致 XML 节点错位
+    patterns.append((
+        re.compile(r"0(\d{2,3})-(\d{7,8})"),
+        lambda m: f"0XX-{m.group(2)}"  # 区号部分替换为0XX，保持总长11位
+    ))
 
     # ---------- 9. 日期范围（P1.3 合规修复：保留连接符和相对关系） ----------
     year4_cn = r'[〇二三四五六七八九0-9]{4}'
@@ -618,6 +620,15 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
     patterns.append((
         re.compile(
             rf'(?<=[\u4e00-\u9fa5\uff1a])(?:{surname_alt}){name_char_class}{{2}}(?![a-zA-Z0-9])'
+        ),
+        rep.get("NAME", "XXX")
+    ))
+
+    # 规则C-1：半角冒号后姓名（如"联系人:方培培"）
+    # 全角冒号已由 Rule C 处理；半角冒号(:)ASCII 不在 [\u4e00-\u9fa5] 范围，需单独处理
+    patterns.append((
+        re.compile(
+            rf'(?<=:)(?:{surname_alt}){name_char_class}{{1,2}}(?![a-zA-Z0-9])'
         ),
         rep.get("NAME", "XXX")
     ))

@@ -114,14 +114,15 @@ def _redistribute_text_nodes(t_nodes: list, redacted: str) -> None:
     """
     将 redacted 文本正确分配到同 run 的所有 w:t 节点。
 
-    策略：按原始各 w:t 节点的长度比例为依据，将 redacted 文本逐节点填充。
-    若 redacted 比原始总长短，清空后的 w:t 保留空字符串；
-    若 redacted 比原始总长长，溢出追加到最后节点。
+    策略：按原始各 w:t 节点的长度精确计算字符区间，
+    将 redacted 文本直接按区间切片分配。
+    避免 round() 累加导致的舍入误差导致的节点间字符错位。
 
-    修复说明：
-      旧逻辑只写 t_nodes[0] 后清空其余节点，导致多 t_node 时文本全堆积
-      到第一个 w:t（XML腐败根因之一）。本函数确保 redacted 文本按原始
-      结构分配到各 w:t 节点。
+    修复记录（v3 - 2026-09-05）：
+      旧逻辑用 round() 累加计算配额，当 redacted 文本与 original 长度
+      不等时（如日期 YYYY年MM月DD日 替换 2015年3月29日），round()
+      累加误差会在节点间扩散，导致后续节点内容错位。
+      新逻辑：精确按节点原始起止位置分配 redacted 区间，零舍入误差。
     """
     if not t_nodes:
         return
@@ -135,28 +136,20 @@ def _redistribute_text_nodes(t_nodes: list, redacted: str) -> None:
     total_original = sum(original_lens)
 
     if total_original == 0:
-        # 全空节点，将 redacted 填入第一个，其余清空
         t_nodes[0].text = redacted
         for t in t_nodes[1:]:
             t.text = None
         return
 
-    # 按比例计算每个节点应得的 redacted 字符数
-    pos = 0
-    num_nodes = len(t_nodes)
-    for i in range(num_nodes):
-        if i < num_nodes - 1:
-            # 非末节点：按比例分配
-            quota = round(len(redacted) * original_lens[i] / total_original)
-            quota = max(0, quota)
-        else:
-            # 末节点：拿剩余全部（避免浮点误差导致字符丢失）
-            quota = len(redacted) - pos
-        chunk = redacted[pos:pos + quota]
-        t_nodes[i].text = chunk
-        pos += len(chunk)
-
-    # 确保所有节点已填充（末节点已处理到这里）
+    # 精确位置分配：按节点原始起止位置，直接切片 redacted
+    for i, tn in enumerate(t_nodes):
+        n_start = sum(original_lens[:i])
+        n_end = n_start + original_lens[i]
+        # 最后一个节点拿 redacted 剩余全部（处理舍入）
+        chunk = redacted[n_start:n_end]
+        if i == len(t_nodes) - 1:
+            chunk = redacted[n_start:]
+        tn.text = chunk
 
 
 def _extract_full_text(root) -> tuple:
