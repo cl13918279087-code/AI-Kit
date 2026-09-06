@@ -22,7 +22,7 @@ from common_rules import reset_patterns, apply_redactions, get_config
 
 WORK_DIR = Path("/Users/clzxr/WorkBuddy/Claw/工作目录")
 
-# 五组文件配置
+# 六组文件配置
 FILE_GROUPS = [
     {
         "name": "郑州银行新核心项目启动会材料",
@@ -53,6 +53,12 @@ FILE_GROUPS = [
         "original": "尖刀测试内容.xlsx",
         "standard": "尖刀测试内容_脱敏标准版.xlsx",
         "ext": "xlsx",
+    },
+    {
+        "name": "尖刀组UAT3测试规划",
+        "original": "尖刀组UAT3测试规划0907.docx",
+        "standard": "尖刀组UAT3测试规划0907_脱敏标准版.docx",
+        "ext": "docx",
     },
 ]
 
@@ -99,12 +105,13 @@ def extract_docx_text(path):
 
 
 def extract_text_from_xml(xml_content):
-    """从XML提取文本内容"""
-    # 提取<w:t>标签中的文本
-    texts = re.findall(r'<w:t[^>]*>([^<]*)</w:t>', xml_content)
-    # 提取普通文本节点
-    texts2 = re.findall(r'>([^<]+)<', xml_content)
-    combined = ' '.join(texts + texts2)
+    """从XML提取文本内容（优先标签文本，避免普通文本节点导致重复提取）"""
+    # 提取 <w:t>（Word）或 <a:t>（PPTX）标签文本
+    texts = re.findall(r'<(?:w|a):t[^>]*>([^<]*)</(?:w|a):t>', xml_content)
+    if not texts:
+        # 兜底：提取普通文本节点
+        texts = re.findall(r'>([^<]+)<', xml_content)
+    combined = ' '.join(texts)
     # 清理多余空白
     combined = re.sub(r'\s+', ' ', combined).strip()
     return combined
@@ -130,12 +137,48 @@ def extract_xlsx_text(path):
     return texts
 
 
+def _text_quality_ok(text, min_cjk_ratio=0.15):
+    """校验提取文本质量：中文占比过低说明是二进制刮取垃圾"""
+    if not text:
+        return False
+    cjk = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
+    return cjk / len(text) >= min_cjk_ratio
+
+
 def extract_doc_text(path):
-    """从DOC提取文本（基础方法，尝试多种编码）"""
+    """从DOC提取文本（OOXML伪装.doc自动走docx通道；真OLE2用textutil兜底）"""
     try:
-        # 尝试直接读取二进制，提取可见字符
         with open(path, 'rb') as f:
+            head = f.read(4)
+            f.seek(0)
             raw = f.read()
+        if head[:2] == b'PK':
+            # 实为 OOXML（docx 换壳 .doc），用 docx 通道提取
+            return extract_docx_text(path)
+        # 真 OLE2 .doc：优先 textutil（macOS），次选 LibreOffice，失败再走二进制刮取
+        import subprocess
+        try:
+            r = subprocess.run(["textutil", "-convert", "txt", "-stdout", str(path)],
+                               capture_output=True, text=True, timeout=120)
+            if r.returncode == 0 and len(r.stdout.strip()) > 50:
+                return [re.sub(r'\s+', ' ', r.stdout).strip()]
+        except Exception:
+            pass
+        # LibreOffice 转纯文本（中文 .doc 兼容性好）
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                r = subprocess.run(
+                    ["soffice", "--headless", "--convert-to", "txt:Text",
+                     "--outdir", td, str(path)],
+                    capture_output=True, text=True, timeout=300)
+                txt_files = list(Path(td).glob('*.txt'))
+                if r.returncode == 0 and txt_files:
+                    content = txt_files[0].read_text(errors='replace')
+                    content = re.sub(r'\s+', ' ', content).strip()
+                    if len(content) > 50 and _text_quality_ok(content):
+                        return [content]
+        except Exception:
+            pass
         # 尝试 UTF-16 LE
         try:
             text = raw.decode('utf-16-le', errors='strict')
@@ -179,75 +222,118 @@ def redact_text(text):
     return apply_redactions(text)
 
 
+def _extract_markers(norm_text, radius=15):
+    """提取所有脱敏标记（连续X串，长度>=2）及其上下文。
+
+    上下文以文本内容为键（前缀/后缀），与绝对位置无关——
+    文本头部的增删不会导致全量错位，从根本上消除对齐噪声。
+    """
+    markers = []
+    for m in re.finditer(r'X{2,}', norm_text):
+        before = norm_text[max(0, m.start()-radius):m.start()]
+        after = norm_text[m.end():m.end()+radius]
+        markers.append({'marker': m.group(0), 'before': before, 'after': after})
+    return markers
+
+
 def compare_redactions(our_text, standard_text, group_name):
     """
-    比对我们的脱敏结果与标准版差异
-    返回：{
-        '漏检': [未脱敏的人名],
-        '误检': [被错误脱敏的内容],
-        '其他差异': []
-    }
+    比对我们的脱敏结果与标准版差异（上下文指纹对齐版）
+
+    对齐策略：
+    1. 每个脱敏点提取 (前缀, 后缀) 上下文指纹；
+    2. 按指纹精确匹配（含重复次数配对）；
+    3. 剩余未匹配项用 rapidfuzz 模糊对齐（容忍邻近微小编輯）；
+    4. 仍无法对齐的才判定为真实差异。
+
+    返回：{'漏检': [...], '误检': [...], '统计': {...}}
+    漏检：标准版有脱敏点，我们没有
+    误检：我们有脱敏点，标准版没有
     """
+    from collections import Counter
+    from rapidfuzz import fuzz
+
     results = {
-        '漏检': [],      # 标准版有XXX，我们没有
-        '误检': [],      # 我们有XXX，标准版没有（可能是我们误检）
-        '可疑': [],      # 脱敏标记位置不一致
+        '漏检': [],      # 标准版有脱敏点，我们没有
+        '误检': [],      # 我们有脱敏点，标准版没有（可能是我们误检）
+        '统计': {},
     }
 
-    # 标准化：合并所有空白
-    our_norm = re.sub(r'\s+', '', our_text)
-    std_norm = re.sub(r'\s+', '', standard_text)
+    # 标准化：合并所有空白，去除BOM等零宽字符
+    our_norm = re.sub(r'[\s\ufeff]+', '', our_text)
+    std_norm = re.sub(r'[\s\ufeff]+', '', standard_text)
 
-    # 提取所有 XXX 序列（我们的结果）
-    our_xxx_positions = set()
-    i = 0
-    while i < len(our_norm):
-        if our_norm[i:i+3] == 'XXX':
-            our_xxx_positions.add(i)
-            i += 3
-        else:
-            i += 1
+    our_markers = _extract_markers(our_norm)
+    std_markers = _extract_markers(std_norm)
 
-    # 提取所有 XXX 序列（标准版）
-    std_xxx_positions = set()
-    i = 0
-    while i < len(std_norm):
-        if std_norm[i:i+3] == 'XXX':
-            std_xxx_positions.add(i)
-            i += 3
-        else:
-            i += 1
+    # 第一轮：上下文指纹精确匹配（按出现次数配对）
+    our_counter = Counter((m['before'], m['after']) for m in our_markers)
+    std_counter = Counter((m['before'], m['after']) for m in std_markers)
 
-    # 找出差异区域
-    # 漏检：标准版有XXX，我们没有（在标准版XXX范围内，检测是否有人名）
-    for pos in std_xxx_positions:
-        if pos not in our_xxx_positions:
-            # 检查周围是否有中文人名模式
-            start = max(0, pos - 10)
-            end = min(len(std_norm), pos + 13)
-            context = std_norm[start:end]
-            # 检查是否有人名姓氏模式
-            names = re.findall(r'[\u4e00-\u9fa5]{2,4}', context)
-            if names:
-                results['漏检'].append({
-                    '位置': pos,
-                    '上下文': context,
-                    '可能的姓名': names
-                })
+    leftover_our_keys = Counter()
+    for key, cnt in our_counter.items():
+        matched = min(cnt, std_counter.get(key, 0))
+        if cnt > matched:
+            leftover_our_keys[key] = cnt - matched
+    leftover_std_keys = Counter()
+    for key, cnt in std_counter.items():
+        matched = min(cnt, our_counter.get(key, 0))
+        if cnt > matched:
+            leftover_std_keys[key] = cnt - matched
 
-    # 误检：我们有XXX，标准版没有
-    for pos in our_xxx_positions:
-        if pos not in std_xxx_positions:
-            start = max(0, pos - 10)
-            end = min(len(our_norm), pos + 13)
-            context = our_norm[start:end]
-            names = re.findall(r'[\u4e00-\u9fa5]{2,4}', context)
-            if names:
-                results['误检'].append({
-                    '位置': pos,
-                    '上下文': context,
-                    '可能的姓名': names
-                })
+    # 第二轮：模糊对齐剩余项（容忍上下文±1-2字的微小编辑差异）
+    fuzzy_matched_std = Counter()
+    final_our = Counter()
+    for okey, ocnt in leftover_our_keys.items():
+        remaining = ocnt
+        # 按相似度从高到低尝试匹配标准版剩余指纹
+        candidates = sorted(
+            ((fuzz.ratio(okey[0], skey[0]) * 0.5 +
+              fuzz.ratio(okey[1], skey[1]) * 0.5, skey)
+             for skey in leftover_std_keys
+             if leftover_std_keys[skey] - fuzzy_matched_std.get(skey, 0) > 0),
+            key=lambda x: -x[0])
+        for score, skey in candidates:
+            if remaining <= 0:
+                break
+            if score < 80:
+                break
+            avail = leftover_std_keys[skey] - fuzzy_matched_std.get(skey, 0)
+            take = min(remaining, avail)
+            fuzzy_matched_std[skey] += take
+            remaining -= take
+        if remaining > 0:
+            final_our[okey] = remaining
+
+    final_std = {
+        key: cnt - fuzzy_matched_std.get(key, 0)
+        for key, cnt in leftover_std_keys.items()
+        if cnt - fuzzy_matched_std.get(key, 0) > 0
+    }
+
+    # 生成差异报告
+    for (before, after), cnt in final_std.items():
+        context = f"...{before}█{after}..."
+        results['漏检'].append({
+            '上下文': context,
+            '出现次数': cnt,
+            '可能的姓名': re.findall(r'[\u4e00-\u9fa5]{2,4}', after[:6]),
+        })
+    for (before, after), cnt in final_our.items():
+        context = f"...{before}█{after}..."
+        results['误检'].append({
+            '上下文': context,
+            '出现次数': cnt,
+            '可能的姓名': re.findall(r'[\u4e00-\u9fa5]{2,4}', after[:6]),
+        })
+
+    aligned = min(len(our_markers), len(std_markers)) - \
+        sum(final_our.values()) - sum(final_std.values())
+    results['统计'] = {
+        '标准版脱敏点': len(std_markers),
+        '我们脱敏点': len(our_markers),
+        '对齐成功': max(0, aligned),
+    }
 
     return results
 
