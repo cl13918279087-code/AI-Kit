@@ -61,6 +61,7 @@ def redact_docx(input_path: str, output_path: str, detector=None) -> dict:
     """
     tmp_dir = Path(tempfile.mkdtemp(prefix="redact_docx_"))
     counts = {}
+    _MANUAL_CHECK_ITEMS.clear()  # R7：每次处理重置人工检查清单
 
     try:
         # ① 解压
@@ -97,9 +98,10 @@ def redact_docx(input_path: str, output_path: str, detector=None) -> dict:
             _process_xml_file(core_xml, "文档属性")
 
         # ⑦ 银行 Logo 图片（文件名含敏感关键词 → 纯黑图）
+        # R6：页眉/页脚 .rels 引用的图片一律确定性遮盖，不赌 OCR/尺寸检测
         media_dir = tmp_dir / "word" / "media"
         if media_dir.exists():
-            _redact_bank_logos(media_dir)
+            _redact_bank_logos(media_dir, force_names=_header_footer_image_names(tmp_dir))
 
         # ⑧ 重新打包
         _repack_docx(tmp_dir, output_path)
@@ -430,11 +432,47 @@ def _process_xml_file(path: Path, label: str = "") -> None:
         print(f"  [警告] 处理 {label} 出错: {e}", file=sys.stderr)
 
 
-def _redact_bank_logos(media_dir: Path) -> None:
+# R7（2026-09-06）：静默失败治理 —— 所有无法自动处理/处理失败的媒体项
+# 显式收集到人工检查清单，处理结束时统一汇报，绝不默默放过。
+_MANUAL_CHECK_ITEMS: list = []
+
+
+def _mark_manual_check(item: str, reason: str) -> None:
+    """记录一项需人工检查的媒体/处理异常。"""
+    _MANUAL_CHECK_ITEMS.append((item, reason))
+    print(f"  [人工检查] {item}: {reason}", file=sys.stderr)
+
+
+def _header_footer_image_names(tmp_dir: Path) -> set:
+    """
+    R6（2026-09-06）：收集被页眉/页脚 .rels 引用的图片文件名。
+    页眉/页脚图片（银行 Logo/艺术字）一律确定性遮盖，不走"无命中→保留"分支。
+    """
+    names = set()
+    rels_dir = tmp_dir / "word" / "_rels"
+    if not rels_dir.exists():
+        return names
+    image_exts = (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tiff", ".tif", ".webp", ".emf")
+    rels_files = list(rels_dir.glob("header*.xml.rels")) + list(rels_dir.glob("footer*.xml.rels"))
+    for rels in rels_files:
+        try:
+            content = rels.read_text("utf-8", errors="replace")
+        except Exception as e:
+            _mark_manual_check(rels.name, f"页眉/页脚关系文件读取失败: {e}")
+            continue
+        for target in re.findall(r'Target="([^"]+)"', content):
+            base = target.split("/")[-1]
+            if base.lower().endswith(image_exts):
+                names.add(base)
+    return names
+
+
+def _redact_bank_logos(media_dir: Path, force_names: set = None) -> None:
     """
     将银行 Logo 图片替换为纯黑图。
 
     检测策略：
+      0. R6：被页眉/页脚 .rels 引用的图片 → 确定性遮盖（force_names）
       1. 文件名含银行相关关键词（精确匹配）
       2. 小面积图片（宽 x 高 <= 60000 px，且宽>高，典型logo比例）
          用于检测页眉/页脚中的银行标识图片
@@ -443,12 +481,18 @@ def _redact_bank_logos(media_dir: Path) -> None:
     import tempfile, os
 
     keywords = ["bank", "logo", "银行", "brand"]
+    force_names = force_names or set()
     for img_file in media_dir.iterdir():
         redact = False
         reason = ""
 
+        # 策略0：页眉/页脚引用（确定性路径）
+        if img_file.name in force_names:
+            redact = True
+            reason = "页眉/页脚引用图片（确定性遮盖）"
+
         # 策略1：文件名含银行相关关键词
-        if any(k in img_file.name.lower() for k in keywords):
+        if not redact and any(k in img_file.name.lower() for k in keywords):
             redact = True
             reason = "文件名含关键词"
 
@@ -479,7 +523,11 @@ def _redact_bank_logos(media_dir: Path) -> None:
                     os.replace(tmp.name, str(img_file))
                     print(f"  [银行Logo遮盖] {img_file.name}（{reason}）→ 纯黑图")
             except Exception as e:
-                print(f"  [警告] 无法遮盖 {img_file.name}: {e}")
+                # R7：失败不再静默——EMF 等无法解析的格式显式标记人工检查
+                _mark_manual_check(img_file.name, f"遮盖失败（{reason}）: {e}")
+        elif img_file.suffix.lower() in (".emf", ".wmf"):
+            # R7：EMF/WMF 矢量图内嵌文字暂无法自动处理，显式标记人工检查
+            _mark_manual_check(img_file.name, "EMF/WMF 矢量图内嵌文字无法自动处理")
 
 
 def _repack_docx(tmp_dir: Path, output_path: str) -> None:
@@ -592,6 +640,12 @@ def redact_word(input_path: str, output_path: str = None) -> dict:
     if counts:
         for label, n in sorted(counts.items(), key=lambda x: -x[1]):
             print(f"         - {label}: {n} 处")
+
+    # R7（2026-09-06）：人工检查项显式汇报，杜绝静默失败
+    if _MANUAL_CHECK_ITEMS:
+        print(f"\n[人工检查] 共 {len(_MANUAL_CHECK_ITEMS)} 项需人工确认（自动处理失败/不支持）：")
+        for item, reason in _MANUAL_CHECK_ITEMS:
+            print(f"         ! {item}: {reason}")
     return counts
 
 

@@ -118,6 +118,22 @@ EXCLUDED_COMMON_WORDS: set = {
     "第一", "第二", "第三", "第四", "第五", "第六", "第七",
     "第八", "第九", "第十", "第十一", "第十二",
     "排", "组", "批", "批注", "列", "行", "号",
+    # ---- R1 热修（2026-09-06）：v2 改进项清单实测误伤词 ----
+    # 姓氏字+名字池字构成的常用词/短语，命中片段被下列词覆盖时保留原文
+    "说明书", "实施方案", "交易进度", "每周一", "每周二", "每周三",
+    "每周四", "每周五", "每周六", "每周日", "方向明确", "测试阶段",
+    "施工方案", "工作方案", "解决方案", "部署方案", "培训方案",
+    "整改方案", "设计方案", "技术方案", "应急方案", "汇报材料",
+    "操作手册", "用户手册", "指导手册", "培训手册", "管理制度",
+    "管理办法", "管理规定", "工作计划", "项目计划", "测试计划",
+    "实施计划", "工作安排", "进度安排", "日程安排", "会议纪要",
+    "会议记录", "工作总结", "技术方案", "操作规程", "管理规范",
+    "时间节点", "时间安排", "文明施工", "单元测试", "集成测试",
+    "系统测试", "验收测试", "性能测试", "压力测试", "回归测试",
+    "程度评估", "平时检查", "方便快捷", "时间成本", "明书",
+    "骨干成员", "阶段范围", "测试阶段范围", "实施阶段", "开发阶段",
+    "准备阶段", "调研阶段", "设计阶段", "部署阶段", "上线阶段",
+    "启动阶段", "执行阶段", "验收阶段", "试运行阶段", "收尾阶段",
 }
 
 
@@ -160,6 +176,43 @@ _ADDRESS_GUARDS = {
 _ADDRESS_SUFFIX_RE = re.compile(
     "|".join(re.escape(s) for s in sorted(_ADDRESS_SUFFIXES, key=len, reverse=True))
 )
+
+
+# ---------------------------------------------------------------------------
+# R1 常用词覆盖保护（2026-09-06）：姓名规则命中片段若被排除词包含，则保留原文
+# 背景：闭集"姓氏字+名字池字"正则对"说明书→说XXX"类高频词误伤率达 90%
+# （见《redact_docx_v2改进项清单》改进1），本函数在姓名规则应用层做过滤。
+# ---------------------------------------------------------------------------
+
+def _is_protected_by_common_word(text: str, start: int, end: int) -> bool:
+    """判断 text[start:end] 命中片段是否被某个排除常用词完整覆盖。"""
+    matched = text[start:end]
+    if matched in EXCLUDED_COMMON_WORDS:
+        return True
+    window_start = max(0, start - 8)
+    window_end = min(len(text), end + 8)
+    window = text[window_start:window_end]
+    for word in EXCLUDED_COMMON_WORDS:
+        if len(word) < 2:
+            continue
+        idx = window.find(word)
+        while idx >= 0:
+            ws = window_start + idx
+            we = ws + len(word)
+            # 命中片段是排除词的真子串（如"明书"⊂"说明书"）→ 常用词，保留
+            if ws <= start and end <= we and (ws, we) != (start, end):
+                return True
+            idx = window.find(word, idx + 1)
+    return False
+
+
+def _name_guard_sub(pattern: re.Pattern, text: str, replacement: str) -> str:
+    """带常用词保护的姓名规则替换。"""
+    def _repl(m: re.Match) -> str:
+        if _is_protected_by_common_word(m.string, m.start(), m.end()):
+            return m.group(0)
+        return replacement
+    return pattern.sub(_repl, text)
 
 
 def _apply_address_pass(text: str) -> str:
@@ -368,11 +421,12 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
         rep.get("DATE_CHINESE", "YYYY年MM月DD日") + r'\2' + rep.get("DATE_CHINESE", "YYYY年MM月DD日")
     ))
     # 斜杠日期范围：2022/04/08 至 2022/04/10
+    # R2 修复（2026-09-06）：右端 $ 锚点导致正文中日期永不命中（漏脱敏），改为 (?![0-9])
     patterns.append((
         re.compile(
             rf'({year4_ar}/(?:0?[1-9]|1[0-2])/(?:0?[1-9]|[12]\d|3[01]))'
             r'(\s*(?:至|——|[-~])\s*)'
-            rf'({year4_ar}/(?:0?[1-9]|1[0-2])/(?:0?[1-9]|[12]\d|3[01])$)'
+            rf'({year4_ar}/(?:0?[1-9]|1[0-2])/(?:0?[1-9]|[12]\d|3[01]))(?![0-9])'
         ),
         rep.get("DATE", "YYYY/MM/DD") + r'\2' + rep.get("DATE", "YYYY/MM/DD")
     ))
@@ -381,7 +435,7 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
         re.compile(
             rf'({year4_ar}-(?:0?[1-9]|1[0-2])-(?:0?[1-9]|[12]\d|3[01]))'
             r'(\s*(?:至|——|[-~])\s*)'
-            rf'({year4_ar}-(?:0?[1-9]|1[0-2])-(?:0?[1-9]|[12]\d|3[01])$)'
+            rf'({year4_ar}-(?:0?[1-9]|1[0-2])-(?:0?[1-9]|[12]\d|3[01]))(?![0-9])'
         ),
         rep.get("DATE", "YYYY/MM/DD") + r'\2' + rep.get("DATE", "YYYY/MM/DD")
     ))
@@ -395,24 +449,39 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
         rep.get("DATE_CHINESE", "YYYY年MM月DD日")
     ))
     # YYYY/MM/DD
+    # R2 修复：$ → (?![0-9])，正文中的日期（如"2020/5/1实施"）此前永不命中
     patterns.append((
-        re.compile(rf'{year4_ar}/(?:0?[1-9]|1[0-2])/(?:0?[1-9]|[12]\d|3[01])$'),
+        re.compile(rf'{year4_ar}/(?:0?[1-9]|1[0-2])/(?:0?[1-9]|[12]\d|3[01])(?![0-9])'),
         rep.get("DATE", "YYYY/MM/DD")
     ))
     # YYYY-MM-DD
     patterns.append((
-        re.compile(rf'{year4_ar}-(?:0?[1-9]|1[0-2])-(?:0?[1-9]|[12]\d|3[01])$'),
+        re.compile(rf'{year4_ar}-(?:0?[1-9]|1[0-2])-(?:0?[1-9]|[12]\d|3[01])(?![0-9])'),
         rep.get("DATE", "YYYY/MM/DD")
     ))
     # 中文年月（独立）
+    # R2 修复：显式吞掉"月"字，避免阿拉伯年月规则先吃掉"2020年5"残留"月"字
+    # 占位符用独立的年月键，避免取到含 DD日 的完整日期占位
     patterns.append((
-        re.compile(rf'{year4_cn}年{month_pat}(?![\s\d\u4e00-\u9fff日])'),
-        rep.get("DATE_CHINESE", "YYYY年MM月")
+        re.compile(rf'{year4_cn}年{month_pat}月(?![0-9日])'),
+        rep.get("DATE_CHINESE_MONTH", "YYYY年MM月")
     ))
-    # 阿拉伯数字年月
+    # 阿拉伯数字年月（后跟"月"的场景由上一条处理）
     patterns.append((
-        re.compile(rf'{year4_ar}年(?:0?[1-9]|1[0-2])(?!月?[0-9日])'),
+        re.compile(rf'{year4_ar}年(?:0?[1-9]|1[0-2])(?!月|[0-9日])'),
         rep.get("DATE", "YYYY/MM")
+    ))
+    # R2 新增：无年份中文短日期"X月X日"（如"5月20日发布"）
+    # 左边界阻止年份残留（YYYY年X月X日 已由上方完整规则先替换）与数字
+    patterns.append((
+        re.compile(r'(?<![0-9年])(?:0?[1-9]|1[0-2])月(?:[0-3]?[0-9])日(?![0-9])'),
+        rep.get("DATE_CHINESE_SHORT", "MM月DD日")
+    ))
+    # R2 新增：无年份斜杠短日期"M/D"（如"截止9/1上报"）
+    # 边界阻止长数字串/小数/日期已替换场景
+    patterns.append((
+        re.compile(r'(?<![0-9/.])(?:0?[1-9]|1[0-2])/(?:0?[1-9]|[12][0-9]|3[01])(?![0-9/])'),
+        rep.get("DATE_SHORT", "MM/DD")
     ))
 
     # ---------- 11. 银行名称（从配置动态加载，完全动态化） ----------
@@ -439,6 +508,14 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
                 re.compile(bank_pattern),
                 rep.get("BANK", "XX银行")
             ))
+
+        # ---------- 11c. 银行名称兜底（R3，2026-09-06） ----------
+        # 白名单外的银行名（如"宁夏银行"）此前不被命中，反被姓名规则截胡为"宁XXX行"。
+        # 通用模式：2-6个汉字 + 银行。占位符"XX银行"的前缀为非汉字字符，不会二次命中。
+        patterns.append((
+            re.compile(r'[\u4e00-\u9fa5]{2,6}银行'),
+            rep.get("BANK", "XX银行")
+        ))
 
         # ---------- 11b. 分支行名称（动态从 bank_names 提取） ----------
         # 提取城市/地区前缀 + 支行/营业部/分行等后缀
@@ -742,9 +819,10 @@ def apply_redactions(text: str) -> str:
     # 必须在姓名规则之前执行，防止"金水/花园"等地址成分被姓名规则误吞
     result = _apply_address_pass(result)
 
-    # 第三阶段：姓名规则
+    # 第三阶段：姓名规则（R1：带常用词覆盖保护，"说明书→说XXX"类误伤在应用层过滤）
+    _name_repl = get_replacement("NAME", "XXX")
     for pattern, replacement in name_patterns:
-        result = pattern.sub(replacement, result)
+        result = _name_guard_sub(pattern, result, replacement)
 
     # 后处理：纠正已知误脱敏
     # 1. 姓名模式误匹配中文词（Rule A 右边界放宽后，可能对常用词造成误匹配）
