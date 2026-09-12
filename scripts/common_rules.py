@@ -135,6 +135,8 @@ EXCLUDED_COMMON_WORDS: set = {
     # ---- R-③（v1.3.2，响应 Issue #6）：基线语料实测误伤词 ----
     # 章/练/和 等姓氏字与常用词撞字：命中片段被下列词覆盖时保留原文
     "章程", "演练方案", "和业务", "交易一部", "时业务",
+    # ---- R-⑩（v1.3.3，响应 Issue #10-B）：尖刀语料实测误伤残余 ----
+    "黎明", "时不用", "部支一七", "部提七", "金进行",
     "准备阶段", "调研阶段", "设计阶段", "部署阶段", "上线阶段",
     "启动阶段", "执行阶段", "验收阶段", "试运行阶段", "收尾阶段",
 }
@@ -200,10 +202,30 @@ _ADDRESS_SUFFIX_RE = re.compile(
 # （见《redact_docx_v2改进项清单》改进1），本函数在姓名规则应用层做过滤。
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# R-⑨（v1.3.3，响应 Issue #10-B）：二字姓名前向双字组合守卫
+#
+# 背景：尖刀语料中"交易明细→交XXX细""资金周转→资XXX周"类误伤，根因是
+# 姓氏池字（易/金/费/史/支/单…）与前一字构成常用双字组合（交易/资金/消费/
+# 历史/收支/存单…）。命中片段被排除词逐个收录属打地鼠，本守卫在规则应用层
+# 统一判断：二字姓名命中若"首字与前一字"构成常用组合则保留原文。
+# 仅作用于 2 字命中，3 字姓名（如"张金进"）不受影响，避免"王进+行"类误保护。
+# ---------------------------------------------------------------------------
+
+_COMMON_BIGRAMS: set = {
+    "交易", "资金", "消费", "历史", "收支", "存单", "记账", "转存",
+    "部支", "业务", "会计", "结算", "清算", "汇兑", "票证", "凭证",
+}
+
+
 def _is_protected_by_common_word(text: str, start: int, end: int) -> bool:
     """判断 text[start:end] 命中片段是否被某个排除常用词完整覆盖。"""
     matched = text[start:end]
     if matched in EXCLUDED_COMMON_WORDS:
+        return True
+    # R-⑨：二字姓名前向双字组合守卫（"交易"易明/"资金"金周 等）
+    if (len(matched) == 2 and start > 0
+            and text[start - 1] + matched[0] in _COMMON_BIGRAMS):
         return True
     window_start = max(0, start - 8)
     window_end = min(len(text), end + 8)
@@ -875,6 +897,111 @@ def _label_for_replacement(replacement: str) -> str:
     return "其他"
 
 
+# ---------------------------------------------------------------------------
+# R-⑥（v1.3.3，响应 Issue #10-A）：段落级差异回写（通用工具，DOCX/PPTX 共用）
+# ---------------------------------------------------------------------------
+
+def redistribute_paragraph(texts: list, redacted: str) -> list:
+    """
+    段落级差异回写。
+
+    Word/PPT 常把一句话拆进多个 run（拼写检查/字体切换），per-run 处理会漏掉
+    跨 run 实体（"2015年4月"+"3日"、"2017"+"年"+"3"+"月"、跨 run 邮箱等）。
+    本函数在整段文本 apply_redactions 后，用 SequenceMatcher 差异区间把变更
+    精确回写到各 run 节点：未变更的 run 文本原样保留（格式不破坏），
+    变更文本写入首个受影响节点。
+
+    texts: 段内各 run 的原始文本（按文档顺序）
+    redacted: 整段脱敏后的文本
+    返回: 与 texts 等长的新文本列表
+    """
+    import difflib
+    combined = "".join(texts)
+    if combined == redacted:
+        return list(texts)
+
+    n = len(texts)
+    starts = [0] * n
+    pos = 0
+    for k, t in enumerate(texts):
+        starts[k] = pos
+        pos += len(t)
+    total = pos
+
+    def _owner(p: int) -> int:
+        """绝对位置 p（基于原始 combined）所属的节点下标。"""
+        if n == 0:
+            return 0
+        if p >= total:
+            p = total - 1
+        if p < 0:
+            p = 0
+        for k in range(n):
+            s = starts[k]
+            e = s + len(texts[k])
+            if s <= p < e:
+                return k
+        # p 落在空节点边界：返回该空节点或最后一个节点
+        for k in range(n):
+            if starts[k] == p:
+                return k
+        return n - 1
+
+    out = [[] for _ in range(n)]
+    sm = difflib.SequenceMatcher(None, combined, redacted, autojunk=False)
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            # 原文逐节点归还（按节点区间整块分配，保持原 run 文本不动）
+            p = i1
+            while p < i2:
+                k = _owner(p)
+                node_end = starts[k] + len(texts[k])
+                if node_end <= p:  # 空节点，前进
+                    p += 1
+                    continue
+                e = min(i2, node_end)
+                out[k].append(combined[p:e])
+                p = e
+        elif tag == "replace":
+            # 替换文本写入首个受影响节点
+            out[_owner(i1)].append(redacted[j1:j2])
+        elif tag == "insert":
+            # 新增文本：i1==0 写入首节点，否则追加到前一个字符所在节点
+            k = _owner(i1 - 1) if i1 > 0 else 0
+            out[k].append(redacted[j1:j2])
+        # delete：原文丢弃，不产出
+
+    return ["".join(chunks) for chunks in out]
+
+
+# ---------------------------------------------------------------------------
+# R-⑧（v1.3.3，响应 Issue #10-A）：角色上下文英文人名规则
+# ---------------------------------------------------------------------------
+
+_ROLE_KEYWORDS = (
+    "组长", "成员", "经理", "负责人", "联系人", "审批人", "复核人",
+    "参与人", "参加人", "主办人", "主持人", "讲师", "签字人", "接口人",
+)
+_ENGLISH_NAME_RE = re.compile(r"(?<![A-Za-z])[A-Z][a-z]{2,}(?![A-Za-z])")
+
+
+def _apply_english_name_pass(text: str, counts: Dict[str, int]) -> str:
+    """段落含角色词时，遮蔽段内英文人名（Lisa/David 等）。
+    全大写术语（UAT/POS）与句首普通词不受影响——仅匹配首字母大写
+    且非全大写的独立词，且限定角色上下文。"""
+    if not text or not isinstance(text, str):
+        return text
+    out_lines = []
+    for line in text.split("\n"):
+        if any(k in line for k in _ROLE_KEYWORDS):
+            def _repl(m: re.Match) -> str:
+                counts["姓名"] = counts.get("姓名", 0) + 1
+                return "XXX"
+            line = _ENGLISH_NAME_RE.sub(_repl, line)
+        out_lines.append(line)
+    return "\n".join(out_lines)
+
+
 def _counting_sub(pattern: re.Pattern, text: str, replacement,
                   counts: Dict[str, int]) -> str:
     """带计数的规则替换：每处命中 +1，按实际产出占位符归类。
@@ -996,6 +1123,11 @@ def apply_redactions_counted(text: str) -> Tuple[str, Dict[str, int]]:
             result = result[:_idx] + 'XXXX年XX月XX日' + result[_idx+len(_date_placeholder):]
             # 注：该处日期仍处于脱敏状态（仅占位符形式变化），计数不回退
         _pos = _idx + 1
+
+    # R-⑧（v1.3.3，响应 Issue #10-A）：角色上下文英文人名规则
+    # 仅当段落（按行）含角色词时，遮蔽段内首字母大写英文词（Lisa/David…）。
+    # 不做无差别英文遮蔽——UAT/POS/PO/OA 等业务术语不受影响。
+    result = _apply_english_name_pass(result, counts)
 
     return result, counts
 

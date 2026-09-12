@@ -27,6 +27,9 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from common_rules import apply_redactions, apply_redactions_counted
+from common_rules import redistribute_paragraph
+from html import unescape as _html_unescape
+from xml.sax.saxutils import escape as _xml_escape
 
 # 与 redact_excel 同型加固（v1.2.3）：解码 CJK 数字实体，防止工具生成的
 # XML 把中文写成 &#NNNNN; 导致规则层漏检（解码 CJK 区段可安全写回明文）
@@ -124,12 +127,24 @@ def _process_xml_file(path: Path, label: str = "") -> dict:
     对单个 XML 文件执行脱敏，返回分类计数。
     v1.2.3：从"按文件数"（{"XML文件": 1}）升级为"按脱敏处数"，
     与 redact_word/redact_pdf 口径一致（每处替换 +1）。
+    R-⑥（v1.3.3，Issue #10-A）：新增 <a:p> 段落级通道——PPT 与 Word 一样
+    会把一句话拆进多个 <a:t> run（"2017"+"年"+"3"+"月"、"…、黎"+"萍、方"+"培培、"），
+    per-run 处理漏掉跨 run 实体。先做段落级拼接脱敏+差异回写，
+    再做整文件级兜底（占位符幂等）。
     """
     try:
         content = path.read_text("utf-8")
         content = _decode_cjk_entities(content)
         original = content
-        redacted, counts = apply_redactions_counted(content)
+
+        # 段落级通道（跨 run 拼接）
+        counts: dict = {}
+        content = _process_paragraph_level(content, counts)
+
+        # 整文件级兜底（占位符幂等；覆盖非 <a:p> 区域）
+        redacted, c2 = apply_redactions_counted(content)
+        _merge_counts(counts, c2)
+
         if redacted != original:
             path.write_text(redacted, "utf-8")
             print(f"  [更新] {label or path.name}")
@@ -137,6 +152,40 @@ def _process_xml_file(path: Path, label: str = "") -> dict:
     except Exception as e:
         print(f"  [警告] 处理 {label or path.name} 出错: {e}", file=sys.stderr)
     return {}
+
+
+_A_P_RE = re.compile(r"<a:p>.*?</a:p>", re.S)
+_A_T_RE = re.compile(r"(<a:t(?:\s[^>]*)?>)(.*?)(</a:t>)", re.S)
+
+
+def _process_paragraph_level(content: str, counts: dict) -> str:
+    """R-⑥：对每个 <a:p> 段落拼接 <a:t> 文本 → 整段脱敏 → 差异回写各 run。"""
+
+    def _fix_block(m: re.Match) -> str:
+        block = m.group(0)
+        ats = list(_A_T_RE.finditer(block))
+        if not ats:
+            return block
+        texts = [_html_unescape(a.group(2)) for a in ats]
+        joined = "".join(texts)
+        if not joined.strip():
+            return block
+        redacted, c = apply_redactions_counted(joined)
+        if redacted == joined:
+            return block
+        for k, v in c.items():
+            counts[k] = counts.get(k, 0) + v
+        new_texts = redistribute_paragraph(texts, redacted)
+        out = []
+        last = 0
+        for a, nt in zip(ats, new_texts):
+            out.append(block[last:a.start()])
+            out.append(a.group(1) + _xml_escape(nt) + a.group(3))
+            last = a.end()
+        out.append(block[last:])
+        return "".join(out)
+
+    return _A_P_RE.sub(_fix_block, content)
 
 
 def _merge_counts(base: dict, new: dict) -> None:

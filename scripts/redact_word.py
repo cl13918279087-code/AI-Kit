@@ -163,76 +163,9 @@ def _redistribute_text_nodes(t_nodes: list, redacted: str) -> None:
         tn.text = chunk
 
 
-def _redistribute_paragraph(texts: list, redacted: str) -> list:
-    """
-    R-A（Issue #3，2026-09-12）：段落级差异回写。
-
-    Word 常把一句话拆进多个 run（拼写检查/字体切换），per-run 处理会漏掉
-    跨 run 实体（"2015年4月"+"3日"、跨 run 邮箱等）。本函数对整段文本
-    apply_redactions 后，用 SequenceMatcher 差异区间把变更精确回写到
-    各 run 的 w:t 节点：未变更的 run 文本原样保留（格式不破坏），
-    变更文本写入首个受影响节点。
-
-    texts: 段内各 w:t 的原始文本（按文档顺序）
-    redacted: 整段脱敏后的文本
-    返回: 与 texts 等长的新文本列表
-    """
-    combined = "".join(texts)
-    if combined == redacted:
-        return list(texts)
-
-    n = len(texts)
-    starts = [0] * n
-    pos = 0
-    for k, t in enumerate(texts):
-        starts[k] = pos
-        pos += len(t)
-    total = pos
-
-    def _owner(p: int) -> int:
-        """绝对位置 p（基于原始 combined）所属的节点下标。"""
-        if n == 0:
-            return 0
-        if p >= total:
-            p = total - 1
-        if p < 0:
-            p = 0
-        for k in range(n):
-            s = starts[k]
-            e = s + len(texts[k])
-            if s <= p < e:
-                return k
-        # p 落在空节点边界：返回该空节点或最后一个节点
-        for k in range(n):
-            if starts[k] == p:
-                return k
-        return n - 1
-
-    out = [[] for _ in range(n)]
-    sm = difflib.SequenceMatcher(None, combined, redacted, autojunk=False)
-    for tag, i1, i2, j1, j2 in sm.get_opcodes():
-        if tag == "equal":
-            # 原文逐节点归还（按节点区间整块分配，保持原 run 文本不动）
-            p = i1
-            while p < i2:
-                k = _owner(p)
-                node_end = starts[k] + len(texts[k])
-                if node_end <= p:  # 空节点，前进
-                    p += 1
-                    continue
-                e = min(i2, node_end)
-                out[k].append(combined[p:e])
-                p = e
-        elif tag == "replace":
-            # 替换文本写入首个受影响节点
-            out[_owner(i1)].append(redacted[j1:j2])
-        elif tag == "insert":
-            # 新增文本：i1==0 写入首节点，否则追加到前一个字符所在节点
-            k = _owner(i1 - 1) if i1 > 0 else 0
-            out[k].append(redacted[j1:j2])
-        # delete：原文丢弃，不产出
-
-    return ["".join(chunks) for chunks in out]
+# R-⑥（v1.3.3）：段落级差异回写工具上移至 common_rules（DOCX/PPTX 共用），
+# 此处保留别名以兼容既有调用。
+from common_rules import redistribute_paragraph as _redistribute_paragraph
 
 
 def _extract_full_text(root) -> tuple:
