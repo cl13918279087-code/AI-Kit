@@ -132,6 +132,9 @@ EXCLUDED_COMMON_WORDS: set = {
     "系统测试", "验收测试", "性能测试", "压力测试", "回归测试",
     "程度评估", "平时检查", "方便快捷", "时间成本", "明书",
     "骨干成员", "阶段范围", "测试阶段范围", "实施阶段", "开发阶段",
+    # ---- R-③（v1.3.2，响应 Issue #6）：基线语料实测误伤词 ----
+    # 章/练/和 等姓氏字与常用词撞字：命中片段被下列词覆盖时保留原文
+    "章程", "演练方案", "和业务", "交易一部", "时业务",
     "准备阶段", "调研阶段", "设计阶段", "部署阶段", "上线阶段",
     "启动阶段", "执行阶段", "验收阶段", "试运行阶段", "收尾阶段",
 }
@@ -878,7 +881,11 @@ def _counting_sub(pattern: re.Pattern, text: str, replacement,
     支持 callable 替换（如固话 0XX- 规则），按实际产出分类。"""
 
     def _repl(m: re.Match) -> str:
-        out = replacement(m) if callable(replacement) else replacement
+        # R-①（v1.3.2，响应 Issue #8）：字符串替换须经 m.expand 展开反向引用
+        # （如日期范围规则的 \2=分隔符）。callable 传给 pattern.sub 时返回值
+        # 不再展开 \1/\2，字面 "\2" 会直接落盘；expand 对不含反斜杠的纯文本
+        # 替换串为恒等操作，零副作用。
+        out = replacement(m) if callable(replacement) else m.expand(replacement)
         label = _label_for_replacement(out)
         counts[label] = counts.get(label, 0) + 1
         return out
@@ -1022,6 +1029,38 @@ def reset_patterns() -> None:
     """重置规则缓存（config.json 变更后需调用）"""
     global _PATTERNS
     _PATTERNS = None
+
+
+# ---------------------------------------------------------------------------
+# R-⑤（v1.3.2，Issue #8 整改连带发现）：docProps/core.xml ISO 时间戳保护
+#
+# 背景：R2（v1.3.1）将日期规则右边界由 $ 放宽为 (?![0-9]) 后，日期规则开始
+# 命中 core.xml 中的 ISO 8601 元数据时间戳（如 lastPrinted="2026-09-05T01:44:53Z"），
+# 产出 "YYYY/MM/DDT01:44:53Z" 之类非法时间戳——openpyxl 直接判定工作簿损坏，
+# python-docx 虽宽容但属性已损坏。时间戳属于低敏感元数据，须整体原样保留。
+# ---------------------------------------------------------------------------
+
+_ISO_DATETIME_RE = re.compile(
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?"
+)
+
+
+def protect_iso_datetimes(text: str) -> Tuple[str, List[str]]:
+    """将 ISO 8601 时间戳替换为哨兵占位，返回 (保护后文本, 原值列表)。
+    脱敏后须调用 restore_iso_datetimes 按原序还原。"""
+    tokens: List[str] = []
+
+    def _stash(m: re.Match) -> str:
+        tokens.append(m.group(0))
+        return f"\x00ISO{len(tokens) - 1}\x00"
+
+    return _ISO_DATETIME_RE.sub(_stash, text), tokens
+
+
+def restore_iso_datetimes(text: str, tokens: List[str]) -> str:
+    for i, tok in enumerate(tokens):
+        text = text.replace(f"\x00ISO{i}\x00", tok)
+    return text
 
 
 # ---------------------------------------------------------------------------

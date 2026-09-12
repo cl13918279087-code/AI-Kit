@@ -218,6 +218,9 @@ brew install --cask libreoffice
 # Linux
 sudo apt install libreoffice
 ```
+Windows 用户也可从 https://www.libreoffice.org/ 下载安装。
+
+> **v1.3.2 起安全策略变更**：环境未安装 LibreOffice 时，`.doc` 文件将**直接报错终止、不生成任何输出文件**（旧版本仅告警）。这是为了防止"输出文件名带'脱敏'但内容未脱敏"的假脱敏泄漏。也可先在 Word/WPS 中将文件**另存为 .docx** 再处理。出现该报错时，原文件须按未脱敏文件管理。
 
 **Q: 脱敏后格式丢失？**
 Word/Excel/PPT 脚本直接操作 XML，不会调用 python-docx/pptx 的保存方法，格式完整保留。

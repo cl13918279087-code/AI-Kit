@@ -32,7 +32,7 @@ from pathlib import Path
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from common_rules import apply_redactions
+from common_rules import apply_redactions, protect_iso_datetimes, restore_iso_datetimes
 from entity_detector import build_llm_detector
 
 # Word XML 命名空间
@@ -514,7 +514,14 @@ def _process_xml_file(path: Path, label: str = "") -> None:
     """通用 XML 文件脱敏（不含 Word runs 结构）"""
     try:
         content = path.read_text("utf-8")
+        # R-⑤（v1.3.2）：core.xml 的 ISO 8601 时间戳原样保留，防止日期规则
+        # 命中日期部分产出非法时间戳（损坏文档属性）
+        tokens = []
+        if path.name == "core.xml":
+            content, tokens = protect_iso_datetimes(content)
         redacted = apply_redactions(content)
+        if tokens:
+            redacted = restore_iso_datetimes(redacted, tokens)
         if redacted != content:
             path.write_text(redacted, "utf-8")
             print(f"  [更新] {label or path.name}")
@@ -686,9 +693,19 @@ def redact_doc_to_docx(input_path: str, output_docx: str, detector=None) -> dict
                 raise RuntimeError("no output file found")
             shutil.copy2(converted, output_docx)
         else:
-            print("  [警告] 未找到 LibreOffice，.doc 文件无法处理内容，已复制原文件")
-            shutil.copy2(input_path, output_docx)
-            return {}
+            # R-④（v1.3.2，响应 Issue #9）：环境无 LibreOffice 时 .doc 无法脱敏。
+            # 严禁以任何形式复制原文件充当输出（防"假脱敏"泄漏路径），
+            # 改为终止处理并强制列入人工检查清单。
+            _mark_manual_check(
+                Path(input_path).name,
+                "环境未安装 LibreOffice，.doc 文件未脱敏。请安装 LibreOffice "
+                "(https://www.libreoffice.org/) 后重跑，或先在 Word/WPS 中"
+                "另存为 .docx 再处理。处理完成前该文件须按未脱敏文件管理。",
+            )
+            raise RuntimeError(
+                "未找到 LibreOffice，.doc 文件无法脱敏（已拒绝生成输出文件）。"
+                "请安装 LibreOffice 或将文件另存为 .docx 后重试。"
+            )
 
         return redact_docx(output_docx, output_docx, detector=detector)
     finally:
@@ -714,13 +731,14 @@ def redact_word(input_path: str, output_path: str = None) -> dict:
     
         counts = redact_docx(input_path, output_path, detector=detector)
     elif ext == ".doc":
-        # .doc → .docx → 处理
+        # .doc → .docx → 处理（R-④：无 LibreOffice 时报错终止，不生成输出）
         tmp_docx = str(Path(tempfile.gettempdir()) / f"_tmp_{Path(input_path).stem}.docx")
-        counts = redact_doc_to_docx(input_path, tmp_docx, detector=detector)
-        if counts:  # 仅在转换成功时替换输出
-            os.replace(tmp_docx, output_path)
-        else:
+        try:
+            counts = redact_doc_to_docx(input_path, tmp_docx, detector=detector)
+        except RuntimeError as e:
+            print(f"[错误] .doc 处理终止：{e}", file=sys.stderr)
             Path(tmp_docx).unlink(missing_ok=True)
+            sys.exit(1)
     else:
         print(f"[错误] 不支持的文件格式: {ext}（仅支持 .docx 和 .doc）", file=sys.stderr)
         sys.exit(1)

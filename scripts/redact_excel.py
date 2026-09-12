@@ -17,7 +17,7 @@ from pathlib import Path
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from common_rules import apply_redactions, apply_redactions_counted, REDACTION_LABELS
+from common_rules import apply_redactions, apply_redactions_counted, REDACTION_LABELS, protect_iso_datetimes, restore_iso_datetimes
 
 # ---------------------------------------------------------------------------
 # .xlsx 处理（OOXML / ZIP 格式）
@@ -103,7 +103,14 @@ def _process_xml_file(path: Path, label: str = "") -> dict:
         content = path.read_text("utf-8")
         content = _decode_cjk_entities(content)
         original = content
+        # R-⑤（v1.3.2）：core.xml 的 ISO 8601 时间戳原样保留，防止日期规则
+        # 命中日期部分产出非法时间戳（openpyxl 判定工作簿损坏）
+        tokens = []
+        if path.name == "core.xml":
+            content, tokens = protect_iso_datetimes(content)
         redacted, counts = apply_redactions_counted(content)
+        if tokens:
+            redacted = restore_iso_datetimes(redacted, tokens)
         if redacted != original:
             path.write_text(redacted, "utf-8")
             print(f"  [更新] {label or path.name}")
