@@ -367,13 +367,15 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
 
     # ---------- 2. IP 地址 ----------
     patterns.append((
-        re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"),
+        # R-F（Issue #5 同类排查）：\b 在"汉字+数字"直连处不成立（汉字与数字均为\w），
+        # "手机13812345678"此前完全漏脱敏；改为数字感知边界
+        re.compile(r"(?<![0-9A-Za-z_])(?:\d{1,3}\.){3}\d{1,3}(?![0-9A-Za-z_])"),
         rep.get("IP", "X.X.X.X")
     ))
 
     # ---------- 3. MAC 地址 ----------
     patterns.append((
-        re.compile(r"\b(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}\b"),
+        re.compile(r"(?<![0-9A-Za-z])(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}(?![0-9A-Za-z])"),
         rep.get("MAC", "XX:XX:XX:XX:XX:XX")
     ))
 
@@ -388,16 +390,17 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
 #     ))
 # 
     # ---------- 5. 身份证号（18位/15位） ----------
+    # R-F：\b → 数字感知边界（汉字直连身份证号此前永不命中）
     patterns.append((
         re.compile(
-            r"\b([1-9]\d{5}(?:19|20)\d{2}(?:0[1-9]|1[0-2])"
-            r"(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx])\b"
+            r"(?<![0-9Xx])([1-9]\d{5}(?:19|20)\d{2}(?:0[1-9]|1[0-2])"
+            r"(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx])(?![0-9Xx])"
         ),
         rep.get("ID_CARD", "XXXXXXXXXXXXXXXXXX")
     ))
     # 15位身份证
     patterns.append((
-        re.compile(r"\b([1-9]\d{5}\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3})\b"),
+        re.compile(r"(?<!\d)([1-9]\d{5}\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3})(?!\d)"),
         rep.get("ID_CARD", "XXXXXXXXXXXXXXXXXX")
     ))
 
@@ -421,7 +424,8 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
 
     # ---------- 7. 手机号码 ----------
     patterns.append((
-        re.compile(r"\b1[3-9]\d{9}\b"),
+        # R-F：\b → 数字感知边界（"手机13812345678"直连此前完全漏脱敏）
+        re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)"),
         rep.get("MOBILE", "XXXXXXXXXXX")
     ))
 
@@ -431,6 +435,13 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
     # 注：历史等长替换约束已随段落级回写（R-A）取消，文本内容长度变化不影响 XML 结构
     patterns.append((
         re.compile(r"0\d{2,3}-\d{7,8}"),
+        rep.get("PHONE", "0XX-XXXXXXXX")
+    ))
+    # R-F（Issue #5）：无分隔紧凑固话（如"方培培037185519208"，姓名与号码
+    # 无分隔符时区号-号码连写）→ 全遮。10-12位且以0开头（0+区号2-3位+号码7-8位），
+    # 前后边界阻止匹配长数字串（身份证/账号）的片段
+    patterns.append((
+        re.compile(r"(?<!\d)0\d{9,11}(?!\d)"),
         rep.get("PHONE", "0XX-XXXXXXXX")
     ))
 
@@ -730,7 +741,10 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
 
     # 规则A：姓氏 + 1-3个名字汉字（支持二字和三字人名如"陈斌""郑学钟"）
     # 左边界：阻止 ASCII/数字前缘（防止英文单词残段匹配）
-    # 右边界：仅阻止 ASCII/数字跟随，释放 CJK 跟随（使"柳长春主持"可匹配）
+    # R-F（Issue #5，v1.3.1）：移除右边界 (?![a-zA-Z0-9])——名字字符类全为汉字，
+    # 右侧跟 ASCII/数字仍是真实姓名场景（"方培培0371-85519208"）；原边界与
+    # 贪婪量词组合会在遇数字时回溯降级为部分匹配（"方培培"→"方培"），残留"培"。
+    # 漏脱敏（红线）风险不对称于误伤，姓名整体匹配。
     # 复姓优先：2字复姓 + 1-3个名字汉字（防止复姓第二字被单姓规则误匹配）
     compound_surnames = cfg.get("compound_surnames", [])
     if compound_surnames:
@@ -739,7 +753,6 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
             re.compile(
                 rf'(?<![a-zA-Z0-9])'
                 rf'(?:{compound_alt}){name_char_class}{{1,3}}'
-                rf'(?![a-zA-Z0-9])'
             ),
             rep.get("NAME", "XXX")
         ))
@@ -747,28 +760,27 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
         re.compile(
             rf'(?<![a-zA-Z0-9])'
             rf'(?:{surname_alt}){name_char_class}{{1,3}}'
-            rf'(?![a-zA-Z0-9])'
         ),
         rep.get("NAME", "XXX")
     ))
 
     # 规则B：姓氏 + 2个名字汉字（左侧有中文词/冒号，右侧无ASCII/非汉字）
     # 处理"总行支持人员：汪晶晶"和"组长：樊霖副组长"等场景
-    # 放宽右边界：允许 CJK 汉字跟随（因为中文名字常被标题/职务词跟随）
-    # 但阻止纯 ASCII 跟随（英文单词残段）
+    # R-F（Issue #5）：右边界同步移除（同规则A，防回溯降级部分匹配）
     # 全角冒号 \uff1a 不在 [一-龥] 范围，需显式加入
     patterns.append((
         re.compile(
-            rf'(?<=[\u4e00-\u9fa5\uff1a])(?:{surname_alt}){name_char_class}{{2}}(?![a-zA-Z0-9])'
+            rf'(?<=[\u4e00-\u9fa5\uff1a])(?:{surname_alt}){name_char_class}{{2}}'
         ),
         rep.get("NAME", "XXX")
     ))
 
     # 规则C-1：半角冒号后姓名（如"联系人:方培培"）
     # 全角冒号已由 Rule C 处理；半角冒号(:)ASCII 不在 [\u4e00-\u9fa5] 范围，需单独处理
+    # R-F（Issue #5）：右边界同步移除
     patterns.append((
         re.compile(
-            rf'(?<=:)(?:{surname_alt}){name_char_class}{{1,3}}(?![a-zA-Z0-9])'
+            rf'(?<=:)(?:{surname_alt}){name_char_class}{{1,3}}'
         ),
         rep.get("NAME", "XXX")
     ))
@@ -778,30 +790,32 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
     # 在"组长：樊霖副组长"中 Rule B 无法匹配（霖后跟CJK"副"），
     # Rule A 也无法匹配（霖后跟CJK"副"违反右边界）。
     # 本规则专门处理：全角冒号后紧跟「姓氏+1名字汉字」的场景，右边界允许CJK跟随。
+    # R-F（Issue #5）：右边界同步移除
     patterns.append((
         re.compile(
-            rf'(?<=：)(?:{surname_alt}){name_char_class}(?![a-zA-Z0-9])'
+            rf'(?<=：)(?:{surname_alt}){name_char_class}'
         ),
         rep.get("NAME", "XXX")
     ))
 
     # 规则D：姓氏 + 名字汉字（左侧是常见介词/动词，解决"由XXX负责"型漏检）
     # 仅添加最可靠的上下文：左侧为"由"时，人名概率最高。
-    # 右边界：允许CJK汉字跟随（如"由XXX负责"），阻止ASCII/数字跟随。
+    # R-F（Issue #5）：右边界同步移除（原"阻止ASCII/数字跟随"同致回溯降级）
     patterns.append((
         re.compile(
-            rf'(?<=由)(?:{surname_alt}){name_char_class}{{1,3}}(?![a-zA-Z0-9])'
+            rf'(?<=由)(?:{surname_alt}){name_char_class}{{1,3}}'
         ),
         rep.get("NAME", "XXX")
     ))
 
     # 规则E：姓氏 + 名字汉字（左侧是常见动词如"由、为、对"等）
     # 覆盖"为XXX安排"、"对XXX负责"等场景。
+    # R-F（Issue #5）：右边界同步移除
     _name_follow_verbs = ['由', '为', '对', '让', '请', '告', '诉', '见', '任', '选', '用', '调', '指', '派', '承', '责', '主', '抓', '干', '经', '协']
     _verb_alt = '|'.join(re.escape(v) for v in _name_follow_verbs)
     patterns.append((
         re.compile(
-            rf'(?<=(?:{_verb_alt}))(?:{surname_alt}){name_char_class}{{1,3}}(?![a-zA-Z0-9])'
+            rf'(?<=(?:{_verb_alt}))(?:{surname_alt}){name_char_class}{{1,3}}'
         ),
         rep.get("NAME", "XXX")
     ))
