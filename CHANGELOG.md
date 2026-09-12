@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.2.3] - 2026-09-12
+
+响应成员 Issue #2 的整改发布（社区运行模式首个完整闭环）。
+
+### Fixed
+- **Excel 计数恒为 0**（Issue #2，成员报告）：`redact_excel.py` 的 `_process_xml_file` 此前无条件 `return {}`，共享字符串/工作表/批注/页眉页脚/文档属性 5 条路径计数全部丢失；现返回分类计数并全路径接入
+- **openpyxl 产物中文漏脱敏**（巡检新发现）：openpyxl 等工具生成的 xlsx 把中文写成 `&#NNNNN;` 数字实体，规则层在 XML 源码上无法识别汉字——中文姓名/中文日期全部漏脱敏；现脱敏前解码 CJK 区段实体（Excel/WPS 原生文件不受影响，属健壮性修复）
+
+### Changed
+- **PPT 计数升级**：从"按文件数"（`{"XML文件": 1}`）升级为"按脱敏处数"分类计数，布局/母版路径接入，与 word/pdf 口径一致
+- `common_rules.py` 新增 `apply_redactions_counted(text) -> (str, dict)`：三阶段（前置规则/地址通道/姓名规则）逐处计数，按占位符类别归类（姓名/日期/银行名/邮箱/固话/地址等）；`apply_redactions` 重构为其兼容包装，行为不变（15 例一致性回归通过）
+
+### Verified
+- xlsx 端到端：17 处计数与实际替换对齐，敏感词零残留（含 openpyxl 实体场景 8 处姓名）
+- word 通道回归：UAT3 文档 7 处，与 v1.2.2 一致
+
 ## [1.2.2] - 2026-09-06
 
 基于《redact_docx_v2改进项清单》评估意见的整改发布（commit bddc90b）。

@@ -26,7 +26,20 @@ from PIL import Image
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from common_rules import apply_redactions
+from common_rules import apply_redactions, apply_redactions_counted
+
+# 与 redact_excel 同型加固（v1.2.3）：解码 CJK 数字实体，防止工具生成的
+# XML 把中文写成 &#NNNNN; 导致规则层漏检（解码 CJK 区段可安全写回明文）
+_CJK_ENTITY_RE = re.compile(r'&#(\d{4,6});')
+
+
+def _decode_cjk_entities(text: str) -> str:
+    def _sub(m: re.Match) -> str:
+        code = int(m.group(1))
+        if 0x2E80 <= code <= 0x9FFF:
+            return chr(code)
+        return m.group(0)
+    return _CJK_ENTITY_RE.sub(_sub, text)
 
 # ---------------------------------------------------------------------------
 # PPT XML 命名空间
@@ -68,13 +81,15 @@ def redact_pptx(input_path: str, output_path: str) -> dict:
         layouts_dir = tmp_dir / "ppt" / "slideLayouts"
         if layouts_dir.exists():
             for xml_file in sorted(layouts_dir.glob("*.xml")):
-                _process_xml_file(xml_file, f"布局 {xml_file.stem}")
+                c = _process_xml_file(xml_file, f"布局 {xml_file.stem}")
+                _merge_counts(counts, c)
 
         # ④ 处理母版
         masters_dir = tmp_dir / "ppt" / "slideMasters"
         if masters_dir.exists():
             for xml_file in sorted(masters_dir.glob("*.xml")):
-                _process_xml_file(xml_file, f"母版 {xml_file.stem}")
+                c = _process_xml_file(xml_file, f"母版 {xml_file.stem}")
+                _merge_counts(counts, c)
 
         # ⑤ 处理备注页
         notes_dir = tmp_dir / "ppt" / "notesSlides"
@@ -105,15 +120,20 @@ def redact_pptx(input_path: str, output_path: str) -> dict:
 
 
 def _process_xml_file(path: Path, label: str = "") -> dict:
-    """对单个 XML 文件执行脱敏，返回变化计数"""
+    """
+    对单个 XML 文件执行脱敏，返回分类计数。
+    v1.2.3：从"按文件数"（{"XML文件": 1}）升级为"按脱敏处数"，
+    与 redact_word/redact_pdf 口径一致（每处替换 +1）。
+    """
     try:
         content = path.read_text("utf-8")
+        content = _decode_cjk_entities(content)
         original = content
-        redacted = apply_redactions(content)
+        redacted, counts = apply_redactions_counted(content)
         if redacted != original:
             path.write_text(redacted, "utf-8")
             print(f"  [更新] {label or path.name}")
-            return {"XML文件": 1}
+            return counts
     except Exception as e:
         print(f"  [警告] 处理 {label or path.name} 出错: {e}", file=sys.stderr)
     return {}

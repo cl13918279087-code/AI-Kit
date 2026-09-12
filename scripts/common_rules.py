@@ -215,7 +215,7 @@ def _name_guard_sub(pattern: re.Pattern, text: str, replacement: str) -> str:
     return pattern.sub(_repl, text)
 
 
-def _apply_address_pass(text: str) -> str:
+def _apply_address_pass(text: str, stats: Dict[str, int] = None) -> str:
     """回溯式地址脱敏：扫描后缀 → 向左收集地名前缀 → XX+后缀。"""
     if not text or not isinstance(text, str):
         return text
@@ -245,6 +245,8 @@ def _apply_address_pass(text: str) -> str:
                     consumed_until = s_end
                     last = s_end
                     replaced = True
+                    if stats is not None:
+                        stats["地址"] = stats.get("地址", 0) + 1
             continue
 
         # 向左回溯收集地名前缀（最多5个汉字）
@@ -303,6 +305,8 @@ def _apply_address_pass(text: str) -> str:
         consumed_until = s_end
         last = s_end
         replaced = True
+        if stats is not None:
+            stats["地址"] = stats.get("地址", 0) + 1
 
     if not replaced:
         return text
@@ -800,29 +804,81 @@ def _get_pattern_groups() -> Tuple[List[Tuple[re.Pattern, str]], List[Tuple[re.P
 # 公开 API
 # ---------------------------------------------------------------------------
 
-def apply_redactions(text: str) -> str:
+def _label_for_replacement(replacement: str) -> str:
+    """按占位符内容归类计数标签（与 REDACTION_LABELS 中文标签一致）。"""
+    if "YYYY" in replacement or "MM" in replacement or "DD" in replacement:
+        return "日期"
+    if "@" in replacement:
+        return "邮箱"
+    if replacement.endswith("银行"):
+        return "银行名"
+    if replacement.startswith("0XX"):
+        return "固话"
+    if replacement == "X.X.X.X":
+        return "IP地址"
+    if replacement == "XXXX":
+        return "组织名"
+    if replacement == "XXX":
+        return "姓名"
+    if replacement.startswith("XX"):
+        return "地址"
+    return "其他"
+
+
+def _counting_sub(pattern: re.Pattern, text: str, replacement,
+                  counts: Dict[str, int]) -> str:
+    """带计数的规则替换：每处命中 +1，按实际产出占位符归类。
+    支持 callable 替换（如固话 0XX- 规则），按实际产出分类。"""
+
+    def _repl(m: re.Match) -> str:
+        out = replacement(m) if callable(replacement) else replacement
+        label = _label_for_replacement(out)
+        counts[label] = counts.get(label, 0) + 1
+        return out
+
+    return pattern.sub(_repl, text)
+
+
+def _name_guard_sub_counted(pattern: re.Pattern, text: str, replacement: str,
+                            counts: Dict[str, int]) -> str:
+    """带计数的姓名规则替换：仅统计实际替换（排除常用词保护保留的命中）。"""
+
+    def _repl(m: re.Match) -> str:
+        if _is_protected_by_common_word(m.string, m.start(), m.end()):
+            return m.group(0)
+        counts["姓名"] = counts.get("姓名", 0) + 1
+        return replacement
+
+    return pattern.sub(_repl, text)
+
+
+def apply_redactions_counted(text: str) -> Tuple[str, Dict[str, int]]:
     """
-    对文本执行全量脱敏替换（链式顺序）。
-    返回脱敏后的文本。
+    对文本执行全量脱敏替换（链式顺序），并返回各类别的替换处数。
+    返回 (脱敏后的文本, 计数字典)。
+
+    计数口径：每处替换动作 +1（如"XX省XX市XX区"计 3 处地址）。
+    后处理纠错（恢复误脱词）不参与计数。
     """
+    counts: Dict[str, int] = {}
     if not text or not isinstance(text, str):
-        return text
+        return text, counts
 
     pre_patterns, name_patterns = _get_pattern_groups()
 
     result = text
     # 第一阶段：姓名之前的规则（邮箱/日期/银行/支行/地名等）
     for pattern, replacement in pre_patterns:
-        result = pattern.sub(replacement, result)
+        result = _counting_sub(pattern, result, replacement, counts)
 
     # 第二阶段：回溯式地址脱敏通道（省/市/县/区/街道/路/楼盘/大厦/支行/门牌）
     # 必须在姓名规则之前执行，防止"金水/花园"等地址成分被姓名规则误吞
-    result = _apply_address_pass(result)
+    result = _apply_address_pass(result, stats=counts)
 
     # 第三阶段：姓名规则（R1：带常用词覆盖保护，"说明书→说XXX"类误伤在应用层过滤）
     _name_repl = get_replacement("NAME", "XXX")
     for pattern, replacement in name_patterns:
-        result = _name_guard_sub(pattern, result, replacement)
+        result = _name_guard_sub_counted(pattern, result, replacement, counts)
 
     # 后处理：纠正已知误脱敏
     # 1. 姓名模式误匹配中文词（Rule A 右边界放宽后，可能对常用词造成误匹配）
@@ -884,8 +940,21 @@ def apply_redactions(text: str) -> str:
         _before = result[max(0, _idx-3):_idx]
         if _before in _prefixes:
             result = result[:_idx] + 'XXXX年XX月XX日' + result[_idx+len(_date_placeholder):]
+            # 注：该处日期仍处于脱敏状态（仅占位符形式变化），计数不回退
         _pos = _idx + 1
 
+    return result, counts
+
+
+def apply_redactions(text: str) -> str:
+    """
+    对文本执行全量脱敏替换（链式顺序）。
+    返回脱敏后的文本。
+
+    v1.2.3：本函数为 apply_redactions_counted 的兼容包装，
+    需要分类计数的调用方（excel/ppt 处理器）请使用 apply_redactions_counted。
+    """
+    result, _counts = apply_redactions_counted(text)
     return result
 
 

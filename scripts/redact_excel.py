@@ -17,7 +17,7 @@ from pathlib import Path
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from common_rules import apply_redactions, REDACTION_LABELS
+from common_rules import apply_redactions, apply_redactions_counted, REDACTION_LABELS
 
 # ---------------------------------------------------------------------------
 # .xlsx 处理（OOXML / ZIP 格式）
@@ -46,18 +46,22 @@ def redact_xlsx(input_path: str, output_path: str) -> dict:
 
         # ③ 批注
         for cm in sorted(tmp_dir.glob("xl/comments*.xml")):
-            _process_xml_file(cm, f"批注 {cm.name}")
+            c = _process_xml_file(cm, f"批注 {cm.name}")
+            _merge_counts(counts, c)
 
         # ④ 页眉页脚
         for hf in sorted(tmp_dir.rglob("header*.xml")):
-            _process_xml_file(hf, f"页眉 {hf.name}")
+            c = _process_xml_file(hf, f"页眉 {hf.name}")
+            _merge_counts(counts, c)
         for hf in sorted(tmp_dir.rglob("footer*.xml")):
-            _process_xml_file(hf, f"页脚 {hf.name}")
+            c = _process_xml_file(hf, f"页脚 {hf.name}")
+            _merge_counts(counts, c)
 
         # ⑤ 文档属性
         core = tmp_dir / "docProps" / "core.xml"
         if core.exists():
-            _process_xml_file(core, "文档属性")
+            c = _process_xml_file(core, "文档属性")
+            _merge_counts(counts, c)
 
         # 重新打包（保持 ZIP 压缩级别）
         with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -71,15 +75,39 @@ def redact_xlsx(input_path: str, output_path: str) -> dict:
     return counts
 
 
+# CJK 数字实体解码（v1.2.3）：openpyxl 等工具生成的 xlsx 会把中文写成
+# &#NNNNN; 数字字符引用（如"孔丽"→&#23380;&#20029;），规则层在 XML 源码
+# 上运行时看不到汉字，导致中文姓名/中文日期漏脱敏。
+# 仅解码 CJK 区段实体（不会产生 < > & 等 XML 语法字符，可安全写回明文 UTF-8）。
+_CJK_ENTITY_RE = re.compile(r'&#(\d{4,6});')
+
+
+def _decode_cjk_entities(text: str) -> str:
+    def _sub(m: re.Match) -> str:
+        code = int(m.group(1))
+        if 0x2E80 <= code <= 0x9FFF:  # CJK 部首扩展~统一汉字
+            return chr(code)
+        return m.group(0)
+    return _CJK_ENTITY_RE.sub(_sub, text)
+
+
 def _process_xml_file(path: Path, label: str = "") -> dict:
-    """读取 XML 文件 → 执行脱敏 → 写回（仅在有变化时）"""
+    """
+    读取 XML 文件 → 执行脱敏 → 写回（仅在有变化时）。
+    v1.2.3（Issue #2 修复）：返回分类计数（每处替换 +1），
+    此前无条件 return {} 导致共享字符串/工作表计数恒为 0。
+    v1.2.3（补充修复）：先解码 CJK 数字实体再脱敏，防止 openpyxl
+    产物中文漏脱敏；写回明文 UTF-8（XML 合法）。
+    """
     try:
         content = path.read_text("utf-8")
+        content = _decode_cjk_entities(content)
         original = content
-        redacted = apply_redactions(content)
+        redacted, counts = apply_redactions_counted(content)
         if redacted != original:
             path.write_text(redacted, "utf-8")
             print(f"  [更新] {label or path.name}")
+            return counts
     except Exception as e:
         print(f"  [警告] 处理 {label or path.name} 出错: {e}", file=sys.stderr)
     return {}
