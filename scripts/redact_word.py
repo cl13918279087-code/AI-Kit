@@ -19,6 +19,7 @@ redact_word.py - Word 文档脱敏脚本
 
 import sys
 import re
+import difflib
 import zipfile
 import shutil
 import subprocess
@@ -97,6 +98,14 @@ def redact_docx(input_path: str, output_path: str, detector=None) -> dict:
         if core_xml.exists():
             _process_xml_file(core_xml, "文档属性")
 
+        # ⑥b R-C（Issue #3 漏4，v1.3.0）：补齐 app.xml / custom.xml
+        # app.xml 的 <Company> 字段常泄露银行名；custom.xml 含自定义属性
+        # （如"发文单位""密级"），均为真实泄露点
+        for prop_name, label in (("app.xml", "应用属性"), ("custom.xml", "自定义属性")):
+            prop_xml = tmp_dir / "docProps" / prop_name
+            if prop_xml.exists():
+                _process_xml_file(prop_xml, label)
+
         # ⑦ 银行 Logo 图片（文件名含敏感关键词 → 纯黑图）
         # R6：页眉/页脚 .rels 引用的图片一律确定性遮盖，不赌 OCR/尺寸检测
         media_dir = tmp_dir / "word" / "media"
@@ -152,6 +161,78 @@ def _redistribute_text_nodes(t_nodes: list, redacted: str) -> None:
         if i == len(t_nodes) - 1:
             chunk = redacted[n_start:]
         tn.text = chunk
+
+
+def _redistribute_paragraph(texts: list, redacted: str) -> list:
+    """
+    R-A（Issue #3，2026-09-12）：段落级差异回写。
+
+    Word 常把一句话拆进多个 run（拼写检查/字体切换），per-run 处理会漏掉
+    跨 run 实体（"2015年4月"+"3日"、跨 run 邮箱等）。本函数对整段文本
+    apply_redactions 后，用 SequenceMatcher 差异区间把变更精确回写到
+    各 run 的 w:t 节点：未变更的 run 文本原样保留（格式不破坏），
+    变更文本写入首个受影响节点。
+
+    texts: 段内各 w:t 的原始文本（按文档顺序）
+    redacted: 整段脱敏后的文本
+    返回: 与 texts 等长的新文本列表
+    """
+    combined = "".join(texts)
+    if combined == redacted:
+        return list(texts)
+
+    n = len(texts)
+    starts = [0] * n
+    pos = 0
+    for k, t in enumerate(texts):
+        starts[k] = pos
+        pos += len(t)
+    total = pos
+
+    def _owner(p: int) -> int:
+        """绝对位置 p（基于原始 combined）所属的节点下标。"""
+        if n == 0:
+            return 0
+        if p >= total:
+            p = total - 1
+        if p < 0:
+            p = 0
+        for k in range(n):
+            s = starts[k]
+            e = s + len(texts[k])
+            if s <= p < e:
+                return k
+        # p 落在空节点边界：返回该空节点或最后一个节点
+        for k in range(n):
+            if starts[k] == p:
+                return k
+        return n - 1
+
+    out = [[] for _ in range(n)]
+    sm = difflib.SequenceMatcher(None, combined, redacted, autojunk=False)
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            # 原文逐节点归还（按节点区间整块分配，保持原 run 文本不动）
+            p = i1
+            while p < i2:
+                k = _owner(p)
+                node_end = starts[k] + len(texts[k])
+                if node_end <= p:  # 空节点，前进
+                    p += 1
+                    continue
+                e = min(i2, node_end)
+                out[k].append(combined[p:e])
+                p = e
+        elif tag == "replace":
+            # 替换文本写入首个受影响节点
+            out[_owner(i1)].append(redacted[j1:j2])
+        elif tag == "insert":
+            # 新增文本：i1==0 写入首节点，否则追加到前一个字符所在节点
+            k = _owner(i1 - 1) if i1 > 0 else 0
+            out[k].append(redacted[j1:j2])
+        # delete：原文丢弃，不产出
+
+    return ["".join(chunks) for chunks in out]
 
 
 def _extract_full_text(root) -> tuple:
@@ -359,12 +440,16 @@ def _process_word_xml_with_llm(path: Path, detector=None, label: str = "") -> di
             changed = True
             counts["LLM实体"] = counts.get("LLM实体", 0) + n_replaced
 
-    # ③ regex 兜底（per-run 处理，跳过LLM已处理的节点避免双加工）
-    # 修复：多t节点时，将redacted文本正确分配到所有t节点，而非只写ts[0]
-    for r in root.iter(f"{W}r"):
-        t_nodes = list(r.iter(f"{W}t"))
-        # 跳过LLM已修改的节点（避免双加工导致文本错位）
-        if any(t in llm_modified_nodes for t in t_nodes):
+    # ③ regex 兜底（R-A：段落级处理，含 LLM 已处理节点）
+    # v1.3.0 修复（Issue #3 漏1/漏3/漏5）：Word 常把一句话拆进多个 run，
+    # per-run 处理会漏掉跨 run 实体（"2015年4月"+"3日"、跨run邮箱/分行名）。
+    # 现按段落聚合当前文本（含 LLM 已替换部分，占位符幂等）整段跑规则，
+    # 差异区间用 _redistribute_paragraph 精确回写，未变更 run 文本原样保留。
+    # 此前跳过 LLM 已修改节点会导致同段落剩余部分失去跨 run 上下文
+    #（如 LLM 替换"方培培"后，同段"2015年4月|3日"无法整段匹配）。
+    for p in root.iter(f"{W}p"):
+        t_nodes = [t for r in p.iter(f"{W}r") for t in r.iter(f"{W}t")]
+        if not t_nodes:
             continue
 
         texts = [t.text or "" for t in t_nodes]
@@ -376,8 +461,13 @@ def _process_word_xml_with_llm(path: Path, detector=None, label: str = "") -> di
         if redacted == combined:
             continue
 
-        # 文本分配：将redacted文本逐节点填充（修复：分配到所有t_nodes而非仅ts[0]）
-        _redistribute_text_nodes(t_nodes, redacted)
+        new_texts = _redistribute_paragraph(texts, redacted)
+        for t, nt in zip(t_nodes, new_texts):
+            if (t.text or "") != nt:
+                t.text = nt
+                # 文本首尾含空格时需保留空格声明，避免 Word 打开丢空格
+                if nt != nt.strip():
+                    t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
         changed = True
         counts["段落/单元格"] = counts.get("段落/单元格", 0) + 1
 

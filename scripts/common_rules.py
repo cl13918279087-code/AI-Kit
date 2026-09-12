@@ -160,10 +160,23 @@ _ADDRESS_STOP_CHARS = set(
     "们我你他她它"
 )
 # 行政区划/道路后缀字符：回溯遇到即停止（地名前缀边界，如"金水区花园路"在"区"处切分、
-# "湖东街道恒力大厦"在"道"处切分）
+# "湖东街道恒力大厦"在"道"处切分）。例外：支行/分行 后缀按
+# _ADDRESS_COLLECTABLE_FOR_CROSSABLE 规则将 乡村街路巷弄道 收集为地名成分
 _ADDRESS_ADMIN_BOUNDARY = set("省市县区镇乡村街路巷弄道")
 # 支行/分行 允许跨越一个行政后缀（如"中牟县支行"的"县"），跨过后需再收集到地名前缀
 _ADDRESS_CROSSABLE_SUFFIXES = {"支行", "分行"}
+# R-B 修复（Issue #3/#4，2026-09-12）：支行/分行 回溯时，乡/村/街/路/巷/弄/道
+# 是地名组成部分而非硬边界（"新乡分行""金水路支行"此前因'乡'/'路'被误判为
+# 行政边界而整体漏检），对可跨越后缀改为正常收集。
+_ADDRESS_ADMIN_BOUNDARY = set("省市县区镇")
+_ADDRESS_COLLECTABLE_FOR_CROSSABLE = set("乡村街路巷弄道")
+# R-B（Issue #4）：前缀词守卫——"项目/产品/工程"等被误收为地名前缀导致
+# "大集中项目分行→大集中XX分行"误伤，前缀含下列词时保留原文。
+# 注意不含"建设/开发/规划"等常见路名词（建设路/开发路是真实路名）
+_ADDRESS_PREFIX_GUARDS = {
+    "项目", "产品", "工程", "课题", "方案", "试点", "专项", "示范",
+    "改造", "投产", "上线", "推广", "验收",
+}
 # 后缀+下一字 的组合保护：避免"市场部/区别/县长/省委"等误伤
 _ADDRESS_GUARDS = {
     ("市", "场"), ("市", "面"), ("市", "委"),
@@ -264,6 +277,13 @@ def _apply_address_pass(text: str, stats: Dict[str, int] = None) -> str:
             if ch in _ADDRESS_STOP_CHARS:
                 break
             if ch in _ADDRESS_ADMIN_BOUNDARY:
+                # R-B（Issue #3 漏1）：支行/分行 回溯时 乡村街路巷弄道 是地名成分
+                # （"新乡分行""金水路支行"），正常收集而非边界
+                if (suf in _ADDRESS_CROSSABLE_SUFFIXES
+                        and ch in _ADDRESS_COLLECTABLE_FOR_CROSSABLE):
+                    collected.append(ch)
+                    i -= 1
+                    continue
                 # 支行/分行 允许跨越一个行政后缀（县支行/市分行），其余作为边界
                 if (suf in _ADDRESS_CROSSABLE_SUFFIXES and not crossed_admin
                         and ch in ("省", "市", "县", "区")):
@@ -274,6 +294,18 @@ def _apply_address_pass(text: str, stats: Dict[str, int] = None) -> str:
             collected.append(ch)
             i -= 1
         prefix = "".join(reversed(collected))
+
+        # R-B 补充（存量缺口）：跨行政后缀场景下前缀仅1字且停在"中"时，
+        # "中"是县名首字（中牟/中卫/中山…）而非"其中"虚词，并入前缀。
+        # "中牟县支行"此前漏检即源于此；"其中+县支行"组合实际不存在，无误伤面
+        if (crossed_admin and len(prefix) == 1 and i > 0
+                and text[i - 1] == "中" and "\u4e00" <= text[i - 1] <= "\u9fff"):
+            i -= 1
+            prefix = "中" + prefix
+
+        # R-B（Issue #4）保护：前缀含项目/产品/工程等非地名词时保留原文
+        if any(g in prefix for g in _ADDRESS_PREFIX_GUARDS):
+            continue
 
         # 保护条件：指示词场景（这栋大楼）/ 前缀不足2字（城市/超市/山区）/ 跨行政后缀但无地名
         if stopped_by_demo or len(prefix) < 2 or (crossed_admin and len(prefix) < 2):
@@ -393,12 +425,13 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
         rep.get("MOBILE", "XXXXXXXXXXX")
     ))
 
-    # ---------- 8. 固定电话（已启用：精确等长替换） ----------
-    # 策略：分两段替换，0XX- 占3位 + 8位数字 = 11位，与原区号-号码格式等长
-    # 例如：0371-85519208(12位) → 0XX-85519208(11位)，避免替换后长度变化导致 XML 节点错位
+    # ---------- 8. 固定电话（R-D 全遮方案，2026-09-12 社区决策） ----------
+    # 策略：区号与号码全部遮盖（0XX-XXXXXXXX），不保留后8位。
+    # 依据：外发文档存在通过号码反查个体的合规风险（Issue #3 漏2 评估决策项）。
+    # 注：历史等长替换约束已随段落级回写（R-A）取消，文本内容长度变化不影响 XML 结构
     patterns.append((
-        re.compile(r"0(\d{2,3})-(\d{7,8})"),
-        lambda m: f"0XX-{m.group(2)}"  # 区号部分替换为0XX，保持总长11位
+        re.compile(r"0\d{2,3}-\d{7,8}"),
+        rep.get("PHONE", "0XX-XXXXXXXX")
     ))
 
     # ---------- 9. 日期范围（P1.3 合规修复：保留连接符和相对关系） ----------
