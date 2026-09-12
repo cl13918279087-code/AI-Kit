@@ -1,6 +1,6 @@
 {
   "name": "doc-redact-project",
-  "version": "1.3.3",
+  "version": "1.3.4",
   "description": "金融文档智能脱敏工具包 - 支持 Word/Excel/PPT/PDF/图片批量脱敏",
   "llm": {
     "provider": "minimax",
