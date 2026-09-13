@@ -26,7 +26,7 @@ from PIL import Image
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from common_rules import apply_redactions, apply_redactions_counted
+from common_rules import apply_redactions, apply_redactions_counted, find_libreoffice
 from common_rules import redistribute_paragraph
 from html import unescape as _html_unescape
 from xml.sax.saxutils import escape as _xml_escape
@@ -286,14 +286,16 @@ def _redact_bank_logos(media_dir: Path) -> None:
 # ---------------------------------------------------------------------------
 
 def _find_converter() -> Optional[str]:
-    """查找可用的 PPT 转换工具"""
+    """查找可用的 PPT 转换工具。
+
+    R-⑪（v1.3.5，响应 Issue #11）：LibreOffice 查找逻辑上移
+    common_rules.find_libreoffice() 供 DOCX/PPTX 通道共用（同 redact_word），
+    Windows PowerPoint COM 分支保持不变。
+    """
     # LibreOffice（跨平台）
-    for cmd in ["soffice", "libreoffice"]:
-        r = subprocess.run(
-            ["which", cmd], capture_output=True, text=True
-        )
-        if r.returncode == 0:
-            return r.stdout.strip()
+    soffice = find_libreoffice()
+    if soffice:
+        return soffice
 
     # Windows PowerPoint COM（需要在 Windows 上）
     if platform.system() == "Windows":
@@ -311,6 +313,9 @@ def redact_ppt_to_pptx(input_path: str, output_pptx: str) -> dict:
             result = subprocess.run(
                 [
                     converter,
+                    # R-⑪连带加固（v1.3.5）：独立用户 profile，规避 GUI 实例
+                    # 占用/系统 profile 损坏导致的偶发转换失败（同 redact_word）
+                    "-env:UserInstallation=" + (tmp_dir / "lo_profile").as_uri(),
                     "--headless",
                     "--convert-to", "pptx",
                     "--outdir", str(tmp_dir),

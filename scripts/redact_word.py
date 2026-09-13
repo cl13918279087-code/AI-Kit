@@ -32,7 +32,7 @@ from pathlib import Path
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from common_rules import apply_redactions, protect_iso_datetimes, restore_iso_datetimes
+from common_rules import apply_redactions, protect_iso_datetimes, restore_iso_datetimes, find_libreoffice
 from entity_detector import build_llm_detector
 
 # Word XML 命名空间
@@ -587,12 +587,14 @@ def _merge_counts(base: dict, new: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def _find_converter() -> Optional[str]:
-    """查找 LibreOffice 路径"""
-    for cmd in ["soffice", "libreoffice"]:
-        r = subprocess.run(["which", cmd], capture_output=True, text=True)
-        if r.returncode == 0:
-            return r.stdout.strip()
-    return None
+    """查找 LibreOffice 路径。
+
+    R-⑪（v1.3.5，响应 Issue #11）：逻辑上移 common_rules.find_libreoffice()
+    供 DOCX/PPTX 通道共用——shutil.which 替代外部 which 命令，
+    消除 Windows 原生/Alpine 等环境无 which 时的未捕获 FileNotFoundError，
+    并补充常见安装路径兜底与 SOFFICE_PATH 环境变量覆盖。
+    """
+    return find_libreoffice()
 
 
 def redact_doc_to_docx(input_path: str, output_docx: str, detector=None) -> dict:
@@ -608,6 +610,10 @@ def redact_doc_to_docx(input_path: str, output_docx: str, detector=None) -> dict
             result = subprocess.run(
                 [
                     converter,
+                    # R-⑪连带加固（v1.3.5）：独立用户 profile——
+                    # 规避 GUI 实例占用/系统 profile 损坏导致的
+                    # DeploymentException 偶发转换失败（本机实测复现）
+                    "-env:UserInstallation=" + (tmp_dir / "lo_profile").as_uri(),
                     "--headless",
                     "--convert-to", "docx",
                     "--outdir", str(tmp_dir),
@@ -668,6 +674,10 @@ def redact_word(input_path: str, output_path: str = None) -> dict:
         tmp_docx = str(Path(tempfile.gettempdir()) / f"_tmp_{Path(input_path).stem}.docx")
         try:
             counts = redact_doc_to_docx(input_path, tmp_docx, detector=detector)
+            # R-⑥连带修复（v1.3.5）：a6aab58 重构 try/except 时丢失 os.replace，
+            # 致 v1.3.2~v1.3.4 的 .doc 产物滞留 /tmp/_tmp_*.docx、声明的输出路径
+            # 从未生成（门禁 G5 实测坐实）。转换+脱敏成功即落盘（含零命中场景）。
+            os.replace(tmp_docx, output_path)
         except RuntimeError as e:
             print(f"[错误] .doc 处理终止：{e}", file=sys.stderr)
             Path(tmp_docx).unlink(missing_ok=True)

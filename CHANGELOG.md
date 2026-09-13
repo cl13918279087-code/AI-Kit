@@ -1,5 +1,26 @@
 # Changelog
 
+## [1.3.5] - 2026-09-13
+
+### 修复（响应 Issue #11，贡献者：陈黎）
+- R-⑪ `_find_converter` 跨平台兼容：上移 `common_rules.find_libreoffice()`
+  公共实现（word/ppt 通道共用）——`shutil.which` 替代外部 `which` 命令
+  （Windows 原生/Alpine 等 minimal 镜像无 which 时旧版抛未捕获
+  FileNotFoundError 直接崩溃，R-④ 安全降级无法触达），补充常见安装路径
+  兜底（Windows/macOS/Linux）与 `SOFFICE_PATH` 环境变量覆盖
+- 连带修复（P0）：`.doc` 分支自 v1.3.2（a6aab58）起 `os.replace` 落盘逻辑
+  丢失，产物滞留 `/tmp/_tmp_*.docx`、声明的输出路径从未生成——门禁 G5
+  实测坐实后恢复落盘（转换+脱敏成功即落盘，含零命中场景）
+- 连带加固：LibreOffice 转换改用独立用户 profile
+  （`-env:UserInstallation`），规避 GUI 实例占用/系统 profile 损坏导致的
+  偶发 `DeploymentException` 转换失败（本机实测复现，3/3 稳定通过）
+
+### 门禁
+- 函数级：默认命中 / SOFFICE_PATH 覆盖 / 无 LibreOffice 返回 None（降级可触发）/
+  兜底路径命中 / 双通道委托
+- `.doc` 端到端 3/3 通过且产物落盘正确；xlsx/docx/pptx 基线复跑零回归；
+  全产物零 `\2` 残留、xlsx 可重开
+
 ## [1.3.4] - 2026-09-13
 
 ### 流程（响应贡献者排名需求）

@@ -15,6 +15,7 @@ from __future__ import annotations
 import re
 import json
 import os
+import shutil
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict, Any
 
@@ -1316,3 +1317,61 @@ def _infer_category(replacement: str, original: str) -> str:
     if "******" in replacement:
         return "密码"
     return "其他"
+
+
+# ---------------------------------------------------------------------------
+# R-⑪（v1.3.5，响应 Issue #11）：LibreOffice 转换器查找（跨平台公共实现）
+# ---------------------------------------------------------------------------
+
+# 常见安装路径兜底（用户自定义安装位置且未加入 PATH 时）
+_LIBREOFFICE_CANDIDATES = [
+    # Windows 默认/便携安装
+    r"C:\Program Files\LibreOffice\program\soffice.exe",
+    r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
+    # macOS（brew cask / 官方 dmg，均不自动进 PATH）
+    "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+    os.path.expanduser("~/Applications/LibreOffice.app/Contents/MacOS/soffice"),
+    "/usr/local/bin/soffice",
+    "/opt/homebrew/bin/soffice",
+    # Linux
+    "/usr/bin/soffice",
+    "/usr/bin/libreoffice",
+    "/usr/lib/libreoffice/program/soffice",
+    "/snap/bin/libreoffice",
+]
+
+
+def find_libreoffice() -> Optional[str]:
+    """
+    查找 LibreOffice 可执行文件路径（跨平台，纯标准库，无外部命令依赖）。
+
+    查找顺序：
+      1. SOFFICE_PATH 环境变量（用户显式指定，最高优先级）
+      2. shutil.which 探测 PATH（soffice / soffice.exe / libreoffice / libreoffice.exe）
+      3. 常见安装路径兜底（Windows / macOS / Linux）
+
+    找不到返回 None（调用方按 R-④ 契约走安全降级：报错终止，不生成输出）。
+    相比旧实现（subprocess 调用外部 which）：
+      - Windows 原生 / Alpine 等 minimal 镜像无 which 命令时不再抛未捕获 FileNotFoundError
+      - Git Bash 的 POSIX 风格路径问题消除（shutil.which 返回当前平台可执行路径）
+    """
+    # 1. 环境变量显式覆盖
+    env_path = os.environ.get("SOFFICE_PATH", "").strip()
+    if env_path and Path(env_path).exists():
+        return env_path
+
+    # 2. PATH 探测（标准库，跨平台；找不到返回 None 而非抛异常）
+    for cmd in ("soffice", "soffice.exe", "libreoffice", "libreoffice.exe"):
+        p = shutil.which(cmd)
+        if p:
+            return p
+
+    # 3. 常见安装路径兜底
+    for cand in _LIBREOFFICE_CANDIDATES:
+        try:
+            if cand and Path(cand).exists():
+                return cand
+        except OSError:
+            # Windows 上非法路径字符等极端情况，跳过
+            continue
+    return None
