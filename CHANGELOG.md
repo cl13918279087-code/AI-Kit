@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.3.6] - 2026-09-13
+
+### 修复（响应 Issue #12，贡献者：陈黎）
+- R-⑫ `.doc` 产物落盘改 `shutil.move`：`os.replace` 为原子 rename 语义，
+  跨文件系统必败（Windows WinError 17 / POSIX EXDEV）——tempdir 与输出
+  路径不同卷时 .doc 全量失败且转换+脱敏成果丢弃；shutil.move 同盘走
+  rename 零拷贝、跨盘自动 copy2+remove
+- Logo 黑图替换（页眉/页脚确定性遮盖路径）统一 `shutil.move`（防漂移）；
+  `_repack_docx` 同目录原子替换保留 `os.replace`
+- 门禁新增跨卷端到端用例：macOS RAM disk 独立卷作为输出目标
+
+### 门禁
+- 跨卷：RAM disk 输出 `.doc` 端到端通过，产物可读、零残字符、占位符正确
+- 同卷回归：.doc 端到端 + Logo 遮盖路径正常；xlsx/docx/pptx 基线复跑零回归
+
 ## [1.3.5] - 2026-09-13
 
 ### 修复（响应 Issue #11，贡献者：陈黎）

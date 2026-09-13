@@ -550,7 +550,9 @@ def _redact_bank_logos(media_dir: Path, force_names: set = None) -> None:
                     tmp = tempfile.NamedTemporaryFile(suffix=img_file.suffix, delete=False)
                     tmp.close()
                     black.save(tmp.name, format=img.format or "PNG")
-                    os.replace(tmp.name, str(img_file))
+                    # R-⑫（v1.3.6，响应 Issue #12）：shutil.move 替代 os.replace——
+                    # os.replace 跨文件系统必败（Windows WinError 17 / POSIX EXDEV）
+                    shutil.move(tmp.name, str(img_file))
                     print(f"  [银行Logo遮盖] {img_file.name}（{reason}）→ 纯黑图")
             except Exception as e:
                 # R7：失败不再静默——EMF 等无法解析的格式显式标记人工检查
@@ -677,7 +679,11 @@ def redact_word(input_path: str, output_path: str = None) -> dict:
             # R-⑥连带修复（v1.3.5）：a6aab58 重构 try/except 时丢失 os.replace，
             # 致 v1.3.2~v1.3.4 的 .doc 产物滞留 /tmp/_tmp_*.docx、声明的输出路径
             # 从未生成（门禁 G5 实测坐实）。转换+脱敏成功即落盘（含零命中场景）。
-            os.replace(tmp_docx, output_path)
+            # R-⑫（v1.3.6，响应 Issue #12）：shutil.move 替代 os.replace——
+            # os.replace 跨文件系统必败（Windows WinError 17 / POSIX EXDEV），
+            # tempdir 与输出路径不同卷时 .doc 全量失败；shutil.move 同盘走
+            # rename 零拷贝、跨盘自动 copy2+remove。
+            shutil.move(tmp_docx, output_path)
         except RuntimeError as e:
             print(f"[错误] .doc 处理终止：{e}", file=sys.stderr)
             Path(tmp_docx).unlink(missing_ok=True)
