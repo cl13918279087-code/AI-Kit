@@ -140,6 +140,9 @@ EXCLUDED_COMMON_WORDS: set = {
     "黎明", "时不用", "部支一七", "部提七", "金进行",
     "准备阶段", "调研阶段", "设计阶段", "部署阶段", "上线阶段",
     "启动阶段", "执行阶段", "验收阶段", "试运行阶段", "收尾阶段",
+    # ---- R-⑭（v1.3.7，响应 Issue #13-②）：字符池系统性补全后实测误伤词 ----
+    # 补 安 入名字池后"临时安排"被 时(姓氏)+安(名) 命中；补 名单之内的 同理
+    "临时安排", "名单之内", "名单之外",
 }
 
 
@@ -155,7 +158,8 @@ EXCLUDED_COMMON_WORDS: set = {
 
 _ADDRESS_SUFFIXES: List[str] = [
     "街道", "大道", "大街", "写字楼", "楼盘", "小区", "公寓", "广场", "大厦", "大楼",
-    "省", "市", "县", "区", "镇", "乡", "村", "街", "路", "巷", "弄", "支行", "分行", "号",
+    "省", "市", "县", "区", "镇", "乡", "村", "街", "路", "巷", "弄",
+    "支行", "分行", "营业部", "分理处", "号",
 ]
 # 指示词/量词字符：回溯遇到即停止，且视为"非地名"场景（如"这栋大楼"）
 _ADDRESS_DEMO_CHARS = set("这那该本各每某数几第其此另")
@@ -170,7 +174,8 @@ _ADDRESS_STOP_CHARS = set(
 # _ADDRESS_COLLECTABLE_FOR_CROSSABLE 规则将 乡村街路巷弄道 收集为地名成分
 _ADDRESS_ADMIN_BOUNDARY = set("省市县区镇乡村街路巷弄道")
 # 支行/分行 允许跨越一个行政后缀（如"中牟县支行"的"县"），跨过后需再收集到地名前缀
-_ADDRESS_CROSSABLE_SUFFIXES = {"支行", "分行"}
+# R-⑯（v1.3.7，Issue #13-④）：营业部/分理处 同属网点名后缀，一并纳入
+_ADDRESS_CROSSABLE_SUFFIXES = {"支行", "分行", "营业部", "分理处"}
 # R-B 修复（Issue #3/#4，2026-09-12）：支行/分行 回溯时，乡/村/街/路/巷/弄/道
 # 是地名组成部分而非硬边界（"新乡分行""金水路支行"此前因'乡'/'路'被误判为
 # 行政边界而整体漏检），对可跨越后缀改为正常收集。
@@ -270,6 +275,15 @@ def _apply_address_pass(text: str, stats: Dict[str, int] = None) -> str:
             continue  # 落在已替换区间内（如"XX省"中的字），跳过
         suf = m.group(0)
 
+        # R-⑯（v1.3.7，Issue #13-④）：单字行政后缀后紧跟网点后缀时跳过该行政后缀
+        # （"锦艺新时代社区支行"的"区"先于"支行"被匹配，会把"锦艺新时代社"吞并成
+        # "锦XX区"，使"支行"回溯时前缀起点落入已替换区间而被整体跳过）。交由网点
+        # 后缀统一处理，可跨后缀逻辑即能正确收集"社区"。
+        if (len(suf) == 1 and suf in "省市县区镇乡村街路巷弄"
+                and any(text.startswith(bs, s_end)
+                        for bs in _ADDRESS_CROSSABLE_SUFFIXES)):
+            continue
+
         # 门牌号：数字+号 → XX号（如"花园路39号"、"2号楼"）
         if suf == "号":
             j = s_start
@@ -288,12 +302,18 @@ def _apply_address_pass(text: str, stats: Dict[str, int] = None) -> str:
                         stats["地址"] = stats.get("地址", 0) + 1
             continue
 
-        # 向左回溯收集地名前缀（最多5个汉字）
+        # 向左回溯收集地名前缀
+        # R-⑯（v1.3.7，Issue #13-④）：可跨后缀（支行/分行/营业部/分理处）的网点名
+        # 上限由 5 放宽至 8（"锦艺新时代社区支行"此前因收满 5 字停在"艺"→
+        # "锦XX区支行"部分遮盖）；其余后缀维持 5，避免长词误收
+        crossable = suf in _ADDRESS_CROSSABLE_SUFFIXES
+        max_collect = 8 if crossable else 5
         i = s_start
         collected: List[str] = []
         stopped_by_demo = False
         crossed_admin = ""  # 支行/分行 跨越的行政后缀（如"中牟县支行"的"县"）
-        while i - 1 >= 0 and len(collected) < 5:
+        stop_backfilled = 0  # 停用字后补计数（每处最多 1 字）
+        while i - 1 >= 0 and len(collected) < max_collect:
             ch = text[i - 1]
             if not ("\u4e00" <= ch <= "\u9fff"):
                 break
@@ -301,18 +321,30 @@ def _apply_address_pass(text: str, stats: Dict[str, int] = None) -> str:
                 stopped_by_demo = True
                 break
             if ch in _ADDRESS_STOP_CHARS:
+                # R-⑯：网点名场景下若已收地名不足 2 字，允许把停用字并入前缀
+                # （"会展支行"的"会"在停用字表，但它是"会展"地名的首字）。
+                # 仅对 支行/分行/营业部/分理处 生效，且每处最多补 1 字
+                if crossable and len(collected) == 1 and stop_backfilled < 1:
+                    collected.append(ch)
+                    i -= 1
+                    stop_backfilled += 1
+                    continue
                 break
             if ch in _ADDRESS_ADMIN_BOUNDARY:
+                # R-⑯："社区支行"——"区"前为"社"时，"社区"是网点类型限定词
+                # （锦艺新时代社区支行），作为地名成分并入遮盖段，而非跨行政后缀
+                if crossable and ch == "区" and i - 2 >= 0 and text[i - 2] == "社":
+                    collected.append(ch)
+                    i -= 1
+                    continue
                 # R-B（Issue #3 漏1）：支行/分行 回溯时 乡村街路巷弄道 是地名成分
                 # （"新乡分行""金水路支行"），正常收集而非边界
-                if (suf in _ADDRESS_CROSSABLE_SUFFIXES
-                        and ch in _ADDRESS_COLLECTABLE_FOR_CROSSABLE):
+                if crossable and ch in _ADDRESS_COLLECTABLE_FOR_CROSSABLE:
                     collected.append(ch)
                     i -= 1
                     continue
                 # 支行/分行 允许跨越一个行政后缀（县支行/市分行），其余作为边界
-                if (suf in _ADDRESS_CROSSABLE_SUFFIXES and not crossed_admin
-                        and ch in ("省", "市", "县", "区")):
+                if crossable and not crossed_admin and ch in ("省", "市", "县", "区"):
                     crossed_admin = ch
                     i -= 1
                     continue
@@ -370,6 +402,60 @@ def _apply_address_pass(text: str, stats: Dict[str, int] = None) -> str:
         return text
     out.append(text[last:])
     return "".join(out)
+
+
+# ---------------------------------------------------------------------------
+# R-⑮（v1.3.7，响应 Issue #13-③）：无区号 7–8 位本地号码脱敏
+#
+# 背景：规则层对"电话：87517381"这类无区号本地号码零覆盖（G2 漏脱敏）。
+# 裸 \d{7,8} 会吞工号/编号/日期(20110612)/金额，故必须"上下文限定"：
+#   命中数字（含可选区号）的前置窗口内必须出现电话类关键词，
+#   且不得出现工号/编号/账号/金额等排除类关键词。
+# 前置窗口短（12 字），避免跨句误判；幂等（占位符无数字，不二次命中）。
+# ---------------------------------------------------------------------------
+
+_LOCAL_PHONE_CONTEXT = (
+    "电话", "联系方式", "联系电话", "座机", "固话", "办公电话",
+    "分机", "内线", "传真", "号码", "手机", "Tel", "tel", "TEL",
+)
+_LOCAL_PHONE_EXCLUDE = (
+    "工号", "编号", "账号", "卡号", "订单", "金额", "合同", "流水", "批次",
+    "序号", "学号", "证号", "版本", "年度", "年第", "日期", "期间", "身份证",
+    "邮编", "房号", "楼号", "室号", "车牌", "发票", "卡号",
+)
+# 可选区号（0 + 2-3 位 + 可选分隔符）+ 7-8 位本地号码；数字边界防子串误伤
+_LOCAL_PHONE_RE = re.compile(r"(?<!\d)(?:0\d{2,3}[-\s]?)?(\d{7,8})(?!\d)")
+_LOCAL_PHONE_WINDOW = 12
+
+
+def _apply_local_phone_pass(text: str, counts: Dict[str, int] = None) -> str:
+    """上下文限定的无区号本地号码脱敏（R-⑮）。"""
+    if not text or not isinstance(text, str):
+        return text
+    if not _LOCAL_PHONE_RE.search(text):
+        return text
+    replacement = get_replacement("PHONE", "0XX-XXXXXXXX")
+
+    def _repl(m: re.Match) -> str:
+        pre = text[max(0, m.start() - _LOCAL_PHONE_WINDOW):m.start()]
+        digits = m.group(1)
+        # 排除日期形态：8 位且形如 YYYYMMDD（20xx…）
+        if len(digits) == 8 and digits[:2] == "20" and "01" <= digits[4:6] <= "12":
+            return m.group(0)
+        # 前置窗口必须含电话关键词（否则视为工号/编号/金额等）
+        if not any(k in pre for k in _LOCAL_PHONE_CONTEXT):
+            return m.group(0)
+        # 前置窗口含排除词则跳过（如"工号：12345678""金额 12345678"）
+        if any(k in pre for k in _LOCAL_PHONE_EXCLUDE):
+            return m.group(0)
+        # 数字后紧邻"号"（门牌/房间号）→ 跳过
+        if m.end() < len(text) and text[m.end()] == "号":
+            return m.group(0)
+        if counts is not None:
+            counts["固话"] = counts.get("固话", 0) + 1
+        return replacement
+
+    return _LOCAL_PHONE_RE.sub(_repl, text)
 
 
 # ---------------------------------------------------------------------------
@@ -1053,6 +1139,10 @@ def apply_redactions_counted(text: str) -> Tuple[str, Dict[str, int]]:
     for pattern, replacement in pre_patterns:
         result = _counting_sub(pattern, result, replacement, counts)
 
+    # R-⑮（v1.3.7，Issue #13-③）：无区号 7–8 位本地号码（上下文限定）
+    # 须在地址通道之前执行——否则"电话：87517381"等可能被其它规则先行切分
+    result = _apply_local_phone_pass(result, counts)
+
     # 第二阶段：回溯式地址脱敏通道（省/市/县/区/街道/路/楼盘/大厦/支行/门牌）
     # 必须在姓名规则之前执行，防止"金水/花园"等地址成分被姓名规则误吞
     result = _apply_address_pass(result, stats=counts)
@@ -1143,6 +1233,37 @@ def apply_redactions(text: str) -> str:
     """
     result, _counts = apply_redactions_counted(text)
     return result
+
+
+# ---------------------------------------------------------------------------
+# R-⑬（v1.3.7，响应 Issue #13-①）：输出文件名脱敏（元数据泄漏治理）
+#
+# 背景：批量入口 pipeline.py 已对输出 stem 走规则脱敏 + 日期戳处理，但单文件
+# CLI（redact_word/excel/ppt/image）未同步——默认输出名保留"郑州银行"等敏感词，
+# 属元数据泄漏（正文已脱敏、文件系统里仍留客户名）。现抽为公共函数，所有入口
+# 共用；用户显式指定 output_path 时不改写（尊重调用方意图）。
+# ---------------------------------------------------------------------------
+
+_FILENAME_DATESTAMP_RE = re.compile(
+    r"(?<!\d)(20\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])(?!\d)"
+)
+
+
+def redact_filename_stem(stem: str) -> str:
+    """对输出文件名主干执行脱敏。
+
+    - apply_redactions 链式规则：银行名/地名/日期等 → 占位符
+    - 8 位日期戳（20171120）→ YYYYMMDD（与 pipeline 口径一致）
+    失败时保留原名，绝不影响正文脱敏。
+    """
+    if not stem or not isinstance(stem, str):
+        return stem
+    try:
+        redacted = apply_redactions(stem)
+        redacted = _FILENAME_DATESTAMP_RE.sub("YYYYMMDD", redacted)
+        return redacted or stem
+    except Exception:
+        return stem
 
 
 def add_custom_replacement(old: str, new: str, position: int = -1) -> None:

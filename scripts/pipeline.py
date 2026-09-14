@@ -147,12 +147,12 @@ def process_single_file(args: Tuple[str, str, str, bool]) -> RedactResult:
         file_size = input_p.stat().st_size
 
         # 构建输出路径（文件名同样脱敏：银行名称/地址等 → XX，日期戳 → YYYYMMDD）
+        # R-⑬（v1.3.7，Issue #13-①）：改用 common_rules 公共实现，与单文件 CLI 统一
         stem = input_p.stem
         ext = input_p.suffix.lower()
         try:
-            from common_rules import apply_redactions as _redact_name
+            from common_rules import redact_filename_stem as _redact_name
             stem = _redact_name(stem)
-            stem = re.sub(r'(?<!\d)(20\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])(?!\d)', 'YYYYMMDD', stem)
         except Exception:
             pass  # 文件名脱敏失败时保留原名，不影响正文脱敏
         output_path = Path(output_dir) / f"{stem}_脱敏{ext}"

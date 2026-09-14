@@ -32,7 +32,7 @@ from pathlib import Path
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from common_rules import apply_redactions, protect_iso_datetimes, restore_iso_datetimes, find_libreoffice
+from common_rules import apply_redactions, protect_iso_datetimes, restore_iso_datetimes, find_libreoffice, redact_filename_stem
 from entity_detector import build_llm_detector
 
 # Word XML 命名空间
@@ -661,7 +661,8 @@ def redact_word(input_path: str, output_path: str = None) -> dict:
     """根据扩展名自动分发处理，返回脱敏统计"""
     detector = build_llm_detector()
     if output_path is None:
-        stem = Path(input_path).stem
+        # R-⑬（v1.3.7，Issue #13-①）：默认输出名与 pipeline 统一走文件名脱敏
+        stem = redact_filename_stem(Path(input_path).stem)
         ext = Path(input_path).suffix.lower()
         output_path = str(Path(input_path).with_name(f"{stem}_脱敏{ext}"))
 

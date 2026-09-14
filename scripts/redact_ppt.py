@@ -27,7 +27,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from common_rules import apply_redactions, apply_redactions_counted, find_libreoffice
-from common_rules import redistribute_paragraph
+from common_rules import redistribute_paragraph, redact_filename_stem
 from html import unescape as _html_unescape
 from xml.sax.saxutils import escape as _xml_escape
 
@@ -349,7 +349,8 @@ def redact_ppt_to_pptx(input_path: str, output_pptx: str) -> dict:
 def redact_ppt(input_path: str, output_path: str = None) -> dict:
     """自动根据扩展名分发处理，返回脱敏统计"""
     if output_path is None:
-        stem = Path(input_path).stem
+        # R-⑬（v1.3.7，Issue #13-①）：默认输出名统一走文件名脱敏
+        stem = redact_filename_stem(Path(input_path).stem)
         output_path = str(Path(input_path).with_name(f"{stem}_脱敏.pptx"))
 
     ext = Path(input_path).suffix.lower()

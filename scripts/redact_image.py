@@ -22,7 +22,7 @@ from pathlib import Path
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from common_rules import apply_redactions
+from common_rules import apply_redactions, redact_filename_stem
 
 # Tesseract 路径自动检测（从 config.json 读取）
 import shutil
@@ -173,7 +173,8 @@ def redact_image(input_path: str, output_path: str = None,
     import numpy as np
 
     if output_path is None:
-        stem = Path(input_path).stem
+        # R-⑬（v1.3.7，Issue #13-①）：默认输出名统一走文件名脱敏
+        stem = redact_filename_stem(Path(input_path).stem)
         ext = Path(input_path).suffix
         output_path = str(Path(input_path).with_name(f"{stem}_脱敏{ext}"))
 
