@@ -108,6 +108,7 @@ EXCLUDED_COMMON_WORDS: set = {
     # 姓+名用字池中的字 → 但整体非姓名（如"骨干"/"成功"/"创业"等）
     "骨干", "成员", "成功", "创业", "兴业", "恒信", "隆昌",
     "腾飞", "卓越", "领先", "领先", "稳健", "合规", "风控",
+    "成立",  # R-⑲（v1.3.8，响应 Issue #14-附带发现）：成(姓)+立(名池)误判，如"自XX银行成立"
     "运营", "管理", "发展", "建设", "推进", "落实", "完善",
     "深化", "提升", "优化", "创新", "改革", "转型", "突破",
     "协同", "联动", "共享", "共建", "共赢", "互利", "互惠",
@@ -1178,6 +1179,15 @@ def apply_redactions_counted(text: str) -> Tuple[str, Dict[str, int]]:
     name_pool_chars = cfg.get("name_pool", "")
     _surname_set_recovery = SURNAME_SET  # 引用全局姓氏集
     _name_chars = set(name_pool_chars)  # 名字用字集合
+    # R-⑱（v1.3.8，响应 Issue #14）：机构后缀守卫——恢复段本为修复地址通道截断
+    # 的姓名（黄XX镇→XXX），但"银行/支行名→XX银行"等机构占位符同样产出 XX。
+    # 当"姓氏字+XX+机构字"（如 于XX银/和XX心/李XX学）时误并致"关XXX行"类过遮盖。
+    # 故 XX 后片段以机构/单位后缀开头时跳过合并；行政后缀（镇/村/路/县等）
+    # 不纳入守卫，保住"黄XX镇→XXX"既有修复场景。
+    _RECOVERY_ORG_SUFFIXES = (
+        "银行", "支行", "分行", "营业部", "分理处",
+        "公司", "中心", "学校", "学院", "大学", "医院", "集团", "研究院",
+    )
     # 扫描所有 XX{single_name_char} 的位置
     _pos = 0
     while True:
@@ -1192,6 +1202,11 @@ def apply_redactions_counted(text: str) -> Tuple[str, Dict[str, int]]:
                 if _idx + 2 < len(result):
                     _ch_after = result[_idx + 2]
                     if _ch_after in _name_chars:
+                        # R-⑱：XX 后以机构后缀开头 → 机构占位符，非截断姓名，跳过
+                        if any(result.startswith(suf, _idx + 2)
+                               for suf in _RECOVERY_ORG_SUFFIXES):
+                            _pos = _idx + 2
+                            continue
                         # 姓氏 + XX + 名字单字 → 姓氏 + XXX（完整姓名）
                         result = result[:_idx - 1] + 'XXX' + result[_idx + 3:]
                         _pos = _idx - 1  # 从 XXX 后继续扫描
