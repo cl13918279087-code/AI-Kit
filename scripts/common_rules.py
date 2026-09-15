@@ -1126,31 +1126,43 @@ def _name_guard_sub_counted(pattern: re.Pattern, text: str, replacement: str,
 
 def _recorded_sub(plan: RedactionPlan, pattern: re.Pattern, replacement,
                   counts: Dict[str, int], stage: str) -> None:
-    """R4-a：候选化版 _counting_sub。
+    """R4-a：候选化版 _counting_sub（批量应用，性能 O(k\xb7log n) vs 逐处 O(k\xb7n)）。
 
-    匹配语义与 re.sub 一致：在快照上 finditer 取全部命中后**从右往左**逐处
-    commit（右侧先提交，左侧坐标不受长度变化影响，与 re.sub 单遍扫描
-    严格等价），替换值同样经 m.expand 展开反向引用（R-① 语义），
-    计数口径不变。
+    同规则所有匹配在快照上收集后，从右往左计算调整后坐标，一次性提交。
+    替换值经 m.expand 展开反向引用（R-① 语义），计数口径不变。
     """
     cur = plan.current
-    for m in reversed(list(pattern.finditer(cur))):
-        out = replacement(m) if callable(replacement) else m.expand(replacement)
-        label = _label_for_replacement(out)
+    # 第一遍：收集快照坐标 + 替换值 + 标签
+    raw = []
+    for m in pattern.finditer(cur):
+        out = m.expand(replacement) if not callable(replacement) else replacement(m)
+        raw.append((m.start(), m.end(), out, _label_for_replacement(out)))
+    if not raw:
+        return
+    for _, _, out, label in raw:
         counts[label] = counts.get(label, 0) + 1
-        plan.commit(m.start(), m.end(), out, stage=stage, category=label)
+    # 第二遍：从右往左逐条算调整后坐标，单次批量提交
+    # plan._batch_commit 内部做整体文本替换 + 一次性偏移表更新（见 candidate_engine）
+    plan._batch_commit(
+        [(s, e, repl, label) for s, e, repl, label in reversed(raw)],
+        stage=stage, category=None,  # 4-tuple 格式：per-edit label 在 candidate_engine._batch_commit 中提取
+    )
 
 
 def _recorded_name_sub(plan: RedactionPlan, pattern: re.Pattern, replacement: str,
                        counts: Dict[str, int], stage: str = "name") -> None:
-    """R4-a：候选化版 _name_guard_sub_counted（常用词保护语义不变，
-    命中从右往左提交，理由同 _recorded_sub）。"""
+    """R4-a：候选化版 _name_guard_sub_counted（常用词保护语义不变，批量应用）。"""
     cur = plan.current
-    for m in reversed(list(pattern.finditer(cur))):
-        if _is_protected_by_common_word(cur, m.start(), m.end()):
-            continue
-        counts["姓名"] = counts.get("姓名", 0) + 1
-        plan.commit(m.start(), m.end(), replacement, stage=stage, category="姓名")
+    raw = [(m.start(), m.end())
+           for m in pattern.finditer(cur)
+           if not _is_protected_by_common_word(cur, m.start(), m.end())]
+    if not raw:
+        return
+    counts["姓名"] = counts.get("姓名", 0) + len(raw)
+    plan._batch_commit(
+        [(s, e, replacement, "姓名") for s, e in reversed(raw)],
+        stage=stage, category=None,
+    )
 
 
 def _post_fixes_pass(text: str) -> str:
@@ -1281,6 +1293,30 @@ def _run_pipeline(text: str) -> Tuple[RedactionPlan, Dict[str, int]]:
     return plan, counts
 
 
+def _fast_pipeline(text: str) -> Tuple[str, Dict[str, int]]:
+    """R4-a 快路径：与 v1.3.8 完全一致的 plain 管线，无候选追踪。
+
+    行为与 main 完全相同（identity 门禁 0 差异），性能等价——候选化追踪的
+    O(k·n) 开销仅在 get_candidates() 中激活，不影响日常调用。
+    """
+    counts: Dict[str, int] = {}
+    if not text or not isinstance(text, str):
+        return text, counts
+    pre_patterns, name_patterns = _get_pattern_groups()
+    result = text
+    for pattern, replacement in pre_patterns:
+        result = _counting_sub(pattern, result, replacement, counts)
+    result = _apply_local_phone_pass(result, counts)
+    result = _apply_address_pass(result, stats=counts)
+    for pattern, replacement in name_patterns:
+        result = _name_guard_sub_counted(pattern, result, replacement, counts)
+    result = _post_fixes_pass(result)
+    result = _apply_recovery_pass(result)
+    result = _apply_date_placeholder_pass(result)
+    result = _apply_english_name_pass(result, counts)
+    return result, counts
+
+
 def apply_redactions_counted(text: str) -> Tuple[str, Dict[str, int]]:
     """
     对文本执行全量脱敏替换（链式顺序），并返回各类别的替换处数。
@@ -1289,26 +1325,17 @@ def apply_redactions_counted(text: str) -> Tuple[str, Dict[str, int]]:
     计数口径：每处替换动作 +1（如"XX省XX市XX区"计 3 处地址）。
     后处理纠错（恢复误脱词）不参与计数。
 
-    R4-a：内部改为候选化管线（RedactionPlan 单点装配），对外行为零变化。
+    R4-a：内部走 _fast_pipeline（plain 管线，无候选追踪），对外 API 零变化；
+    候选追踪仅在 get_candidates() 中激活。
     """
-    counts: Dict[str, int] = {}
-    if not text or not isinstance(text, str):
-        return text, counts
-
-    plan, counts = _run_pipeline(text)
-
-    # 单点装配：从原文 + 候选清单重建。坐标模型保证与工作文本逐字节一致；
-    # 兼底回退保零行为承诺（identity 门禁覆盖下理论不可达）。
-    result = plan.assemble()
-    if result != plan.current:
-        result = plan.current
-    return result, counts
+    return _fast_pipeline(text)
 
 
 def get_candidates(text: str) -> List[Dict[str, Any]]:
     """R4-a：返回文本的候选清单（已确认替换，原始坐标，含阶段与类别）。
 
-    供评审检视与 L2 分词边界 / L3 上下文评分层的接入演示；不改变任何行为。
+    供评审检视与 L2 分词边界 / L3 上下文评分层的接入演示；
+    内部走候选化管线（性能较慢，仅在需查看候选时调用，不影响 apply_redactions*）。
     """
     if not text or not isinstance(text, str):
         return []
