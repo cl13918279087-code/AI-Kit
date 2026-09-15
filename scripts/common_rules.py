@@ -19,6 +19,9 @@ import shutil
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict, Any
 
+# R4-a（major v2.0.0 · 分支评审参照）：候选化引擎
+from candidate_engine import RedactionPlan
+
 # ---------------------------------------------------------------------------
 # 配置加载
 # ---------------------------------------------------------------------------
@@ -1121,42 +1124,49 @@ def _name_guard_sub_counted(pattern: re.Pattern, text: str, replacement: str,
     return pattern.sub(_repl, text)
 
 
-def apply_redactions_counted(text: str) -> Tuple[str, Dict[str, int]]:
+def _recorded_sub(plan: RedactionPlan, pattern: re.Pattern, replacement,
+                  counts: Dict[str, int], stage: str) -> None:
+    """R4-a：候选化版 _counting_sub（批量应用，性能 O(k\xb7log n) vs 逐处 O(k\xb7n)）。
+
+    同规则所有匹配在快照上收集后，从右往左计算调整后坐标，一次性提交。
+    替换值经 m.expand 展开反向引用（R-① 语义），计数口径不变。
     """
-    对文本执行全量脱敏替换（链式顺序），并返回各类别的替换处数。
-    返回 (脱敏后的文本, 计数字典)。
+    cur = plan.current
+    # 第一遍：收集快照坐标 + 替换值 + 标签
+    raw = []
+    for m in pattern.finditer(cur):
+        out = m.expand(replacement) if not callable(replacement) else replacement(m)
+        raw.append((m.start(), m.end(), out, _label_for_replacement(out)))
+    if not raw:
+        return
+    for _, _, out, label in raw:
+        counts[label] = counts.get(label, 0) + 1
+    # 第二遍：从右往左逐条算调整后坐标，单次批量提交
+    # plan._batch_commit 内部做整体文本替换 + 一次性偏移表更新（见 candidate_engine）
+    plan._batch_commit(
+        [(s, e, repl, label) for s, e, repl, label in reversed(raw)],
+        stage=stage, category=None,  # 4-tuple 格式：per-edit label 在 candidate_engine._batch_commit 中提取
+    )
 
-    计数口径：每处替换动作 +1（如"XX省XX市XX区"计 3 处地址）。
-    后处理纠错（恢复误脱词）不参与计数。
-    """
-    counts: Dict[str, int] = {}
-    if not text or not isinstance(text, str):
-        return text, counts
 
-    pre_patterns, name_patterns = _get_pattern_groups()
+def _recorded_name_sub(plan: RedactionPlan, pattern: re.Pattern, replacement: str,
+                       counts: Dict[str, int], stage: str = "name") -> None:
+    """R4-a：候选化版 _name_guard_sub_counted（常用词保护语义不变，批量应用）。"""
+    cur = plan.current
+    raw = [(m.start(), m.end())
+           for m in pattern.finditer(cur)
+           if not _is_protected_by_common_word(cur, m.start(), m.end())]
+    if not raw:
+        return
+    counts["姓名"] = counts.get("姓名", 0) + len(raw)
+    plan._batch_commit(
+        [(s, e, replacement, "姓名") for s, e in reversed(raw)],
+        stage=stage, category=None,
+    )
 
-    result = text
-    # 第一阶段：姓名之前的规则（邮箱/日期/银行/支行/地名等）
-    for pattern, replacement in pre_patterns:
-        result = _counting_sub(pattern, result, replacement, counts)
 
-    # R-⑮（v1.3.7，Issue #13-③）：无区号 7–8 位本地号码（上下文限定）
-    # 须在地址通道之前执行——否则"电话：87517381"等可能被其它规则先行切分
-    result = _apply_local_phone_pass(result, counts)
-
-    # 第二阶段：回溯式地址脱敏通道（省/市/县/区/街道/路/楼盘/大厦/支行/门牌）
-    # 必须在姓名规则之前执行，防止"金水/花园"等地址成分被姓名规则误吞
-    result = _apply_address_pass(result, stats=counts)
-
-    # 第三阶段：姓名规则（R1：带常用词覆盖保护，"说明书→说XXX"类误伤在应用层过滤）
-    _name_repl = get_replacement("NAME", "XXX")
-    for pattern, replacement in name_patterns:
-        result = _name_guard_sub_counted(pattern, result, replacement, counts)
-
-    # 后处理：纠正已知误脱敏
-    # 1. 姓名模式误匹配中文词（Rule A 右边界放宽后，可能对常用词造成误匹配）
-    # 2. DATE pattern 误替换（策略：替换为 XXXX年XX月XX日 保持脱敏但不暴露原始值）
-    import re as _re
+def _post_fixes_pass(text: str) -> str:
+    """后处理纠错硬编码表（R4-b/c 计划以词典数据化清除）。"""
     post_fixes = [
         ('清XXX下', '清单如下'),
         ('营运XXX部', '营运计财部'),
@@ -1169,16 +1179,20 @@ def apply_redactions_counted(text: str) -> Tuple[str, Dict[str, int]]:
         # 扩大：姓氏+XXX+常用后缀 的误脱恢复
     ]
     for wrong, correct in post_fixes:
-        if wrong in result:
-            result = result.replace(wrong, correct)
+        if wrong in text:
+            text = text.replace(wrong, correct)
+    return text
 
+
+def _apply_recovery_pass(text: str) -> str:
+    """XX 恢复段（含 R-⑱ 机构后缀守卫），逻辑自 apply_redactions_counted 抽出。"""
+    result = text
     # 恢复被地址通道误截断的姓名（如"黄日镇"被地址通道处理为"XX镇"）
     # 策略：扫描 "姓氏+XX+名字池单字" 模式，如"黄XX镇" → "XXX"
-    # 姓氏后面紧跟 XX（地址占位符），XX后是名字池中的单字（镇/璇/钟等）
     cfg = _load_config()
     name_pool_chars = cfg.get("name_pool", "")
-    _surname_set_recovery = SURNAME_SET  # 引用全局姓氏集
-    _name_chars = set(name_pool_chars)  # 名字用字集合
+    _surname_set_recovery = SURNAME_SET
+    _name_chars = set(name_pool_chars)
     # R-⑱（v1.3.8，响应 Issue #14）：机构后缀守卫——恢复段本为修复地址通道截断
     # 的姓名（黄XX镇→XXX），但"银行/支行名→XX银行"等机构占位符同样产出 XX。
     # 当"姓氏字+XX+机构字"（如 于XX银/和XX心/李XX学）时误并致"关XXX行"类过遮盖。
@@ -1188,17 +1202,14 @@ def apply_redactions_counted(text: str) -> Tuple[str, Dict[str, int]]:
         "银行", "支行", "分行", "营业部", "分理处",
         "公司", "中心", "学校", "学院", "大学", "医院", "集团", "研究院",
     )
-    # 扫描所有 XX{single_name_char} 的位置
     _pos = 0
     while True:
         _idx = result.find('XX', _pos)
         if _idx < 0:
             break
-        # 检查 XX 前一个字符是否是姓氏
         if _idx > 0:
             _ch_before = result[_idx - 1]
             if _ch_before in _surname_set_recovery:
-                # 检查 XX 后是否紧跟名字池单字
                 if _idx + 2 < len(result):
                     _ch_after = result[_idx + 2]
                     if _ch_after in _name_chars:
@@ -1207,16 +1218,16 @@ def apply_redactions_counted(text: str) -> Tuple[str, Dict[str, int]]:
                                for suf in _RECOVERY_ORG_SUFFIXES):
                             _pos = _idx + 2
                             continue
-                        # 姓氏 + XX + 名字单字 → 姓氏 + XXX（完整姓名）
                         result = result[:_idx - 1] + 'XXX' + result[_idx + 3:]
-                        _pos = _idx - 1  # 从 XXX 后继续扫描
+                        _pos = _idx - 1
                         continue
         _pos = _idx + 1
+    return result
 
-    # DATE 后处理：DATE pattern 把日期替换为 YYYY年MM月DD日，
-    # 但"应为2022年3月31日"中的日期是通用日期描述不应被替换。
-    # 策略：扫描文本中所有"YYYY年MM月DD日"，若其前3字是"应为|必须为|须于"，
-    # 则替换为 XXXX年XX月XX日（保持脱敏但不暴露原始日期）
+
+def _apply_date_placeholder_pass(text: str) -> str:
+    """DATE 占位符后处理："应为/必须为/须于+YYYY年MM月DD日" → XXXX年XX月XX日。"""
+    result = text
     _date_placeholder = 'YYYY年MM月DD日'
     _prefixes = ('应为', '必须为', '须于')
     _pos = 0
@@ -1229,13 +1240,107 @@ def apply_redactions_counted(text: str) -> Tuple[str, Dict[str, int]]:
             result = result[:_idx] + 'XXXX年XX月XX日' + result[_idx+len(_date_placeholder):]
             # 注：该处日期仍处于脱敏状态（仅占位符形式变化），计数不回退
         _pos = _idx + 1
+    return result
+
+
+def _run_pipeline(text: str) -> Tuple[RedactionPlan, Dict[str, int]]:
+    """R4-a 候选化管线：与原链式顺序逐段对应，行为零变化。
+
+    各阶段对接方式：
+    - 正则规则（pre/姓名）：_recorded_sub / _recorded_name_sub 逐处 commit；
+    - 复杂通道（电话/地址/恢复段/后处理/英文人名）：整体产出后经
+      sync_stage 以 diff 对齐记录净编辑（不重写其内部逻辑）；
+    - 计数语义不变：纠错类后处理不参与计数。
+    """
+    counts: Dict[str, int] = {}
+    plan = RedactionPlan(text)
+    pre_patterns, name_patterns = _get_pattern_groups()
+
+    # 第一阶段：姓名之前的规则（邮箱/日期/银行/支行/地名等）
+    for pattern, replacement in pre_patterns:
+        _recorded_sub(plan, pattern, replacement, counts, stage="pre")
+
+    # R-⑮（v1.3.7，Issue #13-③）：无区号 7–8 位本地号码（上下文限定）
+    # 须在地址通道之前执行——否则"电话：87517381"等可能被其它规则先行切分
+    plan.sync_stage(_apply_local_phone_pass(plan.current, counts),
+                    stage="phone_pass", category="固话")
+
+    # 第二阶段：回溯式地址脱敏通道（省/市/县/区/街道/路/楼盘/大厦/支行/门牌）
+    # 必须在姓名规则之前执行，防止"金水/花园"等地址成分被姓名规则误吞
+    plan.sync_stage(_apply_address_pass(plan.current, stats=counts),
+                    stage="address_pass", category="地址")
+
+    # 第三阶段：姓名规则（R1：带常用词覆盖保护，"说明书→说XXX"类误伤在应用层过滤）
+    for pattern, replacement in name_patterns:
+        _recorded_name_sub(plan, pattern, replacement, counts)
+
+    # 后处理：纠正已知误脱敏（不参与计数）
+    plan.sync_stage(_post_fixes_pass(plan.current), stage="post_fix", category="恢复")
+
+    # XX 恢复段（含 R-⑱ 机构后缀守卫，不参与计数）
+    plan.sync_stage(_apply_recovery_pass(plan.current), stage="recovery", category="恢复")
+
+    # DATE 占位符后处理（不参与计数）
+    plan.sync_stage(_apply_date_placeholder_pass(plan.current),
+                    stage="date_placeholder", category="恢复")
 
     # R-⑧（v1.3.3，响应 Issue #10-A）：角色上下文英文人名规则
     # 仅当段落（按行）含角色词时，遮蔽段内首字母大写英文词（Lisa/David…）。
     # 不做无差别英文遮蔽——UAT/POS/PO/OA 等业务术语不受影响。
-    result = _apply_english_name_pass(result, counts)
+    plan.sync_stage(_apply_english_name_pass(plan.current, counts),
+                    stage="english_name", category="英文人名")
 
+    return plan, counts
+
+
+def _fast_pipeline(text: str) -> Tuple[str, Dict[str, int]]:
+    """R4-a 快路径：与 v1.3.8 完全一致的 plain 管线，无候选追踪。
+
+    行为与 main 完全相同（identity 门禁 0 差异），性能等价——候选化追踪的
+    O(k·n) 开销仅在 get_candidates() 中激活，不影响日常调用。
+    """
+    counts: Dict[str, int] = {}
+    if not text or not isinstance(text, str):
+        return text, counts
+    pre_patterns, name_patterns = _get_pattern_groups()
+    result = text
+    for pattern, replacement in pre_patterns:
+        result = _counting_sub(pattern, result, replacement, counts)
+    result = _apply_local_phone_pass(result, counts)
+    result = _apply_address_pass(result, stats=counts)
+    for pattern, replacement in name_patterns:
+        result = _name_guard_sub_counted(pattern, result, replacement, counts)
+    result = _post_fixes_pass(result)
+    result = _apply_recovery_pass(result)
+    result = _apply_date_placeholder_pass(result)
+    result = _apply_english_name_pass(result, counts)
     return result, counts
+
+
+def apply_redactions_counted(text: str) -> Tuple[str, Dict[str, int]]:
+    """
+    对文本执行全量脱敏替换（链式顺序），并返回各类别的替换处数。
+    返回 (脱敏后的文本, 计数字典)。
+
+    计数口径：每处替换动作 +1（如"XX省XX市XX区"计 3 处地址）。
+    后处理纠错（恢复误脱词）不参与计数。
+
+    R4-a：内部走 _fast_pipeline（plain 管线，无候选追踪），对外 API 零变化；
+    候选追踪仅在 get_candidates() 中激活。
+    """
+    return _fast_pipeline(text)
+
+
+def get_candidates(text: str) -> List[Dict[str, Any]]:
+    """R4-a：返回文本的候选清单（已确认替换，原始坐标，含阶段与类别）。
+
+    供评审检视与 L2 分词边界 / L3 上下文评分层的接入演示；
+    内部走候选化管线（性能较慢，仅在需查看候选时调用，不影响 apply_redactions*）。
+    """
+    if not text or not isinstance(text, str):
+        return []
+    plan, _ = _run_pipeline(text)
+    return plan.candidates()
 
 
 def apply_redactions(text: str) -> str:
