@@ -32,8 +32,29 @@ from pathlib import Path
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from common_rules import apply_redactions, protect_iso_datetimes, restore_iso_datetimes, find_libreoffice, redact_filename_stem
+from common_rules import apply_redactions, protect_iso_datetimes, restore_iso_datetimes, find_libreoffice, redact_filename_stem, load_agent_decisions
 from entity_detector import build_llm_detector
+
+# ---------------------------------------------------------------------------
+# Agent 评审决策上下文（方式一：分阶段交互）
+# 由 redact_all.py 的 --agent-decisions 参数在调用时设置
+# ---------------------------------------------------------------------------
+_MANIFEST_OVERRIDE_PATH: str = None  # 类型提示用，实际为 str | None
+
+
+def _set_manifest_override(path: str) -> None:
+    """设置 Agent 评审决策文件路径（由 redact_all.py 调用前设置）"""
+    global _MANIFEST_OVERRIDE_PATH
+    _MANIFEST_OVERRIDE_PATH = path
+
+
+def _get_skip_texts() -> set:
+    """从决策文件加载需跳过的实体文本集合"""
+    if not _MANIFEST_OVERRIDE_PATH:
+        return set()
+    decisions = load_agent_decisions(_MANIFEST_OVERRIDE_PATH)
+    return {t for t, d in decisions.items() if d == "skip"}
+
 
 # Word XML 命名空间
 NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -205,10 +226,13 @@ def _manifest_to_spans(full_text: str, manifest, node_texts: list = None) -> lis
     """
     spans = []
     search_from = 0
+    skip_texts = _get_skip_texts()
     for ent in manifest.entities:
         text = (ent.text or "").strip()
         if not text or len(text) < 2:
             continue  # 跳过单字（避免误匹配"时/我/行"）
+        if skip_texts and text in skip_texts:
+            continue  # Agent 标记跳过，不遮盖
         pos = full_text.find(text, search_from)
         match_len = len(text)
         if pos < 0:
@@ -657,9 +681,15 @@ def redact_doc_to_docx(input_path: str, output_docx: str, detector=None) -> dict
 # 统一入口
 # ---------------------------------------------------------------------------
 
-def redact_word(input_path: str, output_path: str = None) -> dict:
+def redact_word(input_path: str, output_path: str = None,
+               *, manifest_override: str = None) -> dict:
     """根据扩展名自动分发处理，返回脱敏统计"""
     detector = build_llm_detector()
+    if manifest_override:
+        _set_manifest_override(manifest_override)
+        skip_texts = _get_skip_texts()
+        if skip_texts:
+            print(f"[决策] 跳过 {len(skip_texts)} 个 Agent 标记实体的遮盖")
     if output_path is None:
         # R-⑬（v1.3.7，Issue #13-①）：默认输出名与 pipeline 统一走文件名脱敏
         stem = redact_filename_stem(Path(input_path).stem)
@@ -712,9 +742,13 @@ def main():
         print("用法: python3 redact_word.py <输入文件.docx/.doc> [输出文件路径]")
         sys.exit(1)
 
-    input_file = sys.argv[1]
-    output_file = sys.argv[2] if len(sys.argv) > 2 else None
-    redact_word(input_file, output_file)
+    import argparse
+    parser = argparse.ArgumentParser(description="Word 文档脱敏")
+    parser.add_argument("input_file")
+    parser.add_argument("output_file", nargs="?")
+    parser.add_argument("--manifest-override", dest="manifest_override")
+    args = parser.parse_args()
+    redact_word(args.input_file, args.output_file, manifest_override=args.manifest_override)
 
 
 if __name__ == "__main__":

@@ -17,7 +17,7 @@ from pathlib import Path
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from common_rules import apply_redactions, apply_redactions_counted, REDACTION_LABELS, protect_iso_datetimes, restore_iso_datetimes, redact_filename_stem
+from common_rules import apply_redactions, apply_redactions_counted, REDACTION_LABELS, protect_iso_datetimes, restore_iso_datetimes, redact_filename_stem, set_agent_decisions_override, load_agent_decisions
 
 # ---------------------------------------------------------------------------
 # .xlsx 处理（OOXML / ZIP 格式）
@@ -198,7 +198,8 @@ def _count_type(counts: dict, label: str) -> None:
 # 入口
 # ---------------------------------------------------------------------------
 
-def redact_excel(input_path: str, output_path: str = None) -> dict:
+def redact_excel(input_path: str, output_path: str = None,
+               *, manifest_override: str = None) -> dict:
     """
     统一入口，自动根据扩展名分发到 xlsx 或 xls 处理函数。
     返回各类脱敏统计。
@@ -207,6 +208,13 @@ def redact_excel(input_path: str, output_path: str = None) -> dict:
         # R-⑬（v1.3.7，Issue #13-①）：默认输出名统一走文件名脱敏
         stem = redact_filename_stem(Path(input_path).stem)
         output_path = str(Path(input_path).with_name(f"{stem}_脱敏.xlsx"))
+
+    if manifest_override:
+        set_agent_decisions_override(manifest_override)
+        from common_rules import _get_skip_texts
+        skip_texts = _get_skip_texts()
+        if skip_texts:
+            print(f"[决策] Excel 跳过 {len(skip_texts)} 个 Agent 标记实体的遮盖")
 
     ext = Path(input_path).suffix.lower()
     counts = {}

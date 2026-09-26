@@ -20,6 +20,59 @@ from pathlib import Path
 from typing import List, Tuple, Optional, Dict, Any
 
 # ---------------------------------------------------------------------------
+# Agent 评审决策上下文（方式一：分阶段交互）
+# ---------------------------------------------------------------------------
+GRAY_CONFIDENCE_THRESHOLD = 0.75  # ≥ 此值 → 自动遮盖；< 此值 → 灰区交 Agent 评审
+
+# Agent 评审决策文件结构说明（JSON）：
+# [
+#   {"text": "张明", "decision": "skip",  "reason": "上下文为编号，非姓名"},
+#   {"text": "黎明", "decision": "redact", "reason": "确认为人名"}
+# ]
+
+# 全局 Agent 评审决策路径（由 redact_all.py 调用 set_agent_decisions_override() 设置）
+_AGENT_DECISIONS_OVERRIDE: str = None
+
+
+def set_agent_decisions_override(path: str) -> None:
+    """设置 Agent 评审决策文件路径（由 redact_all.py 调用）"""
+    global _AGENT_DECISIONS_OVERRIDE
+    _AGENT_DECISIONS_OVERRIDE = path
+
+
+def is_gray_entity(confidence: float) -> bool:
+    """判断实体是否为灰区（需 Agent 评审）"""
+    return confidence < GRAY_CONFIDENCE_THRESHOLD
+
+
+def _get_skip_texts() -> set:
+    """从决策文件加载需跳过的实体文本集合"""
+    if not _AGENT_DECISIONS_OVERRIDE:
+        return set()
+    decisions = load_agent_decisions(_AGENT_DECISIONS_OVERRIDE)
+    return {t for t, d in decisions.items() if d == "skip"}
+
+
+def load_agent_decisions(path: str) -> Dict[str, str]:
+    """
+    加载 Agent 评审决策，返回 {text: decision} 映射。
+    decision = "skip" 表示跳过（不遮盖），"redact" 表示遮盖。
+    文件不存在或解析失败时返回空字典（不影响正常流程）。
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            decisions = json.load(f)
+        result = {}
+        for item in decisions:
+            t = item.get("text", "")
+            d = item.get("decision", "")
+            if t and d:
+                result[t] = d
+        return result
+    except Exception:
+        return {}
+
+# ---------------------------------------------------------------------------
 # 配置加载
 # ---------------------------------------------------------------------------
 
@@ -972,14 +1025,21 @@ def _label_for_replacement(replacement: str) -> str:
         return "邮箱"
     if replacement.endswith("银行"):
         return "银行名"
-    if replacement.startswith("0XX"):
-        return "固话"
     if replacement == "X.X.X.X":
         return "IP地址"
     if replacement == "XXXX":
         return "组织名"
     if replacement == "XXX":
         return "姓名"
+    if replacement.startswith("0XX"):
+        return "固话"
+    # 长串全X（手机号 11位、身份证 18位、银行卡 16位等）→ 不归"地址"
+    if (replacement.startswith("XXXXX") and replacement.isdigit()) or replacement in (
+            "XXXXXXXXXXX",    # 手机
+            "XXXXXXXXXXXXXXXXXX",  # 身份证
+            "XXXXXXXXXXXXXXXX",    # 银行卡
+    ):
+        return "手机"
     if replacement.startswith("XX"):
         return "地址"
     return "其他"
@@ -1096,6 +1156,9 @@ def _counting_sub(pattern: re.Pattern, text: str, replacement,
     支持 callable 替换（如固话 0XX- 规则），按实际产出分类。"""
 
     def _repl(m: re.Match) -> str:
+        # Agent 评审决策跳过：若本轮匹配文本在 skip 集合中，不遮盖
+        if _get_skip_texts() and m.group(0) in _get_skip_texts():
+            return m.group(0)
         # R-①（v1.3.2，响应 Issue #8）：字符串替换须经 m.expand 展开反向引用
         # （如日期范围规则的 \2=分隔符）。callable 传给 pattern.sub 时返回值
         # 不再展开 \1/\2，字面 "\2" 会直接落盘；expand 对不含反斜杠的纯文本
@@ -1110,10 +1173,13 @@ def _counting_sub(pattern: re.Pattern, text: str, replacement,
 
 def _name_guard_sub_counted(pattern: re.Pattern, text: str, replacement: str,
                             counts: Dict[str, int]) -> str:
-    """带计数的姓名规则替换：仅统计实际替换（排除常用词保护保留的命中）。"""
+    """带计数的姓名规则替换：仅统计实际替换（排除常用词保护/Agent skip 保留的命中）。"""
 
     def _repl(m: re.Match) -> str:
         if _is_protected_by_common_word(m.string, m.start(), m.end()):
+            return m.group(0)
+        # Agent 评审决策跳过：若本轮匹配文本在 skip 集合中，不遮盖
+        if _get_skip_texts() and m.group(0) in _get_skip_texts():
             return m.group(0)
         counts["姓名"] = counts.get("姓名", 0) + 1
         return replacement

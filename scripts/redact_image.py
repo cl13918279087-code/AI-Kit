@@ -16,13 +16,14 @@ redact_image.py - 图片脱敏脚本
 """
 
 import sys
+import os
 import io
 from pathlib import Path
 
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from common_rules import apply_redactions, redact_filename_stem
+from common_rules import apply_redactions, redact_filename_stem, set_agent_decisions_override, _get_skip_texts
 
 # Tesseract 路径自动检测（从 config.json 读取）
 import shutil
@@ -155,7 +156,8 @@ def _apply_black(arr, x1, y1, x2, y2) -> None:
 # ---------------------------------------------------------------------------
 
 def redact_image(input_path: str, output_path: str = None,
-                 method: str = "mosaic") -> dict:
+                 method: str = "mosaic",
+                 *, manifest_override: str = None) -> dict:
     """
     图片脱敏主函数。
 

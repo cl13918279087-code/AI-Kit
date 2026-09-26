@@ -14,6 +14,7 @@ redact_pdf.py - PDF 文档脱敏脚本
 """
 
 import sys
+import os
 import io
 import tempfile
 import shutil
@@ -21,7 +22,7 @@ import subprocess
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from common_rules import apply_redactions
+from common_rules import apply_redactions, set_agent_decisions_override, _get_skip_texts
 
 # Tesseract 路径自动检测（从 config.json 读取）
 import shutil
@@ -310,11 +311,17 @@ def _inc_count(counts: dict, key: str) -> None:
 # 入口
 # ---------------------------------------------------------------------------
 
-def redact_pdf(input_path: str, output_path: str = None) -> dict:
+def redact_pdf(input_path: str, output_path: str = None,
+             *, manifest_override: str = None) -> dict:
     """自动检测 PDF 类型并执行相应脱敏策略"""
     if output_path is None:
         stem = Path(input_path).stem
         output_path = str(Path(input_path).with_name(f"{stem}_脱敏.pdf"))
+    if manifest_override:
+        set_agent_decisions_override(manifest_override)
+        skip_texts = _get_skip_texts()
+        if skip_texts:
+            print(f"[决策] PDF 跳过 {len(skip_texts)} 个 Agent 标记实体的遮盖")
 
     pdf_type = detect_pdf_type(input_path)
     print(f"[信息] PDF 类型: {'文本型' if pdf_type == 'text' else '扫描版（图片型）'}")
