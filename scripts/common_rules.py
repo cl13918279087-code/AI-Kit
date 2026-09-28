@@ -522,6 +522,10 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
     rep = cfg.get("replacement", {})
     bank_names: List[str] = cfg.get("bank_names", [])
     org_suffixes: List[str] = cfg.get("org_suffixes", [])
+    # R-㉛（v1.3.9，响应 Issue #15-C12，赵辉）：日期脱敏口径
+    # full（默认）：全掩码 YYYY年MM月DD日
+    # year-only：仅脱年份，保留月日数字（如 2022年08月08日 → YYYY年08月08日）
+    date_mode = cfg.get("date_mode", "full")
 
     patterns: List[Tuple[re.Pattern, str]] = []
 
@@ -625,77 +629,153 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
     )
     day_pat = r'(?:月)?[^月\s]+(?=日)'
 
+    # R-㉛（v1.3.9，响应 Issue #15-C12，赵辉）：日期口径配置化
+    # full（默认）：全掩码 YYYY年MM月DD日
+    # year-only：仅脱年份，保留月日数字（如 2022年08月08日 → YYYY年08月08日）
+    # 正则分组：独立日期规则 grp1=年, grp2=月, grp3=日
+    #           日期范围规则 grp1=完整日期1, grp2=年1, grp3=月1, grp4=日1,
+    #                         grp5=分隔符, grp6=完整日期2, grp7=年2, grp8=月2, grp9=日2
+    _is_year_only = (date_mode == "year-only")
+
+    if _is_year_only:
+        # year-only 模式：仅替换年份，保留月日数字。
+        # 独立规则分组：grp1=年, grp2=月+月字, grp3=日+日字（lookahead 不消费字符）
+        # 日期范围分组：grp1=年, grp2=月+月字, grp3=日+日字, grp4=分隔符,
+        #               grp5=年, grp6=月+月字, grp7=日+日字
+        _date_chinese_full = "YYYY年MM月DD日"  # 仅供中文日期范围 full 端占位
+        _date_slash_full   = "YYYY/MM/DD"
+        _date_dash_full    = "YYYY-MM-DD"
+        _date_chinese_month = "YYYY年MM月"
+        _date_ar_month      = "YYYY/MM"
+        _date_chinese_short = "MM月DD日"
+        _date_short_slash   = "MM/DD"
+        # 中文独立日期 year-only lambda
+        # 独立中文日期 pattern 结构：(grp1=完整日期|grp2=完整日期)
+        # year-only：从 m.group(0) 的"年"字（含）起取月日部分
+        _date_chinese_repl = lambda m: (
+            "YYYY" + m.group(0)[m.group(0).find("年"):]
+        )
+        _date_slash_repl   = lambda m: "YYYY/" + m.group(1) + "/" + m.group(2)
+        _date_dash_repl    = lambda m: "YYYY-" + m.group(1) + "-" + m.group(2)
+        _date_ar_month_repl = lambda m: "YYYY/" + m.group(2)
+        # 中文日期范围：range pattern 分组 grp1=完整日期1, grp2=分隔符, grp3=完整日期2
+        # m.group(1)[m.group(1).find("年"):] → 从"年"字(含)起取月日
+        _range_chinese_repl = (
+            lambda m: ("YYYY" + m.group(1)[m.group(1).find("年"):]
+                       + m.group(2)
+                       + "YYYY" + m.group(3)[m.group(3).find("年"):])
+        )
+        # slash 范围分组：grp1=完整1, grp2=年1, grp3=月1, grp4=日1, grp5=分隔符, grp6=完整2, grp7=年2, grp8=月2, grp9=日2
+        _range_slash_repl = lambda m: ("YYYY/" + m.group(3) + "/" + m.group(4)
+                                        + m.group(5)
+                                        + "YYYY/" + m.group(8) + "/" + m.group(9))
+        _range_dash_repl  = lambda m: ("YYYY-" + m.group(3) + "-" + m.group(4)
+                                        + m.group(5)
+                                        + "YYYY-" + m.group(8) + "-" + m.group(9))
+    else:  # full
+        _date_chinese_full = rep.get("DATE_CHINESE", "YYYY年MM月DD日")
+        _date_slash_full   = rep.get("DATE", "YYYY/MM/DD")
+        _date_dash_full    = rep.get("DATE", "YYYY/MM/DD")
+        _date_chinese_month = rep.get("DATE_CHINESE_MONTH", "YYYY年MM月")
+        _date_ar_month      = rep.get("DATE", "YYYY/MM")
+        _date_chinese_short = rep.get("DATE_CHINESE_SHORT", "MM月DD日")
+        _date_short_slash   = rep.get("DATE_SHORT", "MM/DD")
+        _date_chinese_repl = _date_chinese_full
+        _date_slash_repl   = _date_slash_full
+        _date_dash_repl    = _date_dash_full
+        _date_ar_month_repl = _date_ar_month
+        _range_chinese_repl = _date_chinese_full + r"\2" + _date_chinese_full
+        _range_slash_repl = _date_slash_full + r"\5" + _date_slash_full
+        _range_dash_repl  = _date_dash_full  + r"\5" + _date_dash_full
+
     # 中文日期范围：2022年4月8日至2022年4月10日
+    # 分组：grp1=年+月+日, grp2=分隔符, grp3=年+月+日
     patterns.append((
         re.compile(
             rf'({year4_cn}年{month_pat}{day_pat}日)'
-            r'(至|至|——|——)'
+            r'([至——][——]?)'
             rf'({year4_cn}年{month_pat}{day_pat}日)'
         ),
-        rep.get("DATE_CHINESE", "YYYY年MM月DD日") + r'\2' + rep.get("DATE_CHINESE", "YYYY年MM月DD日")
+        _range_chinese_repl
     ))
     # 斜杠日期范围：2022/04/08 至 2022/04/10
-    # R2 修复（2026-09-06）：右端 $ 锚点导致正文中日期永不命中（漏脱敏），改为 (?![0-9])
+    # 分组：grp1=完整日期1, grp2=年1, grp3=月1, grp4=日1, grp5=分隔符,
+    #        grp6=完整日期2, grp7=年2, grp8=月2, grp9=日2
     patterns.append((
         re.compile(
-            rf'({year4_ar}/(?:0?[1-9]|1[0-2])/(?:0?[1-9]|[12]\d|3[01]))'
+            rf'(({year4_ar})/(0?[1-9]|1[0-2])/(0?[1-9]|[12]\d|3[01]))'
             r'(\s*(?:至|——|[-~])\s*)'
-            rf'({year4_ar}/(?:0?[1-9]|1[0-2])/(?:0?[1-9]|[12]\d|3[01]))(?![0-9])'
+            rf'(({year4_ar})/(0?[1-9]|1[0-2])/(0?[1-9]|[12]\d|3[01]))(?![0-9])'
         ),
-        rep.get("DATE", "YYYY/MM/DD") + r'\2' + rep.get("DATE", "YYYY/MM/DD")
+        _range_slash_repl
     ))
     # 横杠日期范围：2022-04-08 ~ 2022-04-10
     patterns.append((
         re.compile(
-            rf'({year4_ar}-(?:0?[1-9]|1[0-2])-(?:0?[1-9]|[12]\d|3[01]))'
+            rf'(({year4_ar})-(0?[1-9]|1[0-2])-(0?[1-9]|[12]\d|3[01]))'
             r'(\s*(?:至|——|[-~])\s*)'
-            rf'({year4_ar}-(?:0?[1-9]|1[0-2])-(?:0?[1-9]|[12]\d|3[01]))(?![0-9])'
+            rf'(({year4_ar})-(0?[1-9]|1[0-2])-(0?[1-9]|[12]\d|3[01]))(?![0-9])'
         ),
-        rep.get("DATE", "YYYY/MM/DD") + r'\2' + rep.get("DATE", "YYYY/MM/DD")
+        _range_dash_repl
     ))
 
     # ---------- 10. 日期（独立） ----------
     # 中文数字日期（但排除"应为2022年3月31日"等场景中的日期）
-    # 中文数字日期（但排除"应为2022年3月31日"等场景中的日期）
     # 前置排除用后处理替代，避免变长 lookbehind 语法问题
-    patterns.append((
-        re.compile(rf'{year4_cn}年{month_pat}{day_pat}日'),
-        rep.get("DATE_CHINESE", "YYYY年MM月DD日")
-    ))
+    # year-only 模式使用 year-aware 替换，保留月日
+    # 注意：year4_cn/month_pat/day_pat 是非捕获组变量；此处显式构建含捕获组的正则
+    # 分组：grp1=年, grp2=月+月字, grp3=日+日字
+    # year-only 模式：独立中文日期
+    # 独立中文日期：两分支 pattern 用 | 并列，都以捕获组 () 包裹完整日期
+    # full 模式用 _date_chinese_full（含 \1 引用），year-only 用 lambda
+    # 分支1：阿拉伯数字年/月/日；分支2：汉字数字年/月/日
+    # 注意：阿拉伯分支月不含(?=月) lookahead（"4月"直接匹配），汉字分支含 lookahead（"三"后需"月"）
+    # 独立中文日期：两分支 pattern，都以捕获组 () 包裹完整日期供 full 模式 \1 引用
+    # full 模式用 _date_chinese_full（含 \1），year-only 用 lambda m.group(0)
+    # 分支1：阿拉伯数字年/月/日；分支2：汉字数字年/月/日（需 lookahead 判断月字）
+    _date_cn_pat = (
+        rf'([〇二三四五六七八九0-9]{{4}}年(?:0?[1-9]|1[0-2])月[0-9]+日'
+        r'|[〇二三四五六七八九0-9]{4}年'
+        rf'(?:0?[1-9]|1[0-2]|'
+        r'(?=[一二三四五六七八九十]月)[一二三四五六七八九十]|'
+        r'十一(?=月)|十二(?=月)|正(?=月))月'
+        r'(?:[0-9]+?(?=日)|[一二三四五六七八九十]+(?=日)日))'
+    )
+    patterns.append((re.compile(_date_cn_pat), _date_chinese_repl))
     # YYYY/MM/DD
     # R2 修复：$ → (?![0-9])，正文中的日期（如"2020/5/1实施"）此前永不命中
     patterns.append((
-        re.compile(rf'{year4_ar}/(?:0?[1-9]|1[0-2])/(?:0?[1-9]|[12]\d|3[01])(?![0-9])'),
-        rep.get("DATE", "YYYY/MM/DD")
+        re.compile(rf'{year4_ar}/(0?[1-9]|1[0-2])/(0?[1-9]|[12]\d|3[01])(?![0-9])'),
+        _date_slash_repl if _is_year_only else _date_slash_full
     ))
     # YYYY-MM-DD
     patterns.append((
-        re.compile(rf'{year4_ar}-(?:0?[1-9]|1[0-2])-(?:0?[1-9]|[12]\d|3[01])(?![0-9])'),
-        rep.get("DATE", "YYYY/MM/DD")
+        re.compile(rf'{year4_ar}-(0?[1-9]|1[0-2])-(0?[1-9]|[12]\d|3[01])(?![0-9])'),
+        _date_dash_repl if _is_year_only else _date_dash_full
     ))
     # 中文年月（独立）
     # R2 修复：显式吞掉"月"字，避免阿拉伯年月规则先吃掉"2020年5"残留"月"字
     # 占位符用独立的年月键，避免取到含 DD日 的完整日期占位
     patterns.append((
         re.compile(rf'{year4_cn}年{month_pat}月(?![0-9日])'),
-        rep.get("DATE_CHINESE_MONTH", "YYYY年MM月")
+        _date_chinese_month
     ))
     # 阿拉伯数字年月（后跟"月"的场景由上一条处理）
     patterns.append((
-        re.compile(rf'{year4_ar}年(?:0?[1-9]|1[0-2])(?!月|[0-9日])'),
-        rep.get("DATE", "YYYY/MM")
+        re.compile(rf'{year4_ar}年(0?[1-9]|1[0-2])(?!月|[0-9日])'),
+        _date_ar_month_repl if _is_year_only else _date_ar_month
     ))
     # R2 新增：无年份中文短日期"X月X日"（如"5月20日发布"）
     # 左边界阻止年份残留（YYYY年X月X日 已由上方完整规则先替换）与数字
     patterns.append((
         re.compile(r'(?<![0-9年])(?:0?[1-9]|1[0-2])月(?:[0-3]?[0-9])日(?![0-9])'),
-        rep.get("DATE_CHINESE_SHORT", "MM月DD日")
+        _date_chinese_short
     ))
     # R2 新增：无年份斜杠短日期"M/D"（如"截止9/1上报"）
     # 边界阻止长数字串/小数/日期已替换场景
     patterns.append((
         re.compile(r'(?<![0-9/.])(?:0?[1-9]|1[0-2])/(?:0?[1-9]|[12][0-9]|3[01])(?![0-9/])'),
-        rep.get("DATE_SHORT", "MM/DD")
+        _date_short_slash
     ))
 
     # ---------- 11. 银行名称（从配置动态加载，完全动态化） ----------
@@ -726,10 +806,97 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
         # ---------- 11c. 银行名称兜底（R3，2026-09-06） ----------
         # 白名单外的银行名（如"宁夏银行"）此前不被命中，反被姓名规则截胡为"宁XXX行"。
         # 通用模式：2-6个汉字 + 银行。占位符"XX银行"的前缀为非汉字字符，不会二次命中。
+        # R-㉓（v1.3.9，响应 Issue #15-C4，赵辉）：增加五层误伤防护
+        #   1. 泛称表 BANK_GENERIC_KEEP（如"人民银行""开户银行"等30+不脱）
+        #   2. 集合表述 BANK_COLLECTIVE_RE（"全省农商银行"等不脱）
+        #   3. 业务系统/业态词 BANK_BIZ_SYSTEM_RE（"微信银行""远程视频银行"等不脱）
+        #   4. "的银行"口号守卫（"一农民致富的银行"不脱）
+        #   5. 占位符自保护 X{1,10}银行（防字母规则二次击中）
+        _BANK_GENERIC_KEEP = {
+            "人民银行", "商业银行", "开户银行", "各农商银行", "各农村商业银行",
+            "各信用社", "各农村合作银行", "各合作银行", "村镇银行", "各村镇银行",
+            "农商银行", "农村商业银行", "农信社", "农村信用合作社", "农村合作银行",
+            "各政策性银行", "政策性银行", "国有大型银行", "国有商业银行",
+            "股份制银行", "股份制商业银行", "城市商业银行", "城市合作银行",
+            "外资银行", "合资银行", "民营银行", "直销银行", "互联网银行",
+            "虚拟银行", "手机银行", "网上银行", "电话银行", "视频银行",
+            "远程银行", "数字银行", "智慧银行", "云银行", "开放银行",
+        }
+        _BANK_COLLECTIVE_RE = re.compile(
+            r"(全省|全辖|辖内|各级|各)(农商|农村商业|农信|农合)(银行|行)"
+        )
+        _BANK_BIZ_SYSTEM_RE = re.compile(
+            r"(微信|视频|远程|电话|手机|网上|直销|数字|智慧|云)(?=银行)"
+        )
+        _BANK_DEPT_SUFFIX_RE = re.compile(
+            r"[\u4e00-\u9fa5]{2,6}银行[部处科局]"
+        )
+
+        def _bank_generic_guard(text: str) -> bool:
+            """判断文本是否命中银行名防护层，是则不脱"""
+            if text in _BANK_GENERIC_KEEP:
+                return True
+            if _BANK_COLLECTIVE_RE.search(text):
+                return True
+            if _BANK_BIZ_SYSTEM_RE.search(text):
+                return True
+            if _BANK_DEPT_SUFFIX_RE.fullmatch(text):
+                return True
+            # "的银行"口号守卫（前面是助词/逗号/句号等，上游实证农芯末页"一农民致富的银行"）
+            if text.endswith("的银行"):
+                return True
+            # 占位符自保护：X{1,10}银行（防字母银行名规则二次击中）
+            if re.fullmatch(r"X{1,10}银行", text):
+                return True
+            return False
+
         patterns.append((
             re.compile(r'[\u4e00-\u9fa5]{2,6}银行'),
-            rep.get("BANK", "XX银行")
+            lambda m: m.group(0) if _bank_generic_guard(m.group(0))
+                      else rep.get("BANK", "XX银行")
         ))
+
+        # R-㉔（v1.3.9，响应 Issue #15-C5，赵辉）：银行代码缩写表 + 字母+汉字混合形态
+        # \b 边界让 QRCB_ 漏脱，改用 (?<![A-Za-z0-9])…(?![A-Za-z0-9])
+        _BANK_CODES = cfg.get("bank_codes", [])
+        if _BANK_CODES:
+            _BANK_CODE_RE = re.compile(
+                r"(?<![A-Za-z0-9])({})(?![A-Za-z0-9])".format(
+                    "|".join(re.escape(c) for c in _BANK_CODES)
+                )
+            )
+            patterns.append((_BANK_CODE_RE, lambda m: "XX银行"))
+
+        # 字母+汉字混合形态：LZ银行 / ABC银行（独立于 bank_code_re 的通用形态）
+        patterns.append((
+            re.compile(r"[A-Za-z]{2,6}银行"),
+            lambda m: rep.get("BANK", "XX银行")
+        ))
+
+        # R-㉕（v1.3.9，响应 Issue #15-C6，赵辉）：拉丁银行全称
+        _LATIN_BANK_NAMES = [
+            "Bank of China", "BOC",
+            "China Construction Bank", "CCB", "Construction Bank of China",
+            "Industrial and Commercial Bank of China", "ICBC", "Industrial and Commercial Bank",
+            "Agricultural Bank of China", "ABC", "Agricultural Bank",
+            "Bank of Communications", "BCM", "Bank of Communications Co.",
+            "China Merchants Bank", "CMB",
+            "China Minsheng Banking Corp", "CMBC", "Minsheng Bank",
+            "Industrial Bank Co.", "CIB", "Industrial Bank Co., Ltd.",
+            "China Everbright Bank", "CEB", "Everbright Bank",
+            "Hua Xia Bank", "HX Bank",
+            "Ping An Bank", "PAB", "Ping An Bank Co.",
+            "Shanghai Pudong Development Bank", "SPD Bank", "SPD",
+            "China CITIC Bank", "CITIC Bank",
+            "Bank of Shanghai", "BOS",
+        ]
+        _LATIN_BANK_RE = re.compile(
+            r"(?<![A-Za-z])({})(?![A-Za-z])".format(
+                "|".join(re.escape(n) for n in _LATIN_BANK_NAMES)
+            ),
+            re.IGNORECASE
+        )
+        patterns.append((_LATIN_BANK_RE, lambda m: "[Bank]"))
 
         # ---------- 11b. 分支行名称（动态从 bank_names 提取） ----------
         # 提取城市/地区前缀 + 支行/营业部/分行等后缀
@@ -790,6 +957,25 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
                 ),
                 lambda m: "XX" + m.group(0)
             ))
+
+        # R-㉖（v1.3.9，响应 Issue #15-C7，赵辉）：项目代号脱敏（从 config.json project_codes 读取）
+        # 形态1：显式词表（秦领/农芯）→ XX；形态2：数字紧邻"工程/项目"（811工程→XX工程）
+        # 严禁裸数字匹配——\b811\b 会击中日期碎片 11/18 和书签 _Toc28111
+        _PROJECT_CODES = cfg.get("project_codes", [])
+        if _PROJECT_CODES:
+            _PROJECT_CODE_RE = re.compile(
+                r"(?<![A-Za-z0-9])({})(?![A-Za-z0-9])".format(
+                    "|".join(re.escape(c) for c in _PROJECT_CODES)
+                )
+            )
+            patterns.append((_PROJECT_CODE_RE, lambda m: "XX"))
+
+        # 数字型项目代号：仅限数字紧邻"工程/项目"，且数字≥3位
+        # \d{3,} 只匹配数字部分（工程在 lookahead 不消耗），替换时保留工程/项目原文
+        patterns.append((
+            re.compile(r"(\d{3,})(?=工程|项目)"),
+            lambda m: "XX"
+        ))
 
         # ---------- 11d. 地址/城市名（如海峡、郑州 → XX） ----------
         # 覆盖三类模式：
@@ -1129,6 +1315,24 @@ def redistribute_paragraph(texts: list, redacted: str) -> list:
 _ROLE_KEYWORDS = (
     "组长", "成员", "经理", "负责人", "联系人", "审批人", "复核人",
     "参与人", "参加人", "主办人", "主持人", "讲师", "签字人", "接口人",
+    "组员", "队员", "组：", "队：",
+)
+
+# R-㉙（v1.3.9，响应 Issue #15-C10，赵辉）：角色槽位姓名三件套
+# 1. 精确排除表：含这些词整段跳过，不误伤"成员：需求、开发、测试人员"
+_ROLE_EXCLUDED_PHRASES = {"需求", "开发", "测试", "技术", "业务", "项目", "产品",
+                           "运营", "市场", "设计", "运维", "安全", "数据", "算法"}
+# 2. 角色前缀扩展 + 姓名捕获（token 完整性断言）
+# 形态："核心业务组：蔡元龙"、"测试组：张三"、无冒号"负责人李四"
+_ROLE_NAME_RE = re.compile(
+    r"(?:(?:"
+    + "|".join(re.escape(k) for k in _ROLE_KEYWORDS)
+    + r")[:：\s]*)([\u4e00-\u9fa5]{2,4})(?![\\u4e00-\u9fa5\d])"
+)
+# 3. 调整记录句式（无角色前缀）："将刘利坤、杨磊加入安全测试组"
+# 动词放在捕获组内，保证 m.group(1) 总是全匹配
+_ADJUST_RECORDS_RE = re.compile(
+    r"将([\u4e00-\u9fa5]{2,4}(?:[、，][\u4e00-\u9fa5]{2,4})*(?:加入|调入|调整至|调整到))"
 )
 _ENGLISH_NAME_RE = re.compile(r"(?<![A-Za-z])[A-Z][a-z]{2,}(?![A-Za-z])")
 
@@ -1147,6 +1351,56 @@ def _apply_english_name_pass(text: str, counts: Dict[str, int]) -> str:
                 return "XXX"
             line = _ENGLISH_NAME_RE.sub(_repl, line)
         out_lines.append(line)
+    return "\n".join(out_lines)
+
+
+def _apply_role_context_pass(text: str, counts: Dict[str, int]) -> str:
+    """
+    R-㉙（v1.3.9，响应 Issue #15-C10，赵辉）：角色槽位姓名三件套。
+
+    1. 精确排除表：段落含排除短语（需求/开发/测试等）→ 整段跳过，不误伤
+       "成员：需求、开发、测试人员"（无冒号，仅在角色词前缀形态下触发）
+    2. 角色前缀+中文姓名捕获（token 完整性断言防"天阳宏业7人"误伤）：
+       "核心业务组：蔡元龙" → "核心业务组：XXX"
+    3. 调整记录句式（无角色前缀也可脱）：
+       "将刘利坤、杨磊加入安全测试组" → "将XXX、XXX加入安全测试组"
+    """
+    if not text or not isinstance(text, str):
+        return text
+    out_lines = []
+    for line in text.split("\n"):
+        # 跳过含排除短语的行（如"需求、开发、测试人员"等非姓名语义）
+        # 排除短语用词边界保护（防"核心业务组"被"项目"误命中）
+        if _ROLE_EXCLUDED_PHRASES and any(
+            re.search(rf"(?<!\w){re.escape(p)}(?!\w)", line) for p in _ROLE_EXCLUDED_PHRASES
+        ):
+            out_lines.append(line)
+            continue
+        # 三件套之一：角色前缀+姓名（token 完整性断言已在正则中）
+        def _role_repl(m: re.Match) -> str:
+            # 只替换捕获的姓名组 group(1)，保留角色前缀
+            counts["姓名"] = counts.get("姓名", 0) + 1
+            return m.group(0)[:0 - len(m.group(1))] + "XXX"
+        new_line = _ROLE_NAME_RE.sub(_role_repl, line)
+        # 三件套之二：调整记录句式（无角色前缀也可脱）
+        # 形态："将刘利坤、杨磊加入安全测试组" → "将XXX、XXX加入安全测试组"
+        # 策略：匹配"将...动词"，在替换函数中只替换姓名，保留动词
+        def _adjust_repl(m: re.Match) -> str:
+            counts["姓名"] = counts.get("姓名", 0) + 1
+            matched_text = m.group(0)  # e.g. "将刘利坤、杨磊加入安全测试组"
+            for verb in ("加入", "调入", "调整至", "调整到"):
+                vi = matched_text.find(verb)
+                if vi >= 0:
+                    # 提取"将"之后、动词之前的姓名段（去掉开头的"将"）
+                    names_sub = matched_text[2:vi]  # "刘利坤、杨磊"
+                    n_names = names_sub.count("、") + 1
+                    names_replaced = "、".join(["XXX"] * n_names)
+                    # 重建：保留"将"+替换后姓名段+动词+后缀
+                    return "将" + names_replaced + verb + matched_text[vi + len(verb):]
+            return matched_text
+        new_line = _ADJUST_RECORDS_RE.sub(_adjust_repl, new_line)
+        new_line = _ADJUST_RECORDS_RE.sub(_adjust_repl, new_line)
+        out_lines.append(new_line)
     return "\n".join(out_lines)
 
 
@@ -1300,6 +1554,10 @@ def apply_redactions_counted(text: str) -> Tuple[str, Dict[str, int]]:
     # 仅当段落（按行）含角色词时，遮蔽段内首字母大写英文词（Lisa/David…）。
     # 不做无差别英文遮蔽——UAT/POS/PO/OA 等业务术语不受影响。
     result = _apply_english_name_pass(result, counts)
+
+    # R-㉙（v1.3.9，响应 Issue #15-C10，赵辉）：角色槽位姓名三件套
+    # 仅当段落含角色关键词（且不含排除短语）时，遮蔽段内中文姓名
+    result = _apply_role_context_pass(result, counts)
 
     return result, counts
 

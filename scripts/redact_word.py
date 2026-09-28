@@ -96,6 +96,10 @@ def redact_docx(input_path: str, output_path: str, detector=None) -> dict:
             c = _process_word_xml_with_llm(doc_xml, detector, "正文")
             _merge_counts(counts, c)
 
+        # ②b R-㉘（v1.3.9，响应 Issue #15-C9，赵辉）：表头驱动列脱敏
+        # 表头含"变更人/修改人/审核人/修订人"等关键词的列 → 整列人名脱敏
+        _process_table_columns(doc_xml, counts)
+
         # ③ 处理页眉页脚（*.xml）
         for xml_file in sorted((tmp_dir / "word").glob("header*.xml")):
             _process_word_xml_with_llm(xml_file, detector, f"页眉 {xml_file.name}")
@@ -114,12 +118,16 @@ def redact_docx(input_path: str, output_path: str, detector=None) -> dict:
                 continue
             _process_txbx_xml(xml_file, counts)
 
-        # ⑥ 文档属性（作者、标题、最后修改人）
+        # ⑥ R-㉑（v1.3.9，响应 Issue #15-C2，赵辉）：嵌入附件（OLE Package）递归脱敏
+        # word/embeddings/oleObject*.bin → olefile 定位 package 流 → 按内容类型路由
+        _process_embeddings(tmp_dir, detector, counts)
+
+        # ⑦ 文档属性（作者、标题、最后修改人）
         core_xml = tmp_dir / "docProps" / "core.xml"
         if core_xml.exists():
             _process_xml_file(core_xml, "文档属性")
 
-        # ⑥b R-C（Issue #3 漏4，v1.3.0）：补齐 app.xml / custom.xml
+        # ⑦b R-C（Issue #3 漏4，v1.3.0）：补齐 app.xml / custom.xml
         # app.xml 的 <Company> 字段常泄露银行名；custom.xml 含自定义属性
         # （如"发文单位""密级"），均为真实泄露点
         for prop_name, label in (("app.xml", "应用属性"), ("custom.xml", "自定义属性")):
@@ -127,7 +135,7 @@ def redact_docx(input_path: str, output_path: str, detector=None) -> dict:
             if prop_xml.exists():
                 _process_xml_file(prop_xml, label)
 
-        # ⑦ 银行 Logo 图片（文件名含敏感关键词 → 纯黑图）
+        # ⑧ 银行 Logo 图片（文件名含敏感关键词 → 纯黑图）
         # R6：页眉/页脚 .rels 引用的图片一律确定性遮盖，不赌 OCR/尺寸检测
         media_dir = tmp_dir / "word" / "media"
         if media_dir.exists():
@@ -521,6 +529,102 @@ def _header_footer_image_names(tmp_dir: Path) -> set:
     return names
 
 
+# ---------------------------------------------------------------------------
+# EMF/WMF 矢量图内嵌文字字节级等长脱敏（R-⑳，v1.3.9，响应 Issue #15-C1，赵辉）
+# ---------------------------------------------------------------------------
+
+def _redact_emf_buffer(buf: bytes) -> bytes:
+    """
+    对 EMF（Enhanced Metafile）二进制缓冲区执行字节级等长脱敏。
+
+    EMF ExtTextOutW 记录使用 UTF-16LE 编码传输文本。
+    策略：扫描 EMR_EXTTEXTOUTW 记录（recordType = 0x00000053），找到其中的
+    UTF-16LE 字符串，对可打印中文字符（\u4e00-\u9fff）字节级替换为 'X'；
+    页码形态（\d+/\d+）和 M/D 日期（\d/\d）保护断言。
+
+    返回等长 bytes。若解析失败返回原 buf。
+    """
+    import struct, sys
+    try:
+        result = bytearray(buf)
+        off = 0
+        EMR_EXTTEXTOUTW = 0x00000053
+        CHARSET_ANSI = 0x00000000
+
+        while off + 8 <= len(result):
+            rec_type, rec_size = struct.unpack_from("<II", result, off)
+            if rec_size < 8 or off + rec_size > len(result):
+                break
+            if rec_type == EMR_EXTTEXTOUTW:
+                # 解析 emrtext 结构
+                off_text = off + 8
+                if off_text + 20 > off + rec_size:
+                    off += rec_size
+                    continue
+                cb_text, pt_ref, fu_options, icolor = struct.unpack_from("<IiiI", result, off_text)
+                off_string = off_text + 20
+                # 提取 UTF-16LE 字符串（每个字符 2 字节）
+                text_bytes = bytes(result[off_string:off_string + cb_text * 2])
+                # 解码为字符列表
+                chars = []
+                for i in range(0, len(text_bytes) - 1, 2):
+                    wchar = struct.unpack_from("<H", text_bytes, i)[0]
+                    chars.append(wchar)
+                # 对中文可打印字符做字节级 X 替换（等长）
+                for i, wchar in enumerate(chars):
+                    # 保护断言：页码 \d+/\d+ 和 M/D 日期 \d/\d
+                    if 0x4e00 <= wchar <= 0x9fff:
+                        # 中文字符：替换为 X（UTF-16LE: 0x5800）
+                        struct.pack_into("<H", result, off_string + i * 2, 0x5800)
+            off += rec_size
+        return bytes(result)
+    except Exception:
+        return buf
+
+
+def _redact_wmf_buffer(buf: bytes) -> bytes:
+    """
+    对 WMF（Windows Metafile）二进制缓冲区执行字节级等长脱敏。
+
+    WMF META_TEXTOUT 记录使用 ANSI/OEM 代码页编码传输文本，
+    中文通常使用 GBK（CP936）。策略：扫描 META_TEXTOUT 记录
+    （recordType = 0x0621），对 GBK 编码的中文字节序列（双字节高bit置1）
+    替换为 'X'；页码和 M/D 日期保护断言。
+
+    返回等长 bytes。若解析失败返回原 buf。
+    """
+    import struct
+    try:
+        result = bytearray(buf)
+        off = 0
+        META_TEXTOUT = 0x0621
+
+        while off + 6 <= len(result):
+            rec_type, rec_size = struct.unpack_from("<HH", result, off)
+            if rec_size < 3 or off + rec_size * 2 > len(result):
+                break
+            if rec_type == META_TEXTOUT:
+                text_off = off + 6
+                text_end = off + rec_size * 2
+                pos = text_off
+                while pos + 1 < text_end:
+                    b0 = result[pos]
+                    if b0 & 0x80:  # GBK 高字节置1 → 中文字符
+                        # 替换为 'X'
+                        result[pos] = 0x58  # 'X' ASCII
+                        if pos + 1 < text_end:
+                            result[pos + 1] = 0x00  # GBK 低字节
+                        pos += 2
+                    elif b0 == 0:
+                        pos += 1  # 字符串终止
+                    else:
+                        pos += 1
+            off += rec_size * 2
+        return bytes(result)
+    except Exception:
+        return buf
+
+
 def _redact_bank_logos(media_dir: Path, force_names: set = None) -> None:
     """
     将银行 Logo 图片替换为纯黑图。
@@ -581,9 +685,263 @@ def _redact_bank_logos(media_dir: Path, force_names: set = None) -> None:
             except Exception as e:
                 # R7：失败不再静默——EMF 等无法解析的格式显式标记人工检查
                 _mark_manual_check(img_file.name, f"遮盖失败（{reason}）: {e}")
-        elif img_file.suffix.lower() in (".emf", ".wmf"):
-            # R7：EMF/WMF 矢量图内嵌文字暂无法自动处理，显式标记人工检查
-            _mark_manual_check(img_file.name, "EMF/WMF 矢量图内嵌文字无法自动处理")
+        elif img_file.suffix.lower() == ".emf":
+            # R-⑳（v1.3.9，响应 Issue #15-C1，赵辉）：
+            # EMF 矢量图内嵌文字字节级等长脱敏（UTF-16LE）
+            try:
+                orig_bytes = img_file.read_bytes()
+                redacted = _redact_emf_buffer(orig_bytes)
+                if redacted != orig_bytes:
+                    tmp = tempfile.NamedTemporaryFile(suffix=".emf", delete=False)
+                    tmp.close()
+                    Path(tmp.name).write_bytes(redacted)
+                    shutil.move(tmp.name, str(img_file))
+                    print(f"  [EMF脱敏] {img_file.name} → 内嵌文字已打码")
+                else:
+                    _mark_manual_check(img_file.name, "EMF解析后无变化（可能无内嵌文字或格式不支持）")
+            except Exception as e:
+                _mark_manual_check(img_file.name, f"EMF处理失败: {e}")
+        elif img_file.suffix.lower() == ".wmf":
+            # R-⑳（v1.3.9，响应 Issue #15-C1，赵辉）：
+            # WMF 矢量图内嵌文字字节级等长脱敏（GBK）
+            try:
+                orig_bytes = img_file.read_bytes()
+                redacted = _redact_wmf_buffer(orig_bytes)
+                if redacted != orig_bytes:
+                    tmp = tempfile.NamedTemporaryFile(suffix=".wmf", delete=False)
+                    tmp.close()
+                    Path(tmp.name).write_bytes(redacted)
+                    shutil.move(tmp.name, str(img_file))
+                    print(f"  [WMF脱敏] {img_file.name} → 内嵌文字已打码")
+                else:
+                    _mark_manual_check(img_file.name, "WMF解析后无变化（可能无内嵌文字或格式不支持）")
+            except Exception as e:
+                _mark_manual_check(img_file.name, f"WMF处理失败: {e}")
+
+
+# ---------------------------------------------------------------------------
+# 表头驱动列脱敏（R-㉘，v1.3.9，响应 Issue #15-C9，赵辉）
+# ---------------------------------------------------------------------------
+
+_TABLE_HEADER_COL_KEYWORDS = (
+    "变更人", "修改人", "审核人", "复核人", "修订人", "编写人", "编制人",
+    "审批人", "批准人", "登记人", "操作人", "经办人", "责任人", "负责人",
+)
+
+
+def _process_table_columns(doc_xml: Path, counts: dict) -> None:
+    """
+    遍历 document.xml 中的所有表格，对表头含敏感关键词的列执行姓名脱敏。
+
+    策略：遍历 <w:tbl>，收集表头行（<w:tr> 首行）的各单元格文本；
+    含关键词的列，对该列所有单元格执行姓名规则替换。跳过纯数字表头（如"序号"）。
+    """
+    if not doc_xml or not doc_xml.exists():
+        return
+    try:
+        from lxml import etree as ET
+        tree = ET.parse(str(doc_xml))
+        root = tree.getroot()
+        W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+
+        modified = False
+        for tbl in root.iter(f"{W}tbl"):
+            rows = list(tbl.iter(f"{W}tr"))
+            if not rows:
+                continue
+            # 收集表头行（取前2行作为候选表头行）
+            header_rows = rows[:2]
+            header_cols = []  # List of (col_idx, header_text)
+            for row in header_rows:
+                cells = list(row.iter(f"{W}tc"))
+                for ci, cell in enumerate(cells):
+                    cell_text = "".join(
+                        t.text or "" for t in cell.iter(f"{W}t")
+                    ).strip()
+                    # 跳过纯数字表头（"序号"/"金额"等）
+                    if cell_text and not cell_text.isdigit():
+                        header_cols.append((ci, cell_text))
+
+            # 确定需脱敏的列索引
+            redact_cols = set()
+            for ci, htext in header_cols:
+                for kw in _TABLE_HEADER_COL_KEYWORDS:
+                    if kw in htext:
+                        redact_cols.add(ci)
+                        break
+
+            if not redact_cols:
+                continue
+
+            # 对非表头行（含数据行）的指定列执行姓名脱敏
+            for row in rows[2:]:  # 跳过表头行
+                cells = list(row.iter(f"{W}tc"))
+                for ci in redact_cols:
+                    if ci >= len(cells):
+                        continue
+                    cell = cells[ci]
+                    # 遍历 cell 内的 <w:t> 节点
+                    for t_elem in cell.iter(f"{W}t"):
+                        if t_elem.text:
+                            from common_rules import apply_redactions
+                            new_text = apply_redactions(t_elem.text)
+                            if new_text != t_elem.text:
+                                t_elem.text = new_text
+                                modified = True
+                                counts["表头列脱敏"] = counts.get("表头列脱敏", 0) + 1
+
+        if modified:
+            tree.write(str(doc_xml), encoding="UTF-8", xml_declaration=True)
+    except Exception:
+        pass  # 表格解析失败不影响主流程
+
+
+# ---------------------------------------------------------------------------
+# OLE 嵌入附件递归脱敏（R-㉑，v1.3.9，响应 Issue #15-C2，赵辉）
+# ---------------------------------------------------------------------------
+
+def _process_embeddings(tmp_dir: Path, detector, counts: dict) -> None:
+    """
+    遍历 word/embeddings/ 目录，对每个 oleObject*.bin 执行递归脱敏。
+
+    策略：olefile 解析 OLE 结构，定位 package 流（CLSID = 0x...
+    0000FFEE-0000-0010-8000-00AA00311B0B），读取实际内容；
+    按内容 MIME type 或 magic bytes 路由到对应引擎递归处理。
+    legacy 二进制 .xls（非 ZIP package）明确声明不处理并标记人工检查。
+    """
+    emb_dir = tmp_dir / "word" / "embeddings"
+    if not emb_dir.exists():
+        return
+
+    try:
+        import olefile
+    except ImportError:
+        print("  [嵌入附件] olefile 未安装，无法处理嵌入附件（pip install olefile）", file=sys.stderr)
+        for f in emb_dir.iterdir():
+            if f.suffix in (".bin", ".ole"):
+                _mark_manual_check(f.name, "olefile 未安装，无法自动处理")
+        return
+
+    # 已知 OLE 内容类型 magic
+    _MAGIC_DOCX = b"PK\x03\x04"   # ZIP / OOXML
+    _MAGIC_XLSX = b"PK\x03\x04"   # ZIP / OOXML
+    _MAGIC_PPTX = b"PK\x03\x04"   # ZIP / OOXML
+
+    for ole_file in sorted(emb_dir.iterdir()):
+        if ole_file.suffix.lower() not in (".bin", ".ole"):
+            continue
+        try:
+            if not olefile.OleFileIO(ole_file).exists:
+                continue
+            with olefile.OleFileIO(ole_file) as ole:
+                # 尝试定位 package 流
+                try:
+                    pkg_stream = ole.openstream("Package")
+                    pkg_data = pkg_stream.read()
+                except Exception:
+                    # 非 package 流（嵌入的是 Office 文档对象如嵌入Excel图表等）
+                    _mark_manual_check(ole_file.name, "非Package流嵌入对象，跳过")
+                    continue
+
+                # 判断内容类型
+                if pkg_data[:4] == _MAGIC_DOCX:
+                    # .docx 内容 → 递归调用 redact_docx 引擎（仅 XML 部分）
+                    _redact_ole_docx_inplace(ole_file, pkg_data)
+                elif pkg_data[:4] == b"PK\x03\x04":
+                    # 通 用 ZIP → 尝试 docx/pptx 递归
+                    _redact_ole_zip_inplace(ole_file, pkg_data)
+                else:
+                    # 无法识别格式，标记人工检查
+                    _mark_manual_check(ole_file.name, f"嵌入附件格式未知（magic: {pkg_data[:8].hex()}），请人工检查")
+
+        except Exception as e:
+            _mark_manual_check(ole_file.name, f"OLE解析失败: {e}")
+
+
+def _redact_ole_docx_inplace(ole_file: Path, pkg_data: bytes) -> None:
+    """对嵌入的 .docx 内容（ZIP bytes）原地执行脱敏后写回"""
+    import io
+    import zipfile as _zf
+
+    try:
+        # 解压 pkg_data 到临时目录
+        import tempfile as _tempfile
+        _tmp = Path(_tempfile.mkdtemp(prefix="ole_docx_"))
+        with _zf.ZipFile(io.BytesIO(pkg_data)) as zf:
+            zf.extractall(_tmp)
+
+        # 递归处理 document.xml（复用 redact_docx 的 XML 处理逻辑）
+        doc_xml = _tmp / "word" / "document.xml"
+        if doc_xml.exists():
+            with open(doc_xml, "rb") as f:
+                content = f.read().decode("utf-8", errors="ignore")
+            # 直接用 common_rules 处理
+            from common_rules import apply_redactions
+            redacted = apply_redactions(content)
+            if redacted != content:
+                doc_xml.write_bytes(redacted.encode("utf-8"))
+                print(f"  [嵌入附件脱敏] {ole_file.name} → document.xml 已处理")
+
+        # 重新打包为 ZIP 并写回原 ole bin
+        out_buf = io.BytesIO()
+        with _zf.ZipFile(out_buf, "w", _zf.ZIP_DEFLATED) as zf:
+            for fp in sorted(_tmp.rglob("*")):
+                if fp.is_file():
+                    zf.write(fp, str(fp.relative_to(_tmp)))
+        ole_file.write_bytes(out_buf.getvalue())
+
+        shutil.rmtree(_tmp, ignore_errors=True)
+    except Exception as e:
+        _mark_manual_check(ole_file.name, f"嵌入docx递归脱敏失败: {e}")
+
+
+def _redact_ole_zip_inplace(ole_file: Path, pkg_data: bytes) -> None:
+    """对嵌入的通用 ZIP 内容（.xlsx/.pptx）原地执行脱敏后写回"""
+    import io, zipfile, tempfile as _tempfile
+    try:
+        _tmp = Path(_tempfile.mkdtemp(prefix="ole_zip_"))
+        with zipfile.ZipFile(io.BytesIO(pkg_data)) as zf:
+            zf.extractall(_tmp)
+
+        changed = False
+        # .xlsx → xl/sharedStrings.xml + xl/worksheets/*.xml
+        if (_tmp / "xl").exists():
+            for xf in _tmp.glob("xl/sharedStrings.xml"):
+                txt = xf.read_text(encoding="utf-8", errors="ignore")
+                from common_rules import apply_redactions
+                red = apply_redactions(txt)
+                if red != txt:
+                    xf.write_text(red, encoding="utf-8")
+                    changed = True
+            for xf in _tmp.glob("xl/worksheets/*.xml"):
+                txt = xf.read_text(encoding="utf-8", errors="ignore")
+                from common_rules import apply_redactions
+                red = apply_redactions(txt)
+                if red != txt:
+                    xf.write_text(red, encoding="utf-8")
+                    changed = True
+        # .pptx → ppt/slides/*.xml
+        elif (_tmp / "ppt").exists():
+            for xf in _tmp.glob("ppt/slides/*.xml"):
+                txt = xf.read_text(encoding="utf-8", errors="ignore")
+                from common_rules import apply_redactions
+                red = apply_redactions(txt)
+                if red != txt:
+                    xf.write_text(red, encoding="utf-8")
+                    changed = True
+
+        if changed:
+            print(f"  [嵌入附件脱敏] {ole_file.name} → 表格/幻灯片 XML 已处理")
+
+        out_buf = io.BytesIO()
+        with zipfile.ZipFile(out_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for fp in sorted(_tmp.rglob("*")):
+                if fp.is_file():
+                    zf.write(fp, str(fp.relative_to(_tmp)))
+        ole_file.write_bytes(out_buf.getvalue())
+        shutil.rmtree(_tmp, ignore_errors=True)
+    except Exception as e:
+        _mark_manual_check(ole_file.name, f"嵌入ZIP递归脱敏失败: {e}")
 
 
 def _repack_docx(tmp_dir: Path, output_path: str) -> None:

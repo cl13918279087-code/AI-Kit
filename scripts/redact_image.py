@@ -151,6 +151,39 @@ def _apply_black(arr, x1, y1, x2, y2) -> None:
     arr[y1:y2, x1:x2] = 0
 
 
+def _apply_solid_fill(arr, x1, y1, x2, y2) -> None:
+    """
+    原地纯色填充（R-㉚，v1.3.9，响应 Issue #15-C11，赵辉）：
+    取区域周边众数 RGB 值，直接填充。与马赛克相比，对大色块 Logo 效果更好。
+    """
+    region = arr[y1:y2, x1:x2]
+    rh, rw = region.shape[:2]
+    if rh <= 0 or rw <= 0:
+        return
+    # 采集周边像素（上下各5行，左右各5列）
+    border_pixels = []
+    if y1 >= 5:
+        border_pixels.append(arr[y1-5:y1, x1:x2].reshape(-1, 3))
+    if y2 + 5 <= arr.shape[0]:
+        border_pixels.append(arr[y2:y2+5, x1:x2].reshape(-1, 3))
+    if x1 >= 5:
+        border_pixels.append(arr[y1:y2, x1-5:x1].reshape(-1, 3))
+    if x2 + 5 <= arr.shape[1]:
+        border_pixels.append(arr[y1:y2, x2:x2+5].reshape(-1, 3))
+    if border_pixels:
+        import numpy as np
+        all_border = np.vstack(border_pixels)
+        # 众数 RGB（按行聚合成元组后统计）
+        from collections import Counter
+        rgb_tuples = [tuple(p) for p in all_border]
+        most_common_rgb = Counter(rgb_tuples).most_common(1)[0][0]
+        fill_color = np.array(most_common_rgb, dtype=arr.dtype)
+    else:
+        # 无周边像素时用白色填充
+        fill_color = np.array([255, 255, 255], dtype=arr.dtype)
+    arr[y1:y2, x1:x2] = fill_color
+
+
 # ---------------------------------------------------------------------------
 # 主函数
 # ---------------------------------------------------------------------------
@@ -220,14 +253,15 @@ def redact_image(input_path: str, output_path: str = None,
             apply_fn(img_arr, x1, y1, x2, y2)
             counts["文本遮盖"] = counts.get("文本遮盖", 0) + 1
 
-    # ③ 对 Logo 区域执行马赛克（强制 mosaic，不受 method 参数影响）
+    # ③ 对 Logo 区域执行纯色填充（R-㉚，v1.3.9，响应 Issue #15-C11，赵辉）：
+    # 纯色填充（周边众数取色）优于马赛克，对大色块 Logo 效果更好
     for x1, y1, x2, y2 in logo_regions:
         x1, y1 = max(0, x1), max(0, y1)
         x2, y2 = min(iw, x2), min(ih, y2)
         if x2 > x1 and y2 > y1:
-            _apply_mosaic(img_arr, x1, y1, x2, y2)
-            counts["Logo马赛克"] = counts.get("Logo马赛克", 0) + 1
-            print(f"  [银行Logo马赛克] 区域 ({x1},{y1})-({x2},{y2})")
+            _apply_solid_fill(img_arr, x1, y1, x2, y2)
+            counts["Logo纯色填充"] = counts.get("Logo纯色填充", 0) + 1
+            print(f"  [银行Logo纯色填充] 区域 ({x1},{y1})-({x2},{y2})")
 
     # ④ 保存
     from PIL import Image
