@@ -29,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from common_rules import apply_redactions, apply_redactions_counted, find_libreoffice
 from common_rules import redistribute_paragraph, redact_filename_stem
 from common_rules import set_agent_decisions_override, _get_skip_texts
+from table_role_detector import process_ppt_slide_xml
 from html import unescape as _html_unescape
 from xml.sax.saxutils import escape as _xml_escape
 
@@ -138,8 +139,15 @@ def _process_xml_file(path: Path, label: str = "") -> dict:
         content = _decode_cjk_entities(content)
         original = content
 
-        # 段落级通道（跨 run 拼接）
+        # N-A 层（Issue #16 REQ-NAME-001）：表格角色列批量脱敏
+        # 在段落级处理之前执行，避免姓名枚举层在表格单元格内重复处理
+        table_redacted, table_count = process_ppt_slide_xml(content)
         counts: dict = {}
+        if table_count > 0:
+            counts["姓名"] = counts.get("姓名", 0) + table_count
+            content = table_redacted
+
+        # 段落级通道（跨 run 拼接）
         content = _process_paragraph_level(content, counts)
 
         # 整文件级兜底（占位符幂等；覆盖非 <a:p> 区域）

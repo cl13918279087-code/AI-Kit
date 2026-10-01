@@ -1312,10 +1312,34 @@ def redistribute_paragraph(texts: list, redacted: str) -> list:
 # R-⑧（v1.3.3，响应 Issue #10-A）：角色上下文英文人名规则
 # ---------------------------------------------------------------------------
 
-_ROLE_KEYWORDS = (
-    "组长", "成员", "经理", "负责人", "联系人", "审批人", "复核人",
+# ---------------------------------------------------------------------------
+# N-B 层（Issue #16 REQ-NAME-001）：扩展角色关键词（核心+通用+分组三层）
+# ---------------------------------------------------------------------------
+
+# 核心角色词（高精度，常跟冒号分隔名单，如"项目经理：张三"）
+_ROLE_KEYWORDS_CORE = (
+    "组长", "副组长",
+    "项目经理", "技术负责人", "业务负责人", "项目总监", "架构师",
+    "技术总监", "产品经理", "需求负责人", "技术经理",
+)
+# 通用角色词（中等精度）
+_ROLE_KEYWORDS_GENERAL = (
+    "经理", "负责人", "联系人", "审批人", "复核人",
     "参与人", "参加人", "主办人", "主持人", "讲师", "签字人", "接口人",
-    "组员", "队员", "组：", "队：",
+    "编制", "审核", "批准", "承办", "承办人", "协办", "协办人",
+    "拟稿", "校对", "分发", "参会人", "参会人员",
+)
+# 分组角色词（后接冒号/顿号，如"开发组：张三"）
+_ROLE_KEYWORDS_GROUP = (
+    "核心组", "开发组", "测试组", "业务组", "运维组",
+    "项目组", "专家组", "评审组", "实施组", "设计组",
+    "成员", "组员", "队员",
+)
+
+# 合并（兼容现有 _ROLE_NAME_RE 的冒号/空格后缀模式）
+_ROLE_KEYWORDS = (
+    _ROLE_KEYWORDS_CORE + _ROLE_KEYWORDS_GENERAL + _ROLE_KEYWORDS_GROUP
+    + ("组：", "队：")  # 兼容旧格式
 )
 
 # R-㉙（v1.3.9，响应 Issue #15-C10，赵辉）：角色槽位姓名三件套
@@ -1401,6 +1425,92 @@ def _apply_role_context_pass(text: str, counts: Dict[str, int]) -> str:
         new_line = _ADJUST_RECORDS_RE.sub(_adjust_repl, new_line)
         new_line = _ADJUST_RECORDS_RE.sub(_adjust_repl, new_line)
         out_lines.append(new_line)
+    return "\n".join(out_lines)
+
+
+# ---------------------------------------------------------------------------
+# N-B 层（Issue #16 REQ-NAME-001）：段落角色锚点扩散
+#
+# 触发条件：段落含角色关键词 + 冒号（`：/：/： `）
+# 扩散策略：冒号后捕获所有 2-4 字姓名块（顿号分隔），批量替换为 XXX
+#
+# 示例：
+#   "核心组：蔡新发、张瑜、李明" → "核心组：XXX、XXX、XXX"
+#   "项目经理：王健负责"        → "项目经理：XXX负责"（无顿号，单名保留冒号后）
+# ---------------------------------------------------------------------------
+
+# 角色锚点正则：关键词 + 冒号（捕获冒号后的内容）
+_ANCHOR_COLON_RE = re.compile(
+    r"((?:"
+    + "|".join(re.escape(k) for k in (_ROLE_KEYWORDS_CORE + _ROLE_KEYWORDS_GROUP + _ROLE_KEYWORDS_GENERAL))
+    + r")[:：]\s*)(.+)"
+)
+
+# 姓名块正则：2-4 连续CJK字符（排除词/数字为主）
+_NAME_BLOCK_RE = re.compile(
+    "[\u4e00-\u9fa5]{2,4}"
+)
+# 排除词（不含语义的角色词/常见词）
+_ANCHOR_EXCLUDED_NAMES = {
+    "今日", "昨日", "明日", "一组", "二组", "三组", "四组",
+    "本组", "各组", "组长", "组员", "核心", "开发",
+    "测试", "业务", "运维", "项目", "专家", "评审",
+    "实施", "设计", "组长", "加入", "调入",
+    "负责", "协办", "承办", "编制", "审核", "批准",
+    "拟稿", "校对", "分发", "参会", "需求",
+}
+
+
+def _apply_anchor_expand_pass(text: str, counts: Dict[str, int]) -> str:
+    """
+    N-B 层（Issue #16 REQ-NAME-001）：段落角色锚点扩散。
+
+    对含角色关键词 + 冒号的段落，扩散遮蔽冒号后所有姓名块。
+    在 _apply_role_context_pass 之后执行（叠加而非替代）。
+
+    示例：
+      "核心组：蔡新发、张瑜、李明" → "核心组：XXX、XXX、XXX"
+      "组长张斌负责"              → 由 _apply_role_context_pass 处理（已有规则）
+    """
+    if not text or not isinstance(text, str):
+        return text
+
+    out_lines = []
+    for line in text.split("\n"):
+        new_line = line
+
+        def _anchor_repl(m: re.Match) -> str:
+            prefix = m.group(1)  # e.g. "核心组："
+            rest = m.group(2)    # e.g. "蔡新发、张瑜、李明"
+
+            # 在冒号后内容中捕获所有 2-4 字姓名块
+            result_parts = []
+            last_end = 0
+
+            for block_m in _NAME_BLOCK_RE.finditer(rest):
+                word = block_m.group(0)
+                # 排除词保护
+                if word in _ANCHOR_EXCLUDED_NAMES:
+                    continue
+                # 排除数字为主的词块（日期/编码碎片）
+                digit_ratio = sum(c.isdigit() for c in word) / len(word)
+                if digit_ratio >= 0.4:
+                    continue
+                # 替换
+                counts["姓名"] = counts.get("姓名", 0) + 1
+                result_parts.append(rest[last_end:block_m.start()])
+                result_parts.append("XXX")
+                last_end = block_m.end()
+
+            # 保留未匹配的后缀
+            if last_end < len(rest):
+                result_parts.append(rest[last_end:])
+
+            return prefix + "".join(result_parts)
+
+        new_line = _ANCHOR_COLON_RE.sub(_anchor_repl, new_line)
+        out_lines.append(new_line)
+
     return "\n".join(out_lines)
 
 
@@ -1558,6 +1668,10 @@ def apply_redactions_counted(text: str) -> Tuple[str, Dict[str, int]]:
     # R-㉙（v1.3.9，响应 Issue #15-C10，赵辉）：角色槽位姓名三件套
     # 仅当段落含角色关键词（且不含排除短语）时，遮蔽段内中文姓名
     result = _apply_role_context_pass(result, counts)
+
+    # N-B 层（Issue #16 REQ-NAME-001）：角色锚点扩散——冒号后姓名批量脱敏
+    # 在三件套之后叠加执行，专注处理"角色：名单"格式
+    result = _apply_anchor_expand_pass(result, counts)
 
     return result, counts
 

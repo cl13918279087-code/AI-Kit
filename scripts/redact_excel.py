@@ -18,6 +18,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from common_rules import apply_redactions, apply_redactions_counted, REDACTION_LABELS, protect_iso_datetimes, restore_iso_datetimes, redact_filename_stem, set_agent_decisions_override, load_agent_decisions
+from table_role_detector import process_xlsx_sheet_xml
 
 # ---------------------------------------------------------------------------
 # .xlsx 处理（OOXML / ZIP 格式）
@@ -95,9 +96,11 @@ def _process_xml_file(path: Path, label: str = "") -> dict:
     """
     读取 XML 文件 → 执行脱敏 → 写回（仅在有变化时）。
     v1.2.3（Issue #2 修复）：返回分类计数（每处替换 +1），
-    此前无条件 return {} 导致共享字符串/工作表计数恒为 0。
+    此后无条件 return {} 导致共享字符串/工作表计数恒为 0。
     v1.2.3（补充修复）：先解码 CJK 数字实体再脱敏，防止 openpyxl
     产物中文漏脱敏；写回明文 UTF-8（XML 合法）。
+    N-A 层（Issue #16 REQ-NAME-001）：工作表 XML（sheet*.xml）额外执行
+    表格角色列批量脱敏，在 apply_redactions_counted 之前运行。
     """
     try:
         content = path.read_text("utf-8")
@@ -108,7 +111,14 @@ def _process_xml_file(path: Path, label: str = "") -> dict:
         tokens = []
         if path.name == "core.xml":
             content, tokens = protect_iso_datetimes(content)
-        redacted, counts = apply_redactions_counted(content)
+        # N-A 层：工作表 XML 执行表格角色列批量脱敏
+        counts: dict = {}
+        if path.name.startswith("sheet") and path.suffix == ".xml":
+            content, table_count = process_xlsx_sheet_xml(content)
+            if table_count > 0:
+                counts["姓名"] = counts.get("姓名", 0) + table_count
+        redacted, c2 = apply_redactions_counted(content)
+        _merge_counts(counts, c2)
         if tokens:
             redacted = restore_iso_datetimes(redacted, tokens)
         if redacted != original:
