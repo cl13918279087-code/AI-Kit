@@ -1,6 +1,6 @@
 # Issue #17：【R4】分词边界层 + 上下文评分：姓名检测架构级重构
 
-> **状态**：待立项
+> **状态**：已立项（[GitHub Issue #17](https://github.com/cl13918279087-code/AI-Kit/issues/17)）
 > **创建日期**：2026-10-01
 > **标签**：enhancement / R4
 > **里程碑**：R4
