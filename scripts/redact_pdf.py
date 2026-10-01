@@ -312,7 +312,8 @@ def _inc_count(counts: dict, key: str) -> None:
 # ---------------------------------------------------------------------------
 
 def redact_pdf(input_path: str, output_path: str = None,
-             *, manifest_override: str = None) -> dict:
+             *, manifest_override: str = None,
+             auto_gray: bool = False) -> dict:
     """自动检测 PDF 类型并执行相应脱敏策略"""
     if output_path is None:
         stem = Path(input_path).stem

@@ -209,7 +209,8 @@ def _count_type(counts: dict, label: str) -> None:
 # ---------------------------------------------------------------------------
 
 def redact_excel(input_path: str, output_path: str = None,
-               *, manifest_override: str = None) -> dict:
+               *, manifest_override: str = None,
+               auto_gray: bool = False) -> dict:
     """
     统一入口，自动根据扩展名分发到 xlsx 或 xls 处理函数。
     返回各类脱敏统计。
@@ -239,8 +240,7 @@ def redact_excel(input_path: str, output_path: str = None,
         if xls_output != output_path:
             shutil.copy2(xls_output, output_path)
     else:
-        print(f"[错误] 不支持的文件格式: {ext}（仅支持 .xlsx 和 .xls）", file=sys.stderr)
-        sys.exit(1)
+        raise ValueError(f"不支持的文件格式: {ext}（仅支持 .xlsx 和 .xls）")
 
     total = sum(counts.values())
     print(f"[完成] 共遮盖 {total} 处敏感内容，结果保存至: {output_path}")

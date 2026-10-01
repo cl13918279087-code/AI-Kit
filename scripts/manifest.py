@@ -24,6 +24,9 @@ class SensitiveEntity:
     evidence: str = ""                 # 证据/上下文
     page: Optional[int] = None         # 页码（如有）
     line: Optional[int] = None         # 行号（如有）
+    # Issue #22：LLM 返回的字符偏移，支持位置级精确对齐
+    start: Optional[int] = None
+    end: Optional[int] = None
 
 
 @dataclass

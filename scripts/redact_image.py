@@ -190,7 +190,8 @@ def _apply_solid_fill(arr, x1, y1, x2, y2) -> None:
 
 def redact_image(input_path: str, output_path: str = None,
                  method: str = "mosaic",
-                 *, manifest_override: str = None) -> dict:
+                 *, manifest_override: str = None,
+                 auto_gray: bool = False) -> dict:
     """
     图片脱敏主函数。
 

@@ -20,9 +20,9 @@
   "bank_names": ["郑州银行", "海峡银行", "中原银行"],
   "org_suffixes": ["部", "中心", "办公室"],
   "tokenizer": {
-    "use_jieba": false
+    "use_jieba": true
   },
-  "name_mode": "enum",
+  "name_mode": "r4",
   "r4": {
     "enabled": true,
     "high_threshold": 0.75,

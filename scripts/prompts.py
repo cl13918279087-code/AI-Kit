@@ -20,18 +20,20 @@ ENTITY_EXTRACTION_SYSTEM_PROMPT = """你是一个金融文档脱敏专家，只�
 - 银行名：必须是"XX银行"、"XX总行"、"XX分行"等完整银行机构名
 - 宁可漏脱，不可误脱
 
-【输出格式】
+【输出格式】—— 必须返回字符偏移（start/end）
 {
   "entities": [
     {
       "text": "原始文本",
       "replacement": "脱敏后文本",
       "category": "person_name | bank_name",
-      "confidence": 0.0-1.0
+      "confidence": 0.0-1.0,
+      "start": 0,
+      "end": 2
     }
   ]
 }
-
+说明：start 是实体第一个字符在原文中的索引（从0开始），end 是最后一个字符之后的位置。
 如果文本不含人名或银行名，返回空的 entities 数组：{"entities": []}"""
 
 
@@ -63,13 +65,14 @@ def build_entity_extraction_prompt(text: str, context: str = "") -> str:
 3. "总行"、"我行"、"本行" 不要替换
 4. "建设项目组"、"业务处理"、"问题处理"、"范围" 不要替换
 5. 日期、账号、证件号、金额 不要替换
+6. 【必须】返回每个实体在原文中的字符偏移：start（起始索引，从0开始）和 end（结束索引，不含）
 
 【待分析文本】
 ---
 {text[:6000]}
 ---
 
-只返回人名，不要返回其他类型的敏感信息。"""
+只返回人名，不要返回其他类型的敏感信息。输出 JSON 中每个 entity 必须包含 start 和 end 字段。"""
 
 
 def build_batch_summary_prompt(results: list) -> str:

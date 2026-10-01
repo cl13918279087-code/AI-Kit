@@ -226,6 +226,9 @@ class EntityDetector:
                     source="llm",
                     category=item.get("category", "other"),
                     evidence=item.get("evidence", ""),
+                    # Issue #22：传递 LLM 返回的字符偏移，支持位置级精确对齐
+                    start=item.get("start"),
+                    end=item.get("end"),
                 ))
 
         if error_holder:

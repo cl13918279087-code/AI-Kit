@@ -356,7 +356,8 @@ def redact_ppt_to_pptx(input_path: str, output_pptx: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def redact_ppt(input_path: str, output_path: str = None,
-              *, manifest_override: str = None) -> dict:
+              *, manifest_override: str = None,
+              auto_gray: bool = False) -> dict:
     """自动根据扩展名分发处理，返回脱敏统计"""
     if output_path is None:
         # R-⑬（v1.3.7，Issue #13-①）：默认输出名统一走文件名脱敏
@@ -380,8 +381,7 @@ def redact_ppt(input_path: str, output_path: str = None,
         counts = redact_pptx(tmp_pptx, output_path)
         Path(tmp_pptx).unlink(missing_ok=True)
     else:
-        print(f"[错误] 不支持的文件格式: {ext}（仅支持 .pptx 和 .ppt）", file=sys.stderr)
-        sys.exit(1)
+        raise ValueError(f"不支持的文件格式: {ext}（仅支持 .pptx 和 .ppt）")
 
     total = sum(counts.values())
     print(f"[完成] 共遮盖 {total} 处，结果保存至: {output_path}")

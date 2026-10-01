@@ -27,6 +27,7 @@ import tempfile
 import threading
 import platform
 import os
+import logging as _logging
 from pathlib import Path
 
 import sys
@@ -34,6 +35,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from common_rules import apply_redactions, protect_iso_datetimes, restore_iso_datetimes, find_libreoffice, redact_filename_stem, load_agent_decisions
 from entity_detector import build_llm_detector
+
+_llm_logger = _logging.getLogger("redact_word.llm")
 
 # ---------------------------------------------------------------------------
 # Agent 评审决策上下文（方式一：分阶段交互）
@@ -241,19 +244,29 @@ def _manifest_to_spans(full_text: str, manifest, node_texts: list = None) -> lis
             continue  # 跳过单字（避免误匹配"时/我/行"）
         if skip_texts and text in skip_texts:
             continue  # Agent 标记跳过，不遮盖
-        pos = full_text.find(text, search_from)
-        match_len = len(text)
-        if pos < 0:
-            # 容错：忽略空格差异（如 run 间有空格）
-            fuzzy = re.compile(re.escape(text).replace(r"\ ", r"\s*"))
-            m = fuzzy.search(full_text, search_from)
-            if m:
-                pos = m.start()
-                match_len = m.end() - m.start()
-        if pos < 0:
-            continue
-        search_from = pos + match_len
-        spans.append((pos, pos + match_len, text, ent.replacement or "XXX"))
+        # Issue #22 修复：优先使用 LLM 返回的精确字符偏移（start/end）
+        pos = getattr(ent, "start", None)
+        end = getattr(ent, "end", None)
+        if pos is not None and end is not None and 0 <= pos < end <= len(full_text):
+            # 偏移在文本范围内，直接使用（位置级精确对齐）
+            match_len = end - pos
+            spans.append((pos, end, text, ent.replacement or "XXX"))
+            search_from = end
+        else:
+            # 回退：文本搜索（兼容无偏移的旧 manifest）
+            pos = full_text.find(text, search_from)
+            match_len = len(text)
+            if pos < 0:
+                # 容错：忽略空格差异（如 run 间有空格）
+                fuzzy = re.compile(re.escape(text).replace(r"\ ", r"\s*"))
+                m = fuzzy.search(full_text, search_from)
+                if m:
+                    pos = m.start()
+                    match_len = m.end() - m.start()
+            if pos < 0:
+                continue
+            search_from = pos + match_len
+            spans.append((pos, pos + match_len, text, ent.replacement or "XXX"))
 
     # 排序并合并重叠区间
     spans.sort(key=lambda x: (x[0], -x[1]))
@@ -379,18 +392,16 @@ def _process_word_xml_with_llm(path: Path, detector=None, label: str = "") -> di
                 t.start()
                 t.join(timeout=300)
                 if t.is_alive():
-                    print(f"  [LLM] 检测超时（>60s），跳过 LLM 层")
+                    _llm_logger.warning("[%s] LLM 检测超时（>300s），跳过 LLM 层", label or path.name)
                 elif result_holder[1]:
-                    print(f"  [LLM] 检测失败: {result_holder[1]}")
+                    _llm_logger.warning("[%s] LLM 检测失败: %s", label or path.name, result_holder[1])
                 elif result_holder[0]:
                     manifest = result_holder[0]
                     spans = _manifest_to_spans(full_text, manifest)
                     if spans:
-                        print(f"  [LLM检测] {label or path.name}: 识别到 {len(spans)} 个实体")
+                        _llm_logger.info("[%s] LLM 识别到 %d 个实体", label or path.name, len(spans))
         except Exception as e:
-            import traceback
-            traceback.print_exc()
-            print(f"  [警告] LLM 检测失败（{label or path.name}），继续 regex 脱敏: {e}", file=sys.stderr)
+            _llm_logger.exception("[%s] LLM 检测异常，继续 regex 脱敏: %s", label or path.name, e)
 
     # ② offset 精确替换（优先）
     changed = False
@@ -1073,13 +1084,11 @@ def redact_word(input_path: str, output_path: str = None,
             # tempdir 与输出路径不同卷时 .doc 全量失败；shutil.move 同盘走
             # rename 零拷贝、跨盘自动 copy2+remove。
             shutil.move(tmp_docx, output_path)
-        except RuntimeError as e:
-            print(f"[错误] .doc 处理终止：{e}", file=sys.stderr)
+        except RuntimeError:
             Path(tmp_docx).unlink(missing_ok=True)
-            sys.exit(1)
+            raise
     else:
-        print(f"[错误] 不支持的文件格式: {ext}（仅支持 .docx 和 .doc）", file=sys.stderr)
-        sys.exit(1)
+        raise ValueError(f"不支持的文件格式: {ext}（仅支持 .docx 和 .doc）")
 
     total = sum(counts.values())
     print(f"[完成] 共遮盖 {total} 处，结果保存至: {output_path}")

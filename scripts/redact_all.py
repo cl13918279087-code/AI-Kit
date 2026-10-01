@@ -230,7 +230,8 @@ def apply_agent_decisions(input_path: str, decisions_path: str) -> None:
 
 def redact_file(input_path: str, output_path: str = None,
                 method: str = "mosaic",
-                manifest_override: str = None) -> dict:
+                manifest_override: str = None,
+                auto_gray: bool = False) -> dict:
     """对单个文件执行脱敏，返回统计"""
     input_path = Path(input_path).resolve()
     ext = input_path.suffix.lower()
@@ -260,13 +261,13 @@ def redact_file(input_path: str, output_path: str = None,
     try:
         if ext in (".pdf",):
             return handler(str(input_path), str(output_path),
-                          manifest_override=manifest_override)
+                          manifest_override=manifest_override, auto_gray=auto_gray)
         elif ext in (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tiff"):
             return handler(str(input_path), str(output_path), method,
-                          manifest_override=manifest_override)
+                          manifest_override=manifest_override, auto_gray=auto_gray)
         else:
             return handler(str(input_path), str(output_path),
-                          manifest_override=manifest_override)
+                          manifest_override=manifest_override, auto_gray=auto_gray)
     except Exception as e:
         print(f"[错误] 处理失败: {e}", file=sys.stderr)
         import traceback
@@ -375,7 +376,7 @@ def main():
 
     # 默认：纯自动化（灰区直接遮盖，不交 Agent）
     if len(files) == 1:
-        redact_file(files[0], output, method)
+        redact_file(files[0], output, method, auto_gray=auto_gray)
     else:
         redact_batch(files, output, method)
 
