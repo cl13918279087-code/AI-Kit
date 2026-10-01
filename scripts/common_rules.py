@@ -1673,6 +1673,15 @@ def apply_redactions_counted(text: str) -> Tuple[str, Dict[str, int]]:
     # 在三件套之后叠加执行，专注处理"角色：名单"格式
     result = _apply_anchor_expand_pass(result, counts)
 
+    # R4 层（Issue #17）：分词边界 + 上下文评分
+    # 仅当 name_mode 为 "r4" 或 "both" 时启用；"enum" 模式保持 v1.3.10 行为不变
+    try:
+        from r4_name_scoring import apply_r4_name_pass, get_name_mode
+        if get_name_mode() in ("r4", "both"):
+            result = apply_r4_name_pass(result, counts, mode=get_name_mode())
+    except ImportError:
+        pass  # R4 模块不可用时降级
+
     return result, counts
 
 

@@ -1,6 +1,6 @@
 # Issue #17：【R4】分词边界层 + 上下文评分：姓名检测架构级重构
 
-> **状态**：已立项（[GitHub Issue #17](https://github.com/cl13918279087-code/AI-Kit/issues/17)）
+> **状态**：实施中（[GitHub Issue #17](https://github.com/cl13918279087-code/AI-Kit/issues/17)）
 > **创建日期**：2026-10-01
 > **标签**：enhancement / R4
 > **里程碑**：R4
@@ -129,6 +129,71 @@ Layer R4: 分词边界 + 上下文评分（新增，叠加）
 
 ---
 
-## 实施记录（待填写）
+## 实施记录
 
-> R4 实施完成后在此记录
+### Phase 1+2：技术选型 + 分词边界层实现 ✅（2026-10-01）
+
+**新建文件**：`scripts/r4_name_scoring.py`
+
+**核心实现**：
+- `_iter_cjk_blocks()`：滑动窗口扫描 2-4 字 CJK 块（支持重叠，优先长匹配），解决贪婪正则起点覆盖问题
+- 6 特征加权评分（`_score_candidate`）：
+  - 姓氏命中（0.55）：姓氏是最强姓名信号
+  - 名字常用度（0.10）：name_pool 第二字枚举局限
+  - 周围角色词（0.20）：角色关键词上下文
+  - 密度信号（0.15）：人名密集区（分工表场景）
+  - 排除词冲突（-0.25）：常用词/机构词负权重
+  - 数字比例（-0.10）：数字比例高时降低分数
+- 双阈值（高≥0.75 直接脱敏，中置信 0.50~0.75 LLM 回退，低<0.50 保留）
+- `_llm_fallback_check()`：中置信区 LLM 二次确认（默认开启，可配置关闭）
+- 非姓名过滤：2/4 字黑名单（项目/成立/建设等）+ 角色关键词自身跳过
+- 姓氏开头判定：role_feature 仅对姓氏首字块生效，防止"组长张三"对"项目"误加
+
+**jieba 安装**：`/private/var/folders` 缓存目录冲突，`pip install` 失败；改用手动复制安装：
+- 从 PyPI 下载 tar.gz → 解压 → 复制 `jieba/` + `dict.txt` 到 site-packages
+- dict.txt 5MB，jieba 0.42.1
+- 存在 SyntaxWarning（无效转义序列），非阻塞
+
+**jieba 非依赖**：`_ensure_jieba()` 失败时 `_jieba_initialized = False`，`apply_r4_name_pass` 直接返回原文
+
+### Phase 3：配置化 ✅（2026-10-01）
+
+**修改文件**：`scripts/config.json`
+- 新增 `name_mode: "enum"`（默认，v1.3.10 行为）
+- 新增 `r4.enabled/high_threshold/low_threshold/llm_fallback/feature_weights`
+
+**common_rules.py 集成**：在 `apply_redactions_counted` 末尾、`N-B` pass 之后：
+```python
+from r4_name_scoring import apply_r4_name_pass, get_name_mode
+if get_name_mode() in ("r4", "both"):
+    result = apply_r4_name_pass(result, counts, mode=get_name_mode())
+```
+
+### Phase 4：测试 ✅（2026-10-01）
+
+**新建文件**：`tests/test_r4_name_scoring.py`（10 个场景）
+
+**关键设计决策**：
+1. **滑动窗口替代贪婪正则**：`[\u4e00-\u9fa5]{2,4}` 在起点0匹配"组长张三"（4字），跳过了"张三"（2字）。改用显式窗口迭代器，每个CJK位置尝试 2/3/4 字块
+2. **姓氏开头 role_feature 限定**：否则"组长张三"对"项目"也 role=1.0，导致非姓名块被误判
+3. **密度仅统计姓氏块**：否则"组长张三负责项目"中"负责项目"蹭密度信号
+4. **黑名单双重防护**：2字（项目/成立/建设）+4字（组长张三）黑名单过滤
+5. **重迭代策略**：每次替换后重启扫描，避免位置偏移累积
+
+### Phase 5：文档 ✅（2026-10-01）
+
+- CHANGELOG.md：新增 v1.4.0 节（R4-A~R4-E）
+- docs/贡献档案.md：更新 #17 实施状态
+- docs/Issue-017-R4分词边界层重构.md：补充实施记录
+
+---
+
+## 评审结论（2026-10-01）
+
+| # | 讨论事项 | 结论 |
+|---|---------|------|
+| 1 | 技术选型 | **jieba** + 自研上下文评分 |
+| 2 | N-A/N-B 衔接 | **保留**，高置信兜底通道 |
+| 3 | 配置化粒度 | **三档** `config.json` + `--name-mode` |
+| 4 | 误伤防护 | **双阈值**（0.75/0.50）+ LLM 中置信回退 |
+| 5 | N-D 处置 | **废弃**，R4 Phase 3 密度信号覆盖 |
