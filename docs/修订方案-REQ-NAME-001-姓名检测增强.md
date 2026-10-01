@@ -1,7 +1,7 @@
 # 修订方案：REQ-NAME-001 姓名检测增强——区域预判 + 批量脱敏
 
 > 响应 Issue #16（2026-10-01，@cl13918279087-code）
-> 状态：待评审
+> 状态：**部分实施（v1.3.10候审稿）**——N-A + N-B 已实现，N-C/N-D 延后至 R4 后对接
 > 评审期：2026-10-01 ~ 2026-10-15
 
 ---
@@ -207,3 +207,41 @@ Layer 3: LLM（现有，不变）
 3. **与 R4 重构的关系**：R4（分词边界层/上下文评分）是否优先于本方案？两条线如何衔接？
 4. **误伤防护**：Layer N-A/N-B/N-C 均可能误伤正常正文，是否需要 `EXCLUDED_PHRASES` 动态扩展？
 5. **本地 LLM 兜底**：Phase 5 是否需要接入 LLM 对高不确定区域做二次确认（默认关闭）？
+
+---
+
+## 八、实施记录（v1.3.10）
+
+> 2026-10-01 实施完成
+
+### Phase 1：Layer N-A 表格角色列检测 ✅
+
+**文件**：`scripts/table_role_detector.py`（新建）
+
+**核心逻辑**：
+- `_detect_role_columns_in_ppt_table()`：扫描表头行，含角色词则该列为角色列；角色列右侧所有非数字列一并纳入
+- `_bulk_redact_chinese()`：批量脱敏 2-4 字中文词块（排除数字列/序号列/纯符号列/今日昨日等排除短语）
+- `_rebuild_tc()`：用 `re.sub` 直接替换 `<a:t>` 内容，支持多 run 单元格
+- `process_ppt_table_xml()`：处理 PPT `<a:tbl>` XML
+- `process_xlsx_worksheet()`：处理 Excel 工作表 XML
+
+**PPT 集成**：`redact_ppt.py` `_process_xml_file()`，在段落级处理前调用
+**Excel 集成**：`redact_excel.py` `_process_xml_file()`，对 worksheet XML 调用
+
+**检测关键词**：姓名/组长/成员/负责人/联络人/参与人/技术/管理等 30+ 词
+**排除词集**：今日/昨日/一组/序号/项目名/金额等 32 项
+
+### Phase 2：Layer N-B 段落角色锚点扩散 ✅
+
+**文件**：`scripts/common_rules.py`（扩展）
+
+**扩展内容**：
+- `_ROLE_KEYWORDS_CORE`：项目经理/技术总监/架构师/产品经理/研发总监/安全负责人（6项）
+- `_ROLE_KEYWORDS_GENERAL`：负责人/联络人/接口人/审阅/复核/编制/审核/批准/承办/协办等（14项）
+- `_ROLE_KEYWORDS_GROUP`：核心组/开发组/测试组/业务组/运维组等（11项）
+- `_apply_anchor_expand_pass()`：角色关键词+冒号后，顿号/逗号分隔名单批量脱敏
+- `_ANCHOR_COLON_RE`：锚点正则（修正字符类语法，加入全部三组关键词）
+- `_ANCHOR_EXCLUDED_NAMES`：排除"负责/协办/承办/今日/昨日/序号"等常见词
+- `apply_redactions_counted()`：N-B pass 在 N-A pass 之后执行
+
+**实测覆盖**：核心组顿号名单/组长单名/项目经理+动词后缀/参与人/协办人等 15 个场景全部通过
