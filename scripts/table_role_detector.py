@@ -46,6 +46,35 @@ _ROLE_COLUMN_EXCLUDED: Set[str] = {
     "IP地址", "MAC地址", "端口", "带宽", "线路",
     "机房", "机柜", "设备", "终端", "工作站",
     "云资源", "容器", "集群", "节点", "实例",
+    # D7（赵辉，第5批，2026-10-09）：语义词守卫扩充
+    "风险", "问题", "类别", "情况", "原因", "影响", "措施",
+    "内容", "分析", "说明", "意见", "结果", "状态", "进度",
+    "金额", "合计", "总计", "小计", "金额",
+    "士气", "疲劳", "科技", "厂商", "人员", "成本",
+    "日期", "时间", "计划", "实际", "完成", "进度",
+    # D7：厂商名前缀守卫（厂商名不脱敏，用户口径）
+    "联想", "戴尔", "惠普", "华为", "新华三", "浪潮", "曙光",
+    "Cisco", "Juniper", "VMware", "Oracle", "IBM", "微软",
+}
+
+# H3（赵辉，第4批，2026-10-08）：表头设备/品牌词排除表
+# ⚠ 勿放裸"设备"——"设备负责人"等真姓名列会误排除
+_TBL_HDR_NONNAME: Set[str] = {
+    "设备厂商", "硬件厂商", "产品厂商", "设备品牌",
+    "设备型号", "设备类型", "设备名称", "设备用途",
+    "设备编号", "设备状态", "设备位置",
+    "网络设备", "安全设备", "存储设备", "备份设备",
+    "软件版本", "系统版本", "应用版本",
+    "云资源", "容器", "集群", "节点", "实例",
+    "IP地址", "MAC地址", "端口号", "带宽", "线路",
+}
+
+# D6（赵辉，第5批，2026-10-09）：表头列名排除结尾词
+# 含以下词结尾的列名不触发角色列检测（如"问题与风险类别"）
+_TBL_HDR_EXCLUDE_ENDINGS: Set[str] = {
+    "风险", "问题", "类别", "情况", "原因", "影响", "措施",
+    "内容", "分析", "说明", "意见", "结果", "状态",
+    "进度", "计划", "目标", "要求", "规范", "标准",
 }
 
 
@@ -68,11 +97,18 @@ def _bulk_redact_chinese(text: str) -> Tuple[str, int]:
     ):
         return text, 0
 
-    # E2（赵辉，第3批）：设备/网络列整格跳过
-    # 当单元格内容命中设备关键词时，跳过整格不脱敏
+    # E2（赵辉，第3批，2026-10-08；D7修复，2026-10-09）：设备/网络列整格跳过
+    # D7修复：改为词边界精确匹配，避免"设备厂商联想"整体被跳过
+    # 只在设备列名（不含姓名词时）精确命中整格才跳过
     for excl in _ROLE_COLUMN_EXCLUDED:
         if excl in stripped and len(stripped) >= 2:
-            return text, 0
+            # 精确匹配：整格等于排除词，或排除词是格内独立词（前后是分隔符/边界）
+            if stripped == excl:
+                return text, 0
+            # 检查排除词是否作为独立词出现（前后为分隔符或边界）
+            pat_wb = re.compile(rf'(?<![\u4e00-\u9fa5\w]){re.escape(excl)}(?![\u4e00-\u9fa5\w])')
+            if pat_wb.search(stripped):
+                return text, 0
 
     def _repl(m: re.Match) -> str:
         word = m.group(0)
@@ -159,6 +195,16 @@ def _detect_role_columns_in_ppt_table(tbl_xml: str) -> List[int]:
 
     for col_idx, cell_m in enumerate(cells):
         cell_text = _extract_cell_text(cell_m.group(1)).strip()
+        # D6（赵辉，第5批，2026-10-09）：表头列名排除（H3 + 长度 + 结尾词）
+        # ① 排除含设备/品牌词的表头（H3）
+        if any(kw in cell_text for kw in _TBL_HDR_NONNAME):
+            continue
+        # ② 表头须 ≤20 字（含句读则排除，防止"问题与风险类别"等数据列）
+        if len(cell_text) > 20 or any(cell_text.endswith(p) for p in ('。', '，', '；', '！', '？')):
+            continue
+        # ③ 表头结尾词排除（如"问题与风险类别"）
+        if any(cell_text.endswith(end) for end in _TBL_HDR_EXCLUDE_ENDINGS):
+            continue
         # 精准匹配角色词（词边界保护）
         for word in _ROLE_COLUMN_HEADER_WORDS:
             if re.search(rf'(?<!\w){re.escape(word)}(?!\w)', cell_text):
@@ -288,6 +334,16 @@ def _detect_role_columns_in_xlsx_worksheet(ws_xml: str) -> List[int]:
             cell_text = _html_unescape(is_m.group(1))
         if not cell_text:
             continue
+        # D6（赵辉，第5批，2026-10-09）：表头列名排除（H3 + 长度 + 结尾词）
+        # ① 排除含设备/品牌词的表头（H3）
+        if any(kw in cell_text for kw in _TBL_HDR_NONNAME):
+            continue
+        # ② 表头须 ≤20 字（含句读则排除，防止"问题与风险类别"等数据列）
+        if len(cell_text) > 20 or any(cell_text.endswith(p) for p in ('。', '，', '；', '！', '？')):
+            continue
+        # ③ 表头结尾词排除
+        if any(cell_text.endswith(end) for end in _TBL_HDR_EXCLUDE_ENDINGS):
+            continue
         for word in _ROLE_COLUMN_HEADER_WORDS:
             if re.search(rf'(?<!\w){re.escape(word)}(?!\w)', cell_text):
                 role_cols.append(col_idx)
@@ -371,6 +427,124 @@ def process_xlsx_worksheet(ws_xml: str) -> Tuple[str, int]:
 
     result = _XLSX_ROW_RE.subn(_process_row, ws_xml)[0]
     return result, total_count
+
+
+# ---------------------------------------------------------------------------
+# D15（赵辉，第5批，2026-10-09）：表头驱动列姓名预扫 → 全局注入
+#
+# 预扫表格姓名列取值 → 注入 common_rules 的额外姓名集 → 全文同名替换。
+# 用途：正文引用"王根利的B角"不在表格列内，仅靠列脱敏够不着，
+# 须通过姓名集注入实现跨正文联动。
+# ---------------------------------------------------------------------------
+
+# 模块级姓名收集（跨表格累积）
+_TABLE_COLLECTED_NAMES: set = set()
+
+# 姓名块正则（与 _bulk_redact_chinese 口径一致）
+_NAME_BLOCK_PAT = re.compile(r'[\u4e00-\u9fa5]{2,4}')
+
+
+def _collect_names_from_role_column(text: str) -> set:
+    """
+    从角色列单元格文本中提取候选姓名（供全局注入）。
+    仅提取2-4字CJK块，排除已知的非姓名词。
+    """
+    names: set = set()
+    for m in _NAME_BLOCK_PAT.finditer(text):
+        word = m.group(0)
+        # 排除含排除词的块
+        skip = False
+        for excl in _ROLE_COLUMN_EXCLUDED:
+            if excl in word:
+                skip = True
+                break
+        if skip:
+            continue
+        # 排除数字为主的块
+        digit_ratio = sum(c.isdigit() for c in word) / len(word)
+        if digit_ratio >= 0.4:
+            continue
+        # 排除含"账"字结尾（业务词，如"内部账/总账/对账"）
+        if word.endswith("账"):
+            continue
+        # 排除H3设备词
+        if any(kw in word for kw in _TBL_HDR_NONNAME):
+            continue
+        names.add(word)
+    return names
+
+
+def collect_table_names(xml_content: str) -> set:
+    """
+    D15（赵辉，第5批，2026-10-09）：预扫整个文档 XML，收集表格角色列中的姓名。
+    供 redact_ppt.py / redact_excel.py 在主流程开始前调用，
+    将收集到的姓名注入 common_rules 的额外姓名集（_EXTRA_NAMES）。
+    """
+    global _TABLE_COLLECTED_NAMES
+    collected: set = set()
+
+    # 预扫 PPT 表格
+    for tbl_m in _PPT_TBL_RE.finditer(xml_content):
+        tbl_xml = tbl_m.group(0)
+        role_cols = _detect_role_columns_in_ppt_table(tbl_xml)
+        if not role_cols:
+            continue
+        # 扫描所有行（跳过表头行）
+        for row_m in _PPT_TR_RE.finditer(tbl_xml):
+            row_xml = row_m.group(0)
+            cells = list(_PPT_TC_RE.finditer(row_xml))
+            for col_idx, cell_m in enumerate(cells):
+                if col_idx not in role_cols:
+                    continue
+                cell_text = _extract_cell_text(cell_m.group(1))
+                names = _collect_names_from_role_column(cell_text)
+                collected.update(names)
+
+    # 预扫 XLSX 工作表（单 sheet）
+    for row_m in _XLSX_ROW_RE.finditer(xml_content):
+        row_xml = row_m.group(0)
+        row_num_matches = re.findall(r'\br="(\d+)"', row_xml)
+        if not row_num_matches:
+            continue
+        try:
+            row_num = int(row_num_matches[0])
+        except ValueError:
+            continue
+        if row_num == 1:
+            continue  # 跳过表头行
+        for cell_m in _XLSX_CELL_RE.finditer(row_xml):
+            cell_full = cell_m.group(0)
+            cell_ref_m = _XLSX_CELL_ATTR_R.search(cell_m.group(1))
+            if not cell_ref_m:
+                continue
+            col_idx = _cell_ref_col(cell_ref_m.group(1))
+            # 用 _detect_role_columns_in_xlsx_worksheet 判断（需传完整 worksheet XML）
+            # 简化：直接复用 _ROLE_COLUMN_EXCLUDED 做格级判断
+            inner = cell_m.group(2)
+            v_m = _XLSX_V_RE.search(inner)
+            is_m = re.search(r'<is><t[^>]*>(.*?)</t></is>', inner, re.S)
+            cell_text = ""
+            if v_m:
+                cell_text = v_m.group(1).strip()
+            if is_m:
+                cell_text = _html_unescape(is_m.group(1))
+            if cell_text:
+                names = _collect_names_from_role_column(cell_text)
+                collected.update(names)
+
+    _TABLE_COLLECTED_NAMES.update(collected)
+    return collected
+
+
+def get_table_collected_names() -> set:
+    """返回已收集的表格姓名集合（供外部注入）"""
+    return _TABLE_COLLECTED_NAMES
+
+
+def clear_table_collected_names() -> None:
+    """清空表格姓名收集（文档处理完成后调用，避免跨文档污染）"""
+    global _TABLE_COLLECTED_NAMES
+    _TABLE_COLLECTED_NAMES.clear()
 
 
 # ---------------------------------------------------------------------------

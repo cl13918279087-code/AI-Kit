@@ -18,7 +18,8 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from common_rules import apply_redactions, apply_redactions_counted, REDACTION_LABELS, protect_iso_datetimes, restore_iso_datetimes, redact_filename_stem, set_agent_decisions_override, load_agent_decisions
-from table_role_detector import process_xlsx_sheet_xml
+from table_role_detector import process_xlsx_sheet_xml, collect_table_names
+from common_rules import inject_extra_names, clear_extra_names
 
 # ---------------------------------------------------------------------------
 # .xlsx 处理（OOXML / ZIP 格式）
@@ -32,6 +33,18 @@ def redact_xlsx(input_path: str, output_path: str) -> dict:
     try:
         with zipfile.ZipFile(input_path, "r") as zf:
             zf.extractall(tmp_dir)
+
+        # D15（赵辉，第5批，2026-10-09）：预扫所有工作表，收集角色列姓名
+        ws_dir = tmp_dir / "xl" / "worksheets"
+        all_sheets_content = ""
+        if ws_dir.exists():
+            for ws in sorted(ws_dir.glob("sheet*.xml")):
+                all_sheets_content += ws.read_text("utf-8")
+        if all_sheets_content:
+            names = collect_table_names(all_sheets_content)
+            if names:
+                inject_extra_names(names)
+                print(f"  [D15] 表格姓名注入 {len(names)} 个 → 全文联动脱敏")
 
         # ① 共享字符串表（Excel 最常用文本存储位置）
         shared = tmp_dir / "xl" / "sharedStrings.xml"
@@ -71,6 +84,7 @@ def redact_xlsx(input_path: str, output_path: str) -> dict:
                     arcname = str(fp.relative_to(tmp_dir))
                     zf.write(fp, arcname)
     finally:
+        clear_extra_names()  # D15：清空表格姓名收集，避免跨文档污染
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
     return counts

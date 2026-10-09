@@ -46,6 +46,218 @@ for _p in _tesseract_paths:
 
 
 # ---------------------------------------------------------------------------
+# D1（赵辉，第5批，2026-10-09）：OCR 字符区间姓名检测
+#
+# 背景：整行打码无法区分"正文+姓名混排行"中的姓名区间。
+# 本模块对每个 OCR 文本块做规则检测，返回姓名区间，
+# 按字符宽度比例映射到像素坐标，只打姓名区间不打整行。
+# ---------------------------------------------------------------------------
+
+import re as _re
+
+# 角色前缀词（支持：角色词/部门机构词/厂商简称）
+_ROLE_PREFIX_WORDS = (
+    "组长", "副组长", "负责人", "联系人", "成员", "组员",
+    "经理", "总监", "工程师", "设计师", "分析师", "架构师",
+    "主管", "部长", "主任", "处长", "科员",
+    "总经理", "副总经理", "项目经理", "技术经理", "产品经理",
+    "主办", "协办", "承办", "参会", "主讲", "主持",
+    "开发", "测试", "运维", "安全", "业务", "产品",
+    "技术", "实施", "设计", "验收", "评审",
+)
+_ROLE_PREFIX_RE = _re.compile(
+    r"^(?:"
+    + "|".join(_re.escape(w) for w in _ROLE_PREFIX_WORDS)
+    + r")[:：\s]*(.+)$"
+)
+
+# D12（赵辉，第5批，2026-10-09）：OCR 单元格分隔符扩充
+# 原分隔符：、/\n，新增 /／ 以及尾随分隔（OCR 把"刘殿麒、马杰"截成"刘殿麒/马"）
+_CELL_SEP_RE = _re.compile(r'[、/／\\，,\n]+')
+
+
+def _detect_name_spans_in_text(text: str) -> list:
+    """
+    D1（赵辉，第5批，2026-10-09）：检测文本中的姓名区间。
+    返回 [(start_char_idx, end_char_idx, name_text)]，字符索引基于 text。
+    """
+    spans = []
+    if not text:
+        return spans
+
+    # 模式1：角色前缀 + 名单（如"组长：张三、李四"）
+    m = _ROLE_PREFIX_RE.match(text)
+    if m:
+        rest = m.group(1)
+        parts = _CELL_SEP_RE.split(rest)
+        char_pos = len(m.group(0)) - len(rest)
+        for part in parts:
+            part = part.strip()
+            if not part:
+                continue
+            name = part
+            for suffix in ("总", "等", "和", "与"):
+                if name.endswith(suffix) and len(name) > 2:
+                    name = name[:-1]
+            if 2 <= len(name) <= 4 and _re.search(r'[\u4e00-\u9fa5]', name):
+                spans.append((char_pos, char_pos + len(name), name))
+            char_pos += len(part)
+
+    # 模式2：姓名 + "总"（敬称）："谢红总" → 谢红
+    for m in _re.finditer(r'[\u4e00-\u9fa5]{2,3}总', text):
+        name = m.group(0)[:-1]
+        if 2 <= len(name) <= 3:
+            spans.append((m.start(), m.start() + len(name), name))
+
+    # 模式3：单姓 + "行"（邓行 = 邓行长简写）
+    # 匹配单汉字+行，span 返回完整 2 字符，redact 时只打姓名部分
+    for m in _re.finditer(r'[\u4e00-\u9fa5]行', text):
+        surname_start = m.start()
+        # 前一字是连词/标点，或位于行首 → 有效单姓行
+        valid = True
+        if surname_start > 0:
+            prev = text[surname_start - 1]
+            if prev in '和与及或但而且并：：':
+                valid = False
+        if valid:
+            spans.append((surname_start, surname_start + 2, text[surname_start]))
+
+    # 模式4：顿号分隔名单（如"蔡元龙、张瑜"）
+    parts = _CELL_SEP_RE.split(text)
+    pos = 0
+    for part in parts:
+        part = part.strip()
+        if not part:
+            pos += 1
+            continue
+        for suffix in ("总", "等"):
+            if part.endswith(suffix) and len(part) > 2:
+                part = part[:-1]
+        if 2 <= len(part) <= 4 and _re.search(r'[\u4e00-\u9fa5]', part):
+            skip = False
+            if pos > 0:
+                prev_char = text[max(0, pos - 1)]
+                if prev_char in '和与及或但而且并':
+                    skip = True
+            if not skip:
+                spans.append((pos, pos + len(part), part))
+        pos += len(part) + 1
+
+    # 去重：相同区间保留最长 name（优先保留更完整的姓名）
+    seen = set()
+    result = []
+    for start, end, name in sorted(spans, key=lambda x: (x[0], -x[1])):
+        key = (start, end)
+        if key not in seen:
+            seen.add(key)
+            result.append((start, end, name))
+        else:
+            # 已有相同区间，若新 name 更长则替换
+            for i, (s, e, n) in enumerate(result):
+                if s == start and e == end and len(name) > len(n):
+                    result[i] = (start, end, name)
+    return result
+
+
+def _apply_name_spans_by_block(img_arr, ocr_data: dict, apply_fn,
+                               pad: int = 3) -> int:
+    """
+    D1（赵辉，第5批，2026-10-09）：对每个 OCR 文本块检测姓名区间，
+    按字符宽度比例计算像素坐标并打码。只打姓名区间不打整行。
+    返回打码处数。
+    """
+    ih, iw = img_arr.shape[:2]
+    count = 0
+    n = len(ocr_data["text"])
+
+    for i in range(n):
+        text = ocr_data["text"][i].strip()
+        if not text:
+            continue
+
+        x = ocr_data["left"][i]
+        y = ocr_data["top"][i]
+        bw = ocr_data["width"][i]
+        bh = ocr_data["height"][i]
+        text_len = len(text)
+
+        # 检测姓名区间
+        spans = _detect_name_spans_in_text(text)
+        if not spans:
+            continue
+
+        for start, end, name in spans:
+            if start >= end or text_len == 0:
+                continue
+            # 按字符宽度比例计算像素区间
+            char_width = bw / text_len
+            x1 = int(x + start * char_width)
+            x2 = int(x + end * char_width)
+            y1 = max(0, y - pad)
+            y2 = min(iw, y + bh + pad)
+            x1 = max(0, x1 - pad)
+            x2 = min(iw, x2 + pad)
+
+            if x2 > x1 and y2 > y1:
+                apply_fn(img_arr, x1, y1, x2, y2)
+                count += 1
+
+    return count
+
+
+# ---------------------------------------------------------------------------
+# E7（赵辉，第5批，2026-10-09）：图片年份选区打码
+# 图片中 OCR 识别的年份（如"2025.3.31"），只打年份部分，月日保留
+# ---------------------------------------------------------------------------
+
+_YEAR_PAT = _re.compile(r'20[12]\d')
+
+
+def _apply_year_spans_by_block(img_arr, ocr_data: dict, apply_fn,
+                                pad: int = 2) -> int:
+    """
+    E7（赵辉，第5批，2026-10-09）：对 OCR 文本块中检测到的年份（20xx），
+    按字符占比计算像素区间并打码。只打年份段，月日保留
+    （如 2025.3.31 → ████.3.31）。
+    返回打码处数。
+    """
+    ih, iw = img_arr.shape[:2]
+    count = 0
+    n = len(ocr_data["text"])
+
+    for i in range(n):
+        text = ocr_data["text"][i].strip()
+        if not text:
+            continue
+
+        x = ocr_data["left"][i]
+        y = ocr_data["top"][i]
+        bw = ocr_data["width"][i]
+        bh = ocr_data["height"][i]
+        text_len = len(text)
+
+        if text_len == 0:
+            continue
+
+        for m in _YEAR_PAT.finditer(text):
+            year_start = m.start()
+            year_end = m.end()
+            char_width = bw / text_len
+            x1 = int(x + year_start * char_width)
+            x2 = int(x + year_end * char_width)
+            y1 = max(0, y - pad)
+            y2 = min(iw, y + bh + pad)
+            x1 = max(0, x1 - pad)
+            x2 = min(iw, x2 + pad)
+
+            if x2 > x1 and y2 > y1:
+                apply_fn(img_arr, x1, y1, x2, y2)
+                count += 1
+
+    return count
+
+
+# ---------------------------------------------------------------------------
 # 银行 Logo 检测
 # ---------------------------------------------------------------------------
 
@@ -228,9 +440,26 @@ def redact_image(input_path: str, output_path: str = None,
     # ① 检测银行 Logo 区域
     logo_regions = detect_logo_regions(img_arr)
 
-    # ② 对每个 OCR 文本块执行脱敏
+    # ② 脱敏方法
     apply_fn = {"mosaic": _apply_mosaic, "blur": _apply_blur, "black": _apply_black}.get(method)
 
+    # ②-a E7（赵辉，第5批，2026-10-09）：图片年份选区打码
+    # 先于整行打码，只打年份段不打破月日
+    year_count = _apply_year_spans_by_block(img_arr, ocr_data, apply_fn, pad=2)
+    if year_count > 0:
+        counts["年份选区遮盖"] = counts.get("年份选区遮盖", 0) + year_count
+        print(f"  [E7] 年份选区打码 {year_count} 处")
+
+    # ②-b D1（赵辉，第5批，2026-10-09）：OCR 字符区间姓名打码
+    # 只打姓名区间不打整行，按字符比例映射像素坐标
+    name_span_count = _apply_name_spans_by_block(img_arr, ocr_data, apply_fn, pad=3)
+    if name_span_count > 0:
+        counts["姓名区间遮盖"] = counts.get("姓名区间遮盖", 0) + name_span_count
+        print(f"  [D1] 姓名区间打码 {name_span_count} 处")
+
+    # ②-c 整行块级兜底（规则层应用整块文本，若块内容含敏感词则整块打码；
+    # D1 已处理姓名区间场景，兜底覆盖其他类型敏感词）
+    block_count = 0
     for i in range(n_boxes):
         text = ocr_data["text"][i].strip()
         if not text:
@@ -252,7 +481,10 @@ def redact_image(input_path: str, output_path: str = None,
 
         if x2 > x1 and y2 > y1:
             apply_fn(img_arr, x1, y1, x2, y2)
-            counts["文本遮盖"] = counts.get("文本遮盖", 0) + 1
+            block_count += 1
+
+    if block_count > 0:
+        counts["文本遮盖"] = counts.get("文本遮盖", 0) + block_count
 
     # ③ 对 Logo 区域执行纯色填充（R-㉚，v1.3.9，响应 Issue #15-C11，赵辉）：
     # 纯色填充（周边众数取色）优于马赛克，对大色块 Logo 效果更好

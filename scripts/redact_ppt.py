@@ -29,7 +29,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from common_rules import apply_redactions, apply_redactions_counted, find_libreoffice
 from common_rules import redistribute_paragraph, redact_filename_stem
 from common_rules import set_agent_decisions_override, _get_skip_texts
-from table_role_detector import process_ppt_slide_xml
+from table_role_detector import process_ppt_slide_xml, collect_table_names
+from common_rules import inject_extra_names, clear_extra_names
 from html import unescape as _html_unescape
 from xml.sax.saxutils import escape as _xml_escape
 
@@ -78,6 +79,15 @@ def redact_pptx(input_path: str, output_path: str) -> dict:
         # ② 处理幻灯片 XML（正文/文本框/形状）
         slides_dir = tmp_dir / "ppt" / "slides"
         if slides_dir.exists():
+            # D15（赵辉，第5批，2026-10-09）：预扫所有幻灯片表格，收集角色列姓名
+            all_slides_content = ""
+            for xml_file in sorted(slides_dir.glob("slide*.xml")):
+                all_slides_content += xml_file.read_text("utf-8")
+            if all_slides_content:
+                names = collect_table_names(all_slides_content)
+                if names:
+                    inject_extra_names(names)
+                    print(f"  [D15] 表格姓名注入 {len(names)} 个 → 全文联动脱敏")
             for xml_file in sorted(slides_dir.glob("slide*.xml")):
                 c = _process_xml_file(xml_file, f"幻灯片 {xml_file.stem}")
                 _merge_counts(counts, c)
@@ -119,6 +129,7 @@ def redact_pptx(input_path: str, output_path: str) -> dict:
                     zf.write(fp, arcname)
 
     finally:
+        clear_extra_names()  # D15：清空表格姓名收集，避免跨文档污染
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
     return counts

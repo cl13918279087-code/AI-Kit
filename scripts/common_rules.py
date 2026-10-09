@@ -33,6 +33,30 @@ GRAY_CONFIDENCE_THRESHOLD = 0.75  # ≥ 此值 → 自动遮盖；< 此值 → �
 # 全局 Agent 评审决策路径（由 redact_all.py 调用 set_agent_decisions_override() 设置）
 _AGENT_DECISIONS_OVERRIDE: str = None
 
+# ---------------------------------------------------------------------------
+# D15（赵辉，第5批，2026-10-09）：表格列姓名预扫 → 全局注入
+# 表头驱动列姓名预扫 → 注入本集合 → 全文同名替换
+# 防止正文引用"王根利的B角"等不在表格列内的人名漏脱
+# ---------------------------------------------------------------------------
+_EXTRA_NAMES: set = set()
+
+
+def inject_extra_names(names: set) -> None:
+    """注入表格列预扫收集到的额外姓名，供 apply_redactions_counted 全局使用"""
+    global _EXTRA_NAMES
+    _EXTRA_NAMES.update(names)
+
+
+def get_extra_names() -> set:
+    """返回当前已注入的额外姓名集合"""
+    return _EXTRA_NAMES
+
+
+def clear_extra_names() -> None:
+    """清空额外姓名集合（文档处理完成后调用）"""
+    global _EXTRA_NAMES
+    _EXTRA_NAMES.clear()
+
 
 def set_agent_decisions_override(path: str) -> None:
     """设置 Agent 评审决策文件路径（由 redact_all.py 调用）"""
@@ -1836,6 +1860,17 @@ def apply_redactions_counted(text: str) -> Tuple[str, Dict[str, int]]:
             result = apply_r4_name_pass(result, counts, mode=get_name_mode())
     except ImportError:
         pass  # R4 模块不可用时降级
+
+    # D15（赵辉，第5批，2026-10-09）：表格列姓名预扫 → 全局注入
+    # 在所有规则链之后，对预扫收集到的额外姓名做全文替换
+    if _EXTRA_NAMES:
+        _name_repl = get_replacement("NAME", "XXX")
+        for name in _EXTRA_NAMES:
+            if name and len(name) >= 2:
+                # 使用词边界保护，避免子串误伤
+                pat = re.compile(rf'(?<!\w){re.escape(name)}(?!\w)')
+                result, n = _counting_sub(pat, result, _name_repl, counts)
+                # 计数已由 _counting_sub 处理
 
     return result, counts
 
