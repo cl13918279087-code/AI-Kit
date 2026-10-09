@@ -39,6 +39,13 @@ _ROLE_COLUMN_EXCLUDED: Set[str] = {
     "项目组", "专家组", "评审组", "实施组",
     "编号", "序号", "序列", "项目", "阶段", "日期",
     "任务", "模块", "系统",
+    # E2（赵辉，第3批，2026-10-08）：设备/网络/系统列名不触发角色列检测
+    "服务器", "主机", "虚拟机", "数据库", "存储", "备份",
+    "网络设备", "交换机", "路由器", "防火墙", "安全设备",
+    "应用系统", "中间件", "操作系统", "软件", "版本",
+    "IP地址", "MAC地址", "端口", "带宽", "线路",
+    "机房", "机柜", "设备", "终端", "工作站",
+    "云资源", "容器", "集群", "节点", "实例",
 }
 
 
@@ -51,6 +58,21 @@ def _bulk_redact_chinese(text: str) -> Tuple[str, int]:
     """
     if not text:
         return text, 0
+
+    # E1（赵辉，第3批，2026-10-08）：整格成句跳过
+    # 单元格内容为完整句子（≥15字，含句末标点/动词结构）时跳过整格，
+    # 不对格内2-4字块单独脱敏（如"需求、开发、测试"整格保留）
+    stripped = text.strip()
+    if len(stripped) >= 15 and any(
+        stripped.endswith(p) for p in ("。", "，", "；", "！", "？", "：", "、", "…")
+    ):
+        return text, 0
+
+    # E2（赵辉，第3批）：设备/网络列整格跳过
+    # 当单元格内容命中设备关键词时，跳过整格不脱敏
+    for excl in _ROLE_COLUMN_EXCLUDED:
+        if excl in stripped and len(stripped) >= 2:
+            return text, 0
 
     def _repl(m: re.Match) -> str:
         word = m.group(0)

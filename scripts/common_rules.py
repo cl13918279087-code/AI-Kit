@@ -214,6 +214,9 @@ EXCLUDED_COMMON_WORDS: set = {
     "行方", "甲方", "乙方", "双方", "各方", "责任方", "承建方", "建设方",
     "业主方", "相关方", "公司方", "厂商方", "业务方", "实施方", "需求方",
     "提供方", "服务方", "设计方", "测试方", "运维方", "评审方", "验收方",
+    # D8/F1（赵辉，第3批）：含名字池字符的角色词保护（防责/宏/海等字误捕角色词）
+    "负责", "主任", "副主任", "经理", "副经理", "总监", "副总监",
+    "组长", "副组长", "管理员", "操作员",
 }
 
 
@@ -1445,7 +1448,52 @@ _ROLE_KEYWORDS = (
 # R-㉙（v1.3.9，响应 Issue #15-C10，赵辉）：角色槽位姓名三件套
 # 1. 精确排除表：含这些词整段跳过，不误伤"成员：需求、开发、测试人员"
 _ROLE_EXCLUDED_PHRASES = {"需求", "开发", "测试", "技术", "业务", "项目", "产品",
-                           "运营", "市场", "设计", "运维", "安全", "数据", "算法"}
+                           "运营", "市场", "设计", "运维", "安全", "数据", "算法",
+                           "模块", "系统", "版本", "编号", "任务", "阶段", "日期"}
+
+# D8（赵辉，第3批，2026-10-08）：角色槽位连词守卫
+# "王力和张明"中"张明"前导"和"，姓名规则无法触发；连词两侧均脱敏
+# 约束：连词两侧必须是"姓氏字+名字用字"，避免捕到任意CJK块
+# 延迟构建（在模块加载时通过 _load_config 读取，避免循环依赖）
+_role_conj_re_cache: Optional[re.Pattern] = None
+
+def _get_role_conjunction_re() -> re.Pattern:
+    global _role_conj_re_cache
+    if _role_conj_re_cache is not None:
+        return _role_conj_re_cache
+    cfg = _load_config()
+    sp = cfg.get("surname_pool", "")
+    if not sp:
+        sp = "赵钱孙李周吴郑王冯陈褚卫蒋沈韩杨朱秦尤许何吕施张孔曹严华金魏陶姜戚谢邹喻柏水窦章云苏潘葛奚范彭郎鲁韦昌马苗凤花方俞任袁柳酆鲍史唐费廉岑薛雷贺倪汤滕殷罗毕郝邬安常乐于时傅皮卞齐康伍余元卜顾孟平黄和穆萧尹姚邵湛汪祁毛禹狄米贝明臧计伏成戴谈宋茅庞熊纪舒屈项祝董梁杜阮蓝闵席季麻强贾路娄危江童颜郭梅盛林刁钟徐骆高夏蔡田樊胡凌霍虞万支柯昝管卢莫经房裘缪干解应宗丁宣邓单洪包诸左石崔吉钮龚林门龙段郑孔牛童浦施零厉付肖闫覃刘"
+    np_chars = cfg.get("name_pool", "伟强志建华文静宇轩浩然俊杰明辉晨曦")
+    surname_alt = "|".join(re.escape(c) for c in sp)
+    name_class = "[" + np_chars + "]"
+    _role_conj_re_cache = re.compile(
+        rf'({surname_alt}{name_class}{{1,3}})(和|与|及|或者|以及)'
+        rf'({surname_alt}{name_class}{{1,3}})'
+    )
+    return _role_conj_re_cache
+
+# H1/D11/D16（赵辉，第3批）：顿号名单保形 + 序号守卫
+# 顿号列表逐块替换天然保形；追加"第X名"等序号结构防误捕
+_ROLE_LIST_EXCLUDED = {
+    "等", "如下", "包括", "共计", "合计", "共", "名",
+    "第一名", "第二名", "第三名", "第四名", "第五名",
+    "第六名", "第七名", "第八名", "第九名", "第十名",
+    "倒数第一", "倒数第二", "倒数第三",
+}
+
+# F1~F6/G1（赵辉，第3批）：桂林/柳州场景口径
+_ROLE_EXCLUDED_PHRASES.update({
+    "桂林银行", "柳州银行", "南宁分行", "桂林分行", "柳州分行",
+    "广西分行", "北部湾银行", "桂银", "柳银",
+    "桂分", "桂行", "柳分", "柳行",
+    "漓江", "桂山", "桂林", "柳州",
+    "桂林市", "柳州市", "南宁市", "梧州市", "北海市",
+    "防城港市", "钦州市", "贵港市", "玉林市", "百色市",
+    "贺州市", "河池市", "来宾市", "崇左市",
+})
+
 # 2. 角色前缀扩展 + 姓名捕获（token 完整性断言）
 # 形态："核心业务组：蔡元龙"、"测试组：张三"、无冒号"负责人李四"
 _ROLE_NAME_RE = re.compile(
@@ -1524,6 +1572,11 @@ def _apply_role_context_pass(text: str, counts: Dict[str, int]) -> str:
             return matched_text
         new_line = _ADJUST_RECORDS_RE.sub(_adjust_repl, new_line)
         new_line = _ADJUST_RECORDS_RE.sub(_adjust_repl, new_line)
+        # D8（赵辉）：连词守卫——"王力和张明"中"和"两侧姓名均脱敏
+        def _conj_repl(m: re.Match) -> str:
+            counts["姓名"] = counts.get("姓名", 0) + 2
+            return "XXX" + m.group(2) + "XXX"
+        new_line = _get_role_conjunction_re().sub(_conj_repl, new_line)
         out_lines.append(new_line)
     return "\n".join(out_lines)
 
@@ -1551,7 +1604,7 @@ _NAME_BLOCK_RE = re.compile(
     "[\u4e00-\u9fa5]{2,4}"
 )
 # 排除词（不含语义的角色词/常见词）
-_ANCHOR_EXCLUDED_NAMES = {
+_ANCHOR_EXCLUDED_NAMES: set = {
     "今日", "昨日", "明日", "一组", "二组", "三组", "四组",
     "本组", "各组", "组长", "组员", "核心", "开发",
     "测试", "业务", "运维", "项目", "专家", "评审",
@@ -1559,6 +1612,8 @@ _ANCHOR_EXCLUDED_NAMES = {
     "负责", "协办", "承办", "编制", "审核", "批准",
     "拟稿", "校对", "分发", "参会", "需求",
 }
+# D11/D16/H1（赵辉，第3批）：合并顿号名单保形守卫 + 序号守卫
+_ANCHOR_EXCLUDED_NAMES.update(_ROLE_LIST_EXCLUDED)
 
 
 def _apply_anchor_expand_pass(text: str, counts: Dict[str, int]) -> str:
