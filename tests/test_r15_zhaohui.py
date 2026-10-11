@@ -291,6 +291,74 @@ def test_filename_stem():
     print(f"✅ filename_stem: {s1!r} / {s2!r}")
 
 
+# ---------------------------------------------------------------------------
+# H4（赵辉，第4批）：XML 属性重写必须保留 `=`（通用缺陷警示）
+#
+# 背景：chart rels / 嵌入件 XML 中属性改写回调若返回 `m.group(1)+'"'+新值+'"'`
+# 而非 `m.group(1)+'="'+新值+'"'`，会丢失 `=` → 非法 XML，lxml 解析失败。
+#
+# 当前仓库实现：XML 写入全部走 apply_redactions（纯文本替换，不碰属性），
+# 故此 bug 不存在。本测试验证替换结果仍保持 XML 合法。
+# ---------------------------------------------------------------------------
+
+def test_h4_xml_wellformed_no_attr_rewrite():
+    """
+    H4（赵辉，第4批）：验证 apply_redactions 对 XML 片段的输出仍为合法 XML。
+    关键验证点：
+      1. XML 属性值内的敏感词被替换时，`=` 不丢失
+      2. `<a:t>姓名</a:t>` 类 run 替换后 XML 结构完整
+      3. 不出现 `属性名"值"`（缺少 `=`）的非法形态
+    """
+    # 场景1：XML 属性值含银行名
+    xml1 = '<Relationship Id="rId1" Target="云南红塔银行.xlsx" />'
+    out1 = cr.apply_redactions(xml1)
+    assert "=" in out1, f"H4-1: 等号丢失：{out1!r}"
+    assert 'Target"' not in out1, f"H4-1: 属性值格式非法（缺等号）：{out1!r}"
+    assert "云南红塔银行" not in out1, f"H4-1: 银行名未脱敏：{out1!r}"
+    print(f"✅ H4-1 XML属性银行名: {xml1!r} -> {out1!r}")
+
+    # 场景2：`<a:t>` run 含姓名（用3字姓名，系统可识别）
+    xml2 = '<a:t>王明</a:t><a:t>联系电话13812345678</a:t>'
+    out2 = cr.apply_redactions(xml2)
+    assert "<a:t>" in out2 and "</a:t>" in out2, f"H4-2: XML 标签丢失：{out2!r}"
+    assert "王明" not in out2, f"H4-2: 姓名未脱敏：{out2!r}"
+    assert "13812345678" not in out2, f"H4-2: 手机号未脱敏：{out2!r}"
+    print(f"✅ H4-2 XML run姓名: {xml2!r} -> {out2!r}")
+
+    # 场景3：`<w:t>` run 含身份证
+    xml3 = '<w:t>身份证110101199003072345</w:t>'
+    out3 = cr.apply_redactions(xml3)
+    assert "<w:t>" in out3 and "</w:t>" in out3, f"H4-3: XML 标签丢失：{out3!r}"
+    assert "110101199003072345" not in out3, f"H4-3: 身份证未脱敏：{out3!r}"
+    print(f"✅ H4-3 XML run身份证: {xml3!r} -> {out3!r}")
+
+    # 场景4：XML 属性含日期
+    xml4 = '<Property id="birthday" value="2025年10月8日" />'
+    out4 = cr.apply_redactions(xml4)
+    assert "=" in out4, f"H4-4: 等号丢失：{out4!r}"
+    assert 'value"' not in out4, f"H4-4: 属性值格式非法（缺等号）：{out4!r}"
+    assert "2025年10月8日" not in out4, f"H4-4: 日期未脱敏：{out4!r}"
+    print(f"✅ H4-4 XML属性日期: {xml4!r} -> {out4!r}")
+
+    # 场景5：chart rels 形态（含 Target 属性，模拟 H4 原始 bug 场景）
+    xml5 = '<Relationship Id="rId5" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/package" Target="file:///embeddings/红塔银行项目2025年数据.xlsx" />'
+    out5 = cr.apply_redactions(xml5)
+    assert "=" in out5, f"H4-5: 等号丢失：{out5!r}"
+    assert 'Target"' not in out5, f"H4-5: 属性值格式非法（缺等号）：{out5!r}"
+    assert "红塔银行" not in out5, f"H4-5: 银行名未脱敏：{out5!r}"
+    print(f"✅ H4-5 chart rels Target: {xml5!r} -> {out5!r}")
+
+    # 场景6：验证 `<a:t>` run 替换后标签对仍完整
+    xml6 = '<a:r><a:t>负责人王明</a:t></a:r>'
+    out6 = cr.apply_redactions(xml6)
+    assert out6.count("<a:t>") == out6.count("</a:t>"), \
+        f"H4-6: XML 标签对不平衡：{out6!r}"
+    assert "王明" not in out6, f"H4-6: 姓名未脱敏：{out6!r}"
+    print(f"✅ H4-6 XML run标签对: {xml6!r} -> {out6!r}")
+
+    print("✅ H4（XML属性重写保留等号）全部场景通过")
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("R15 回归测试（贡献者：赵辉） — common_rules 规则中心")
@@ -317,6 +385,7 @@ if __name__ == "__main__":
     test_address_tail()
     test_counted_api()
     test_filename_stem()
+    test_h4_xml_wellformed_no_attr_rewrite()
 
     print("=" * 60)
     print("全部测试通过 ✅")

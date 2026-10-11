@@ -465,14 +465,15 @@ class TestAddressRules:
         """
         R-B：支行/分行 回溯时，乡村街路巷弄是地名成分（"新乡分行"）。
 
-        实际行为："新乡分行"中"新"不是姓氏字（不在姓氏集），
-        "乡分行"回溯时前缀"新"不足2字 → 保护跳过，不产生 XX分行。
-        "分行"作为独立词（standalone_suffix）被替换为 "XXXX"。
-        "新乡"前缀不足2字，保留原文。
+        D10（第6批，2026-10-09）修正：
+        独立分行/支行被替换为 XX分行/XX支行（保留后缀语义），
+        而非原版的 XXXX（后缀消失）。"新乡"前缀不足2字，保留原文。
+
+        实际行为："新乡分行" → "XX分行"（分行被替换为 XX分行，保留"分行"后缀）
         """
         result = common_rules.apply_redactions("新乡分行")
-        # 验证"分行"被替换（无论以什么形式）
-        assert "分行" not in result, f"分行未被替换: {result}"
+        # 验证"分行"被替换为 XX分行（不再是"XXXX"，而是"XX分行"保留后缀）
+        assert result == "XX分行", f"新乡分行 期望 XX分行，实际: {result!r}"
 
     def test_address_with_demo_char_protected(self):
         """指示词场景（这栋大楼）不应被误判为地址。"""
@@ -853,8 +854,7 @@ class TestIntegration:
 
     def test_no_false_positive_on_common_terms(self):
         """常用词/术语不应产生误报。"""
-        # "分行"作为 standalone_suffix 被替换为 XXXX（独立银行网点词，非误报）
-        # "总行"/"支行" 也在 standalone_suffixes 中，同理
+        # 通用词/术语（系统/流程/说明书等）不应被替换
         terms_safe = [
             "系统", "业务系统", "核心系统",
             "流程", "操作流程", "演练", "版本",
@@ -865,9 +865,10 @@ class TestIntegration:
             result = common_rules.apply_redactions(term)
             assert "XXX" not in result, f"常用词 {term!r} 被错误替换为 XXX"
 
-        # 验证 standalone suffix（独立网点词）被正确替换
+        # D10（第6批，2026-10-09）修正：
+        # 独立分行/支行被替换为 XX分行/XX支行（保留后缀语义），而非 XXXX
         result_branch = common_rules.apply_redactions("分行")
-        assert "分行" not in result_branch, f"独立分行未被替换: {result_branch}"
+        assert result_branch == "XX分行", f"独立分行 期望 XX分行，实际: {result_branch!r}"
 
 
 # ---------------------------------------------------------------------------

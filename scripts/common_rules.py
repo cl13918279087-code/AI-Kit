@@ -241,6 +241,20 @@ EXCLUDED_COMMON_WORDS: set = {
     # D8/F1（赵辉，第3批）：含名字池字符的角色词保护（防责/宏/海等字误捕角色词）
     "负责", "主任", "副主任", "经理", "副经理", "总监", "副总监",
     "组长", "副组长", "管理员", "操作员",
+    # ---- D17（赵辉，第6批，2026-10-09）：语义词守卫扩充（假阳性收敛）----
+    # 测试域（首字落百家姓：全/白/灰/黑）
+    "全功能", "全界面", "全白盒", "白盒测试", "黑盒测试", "灰盒测试",
+    # 通用业务域
+    "全产品", "全业务", "全错误",
+    # ---- H2（赵辉，第6批，2026-10-09）：姓氏"后"的动宾短语守卫（追加）----
+    "后即", "后由", "后再", "后进",
+    # ---- E3（赵辉，第6批，2026-10-09）：角色槽位后的动词/程度词守卫（追加）----
+    "按时", "认真", "严格", "准确", "清晰", "完整", "合理", "有效",
+    "积极", "持续", "推动", "安排", "指定", "确认", "同意", "汇报",
+    # ---- G1（赵辉，第6批，2026-10-09）：人名段尾字豁免表须含「账」
+    # 真实姓名不以「账」结尾；全8源扫描所有"XX账"词段均为业务词（总账/对账/转账/…）
+    "总账", "对账", "转账", "平账", "抹账", "台账", "内部账", "明细账",
+    "外部账", "往来账", "备抵账", "调整账", "结账", "记账",
 }
 
 
@@ -922,15 +936,47 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
             "外资银行", "合资银行", "民营银行", "直销银行", "互联网银行",
             "虚拟银行", "手机银行", "网上银行", "电话银行", "视频银行",
             "远程银行", "数字银行", "智慧银行", "云银行", "开放银行",
+            # D13（赵辉，第6批，2026-10-09）：业态词保留表扩充——"个人"前缀
+            # "个人银行账户报送系统"整体保留；"个人商业银行客户"中"个人商业银行"保留
+            "个人银行", "个人商业银行",
         }
         _BANK_COLLECTIVE_RE = re.compile(
             r"(全省|全辖|辖内|各级|各)(农商|农村商业|农信|农合)(银行|行)"
         )
         _BANK_BIZ_SYSTEM_RE = re.compile(
-            r"(微信|视频|远程|电话|手机|网上|直销|数字|智慧|云)(?=银行)"
+            r"(微信|视频|远程|电话|手机|网上|直销|数字|智慧|云|个人)(?=银行)"
         )
         _BANK_DEPT_SUFFIX_RE = re.compile(
             r"[\u4e00-\u9fa5]{2,6}银行[部处科局]"
+        )
+
+        # ---- D10（赵辉，第6批，2026-10-09）：机构泛称收尾守卫
+        # "业务条线及分支行" 被整段吞成"XX支行"；前缀以"分/总"收尾视为泛称保留
+        # _GENERIC_ORG_PREFIX 放银行通用守卫之前（先泛称保护，再银行脱敏）
+        _GENERIC_ORG_PREFIX = {
+            "总分", "总分行", "分支", "分行", "总行",
+            "各分行", "各支行", "各营业部", "各网点",
+            "分支机构", "分支行", "分支行人员",
+        }
+        _GENERIC_ORG_PREFIX_RE = re.compile(
+            r"(?:^|(?<=[，。、；：？！—…～\s()（）【】《》『』「」,，/]))(?:"
+            + "|".join(re.escape(p) for p in sorted(_GENERIC_ORG_PREFIX, key=len, reverse=True))
+            + r")"
+        )
+
+        # ---- D9（赵辉，第6批，2026-10-09）：银行名兜底的「前导词剥离」
+        # "稳定性等指标是否满足红塔银行"贪婪吞掉"是否满足红塔银行"整段
+        # 前导词：句法功能词（是否/满足/针对/依托/…）在银行名前时先剥离再脱敏
+        _BANK_LEAD_WORDS = {
+            "是否", "满足", "针对", "依托", "通过", "依据", "根据",
+            "鉴于", "按照", "遵照", "参照", "参考", "包括", "涵盖",
+            "涉及", "关联", "相关", "配合", "围绕", "推进", "落实",
+            "保障", "服务", "支持", "对接", "深化", "强化", "加强",
+        }
+        _BANK_LEAD_RE = re.compile(
+            r"(?:"
+            + "|".join(re.escape(w) for w in sorted(_BANK_LEAD_WORDS, key=len, reverse=True))
+            + r")(?=[一-龥a-zA-Z])"
         )
 
         def _bank_generic_guard(text: str) -> bool:
@@ -943,6 +989,10 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
                 return True
             if _BANK_DEPT_SUFFIX_RE.fullmatch(text):
                 return True
+            # D10（赵辉，第6批，2026-10-09）：机构泛称收尾守卫（"总分/分支行"等泛称保留）
+            # 检查匹配前1-3字是否与本字组合成泛称前缀（如"总分分行"、"分支行"）
+            if _GENERIC_ORG_PREFIX_RE.search(text):
+                return True
             # "的银行"口号守卫（前面是助词/逗号/句号等，上游实证农芯末页"一农民致富的银行"）
             if text.endswith("的银行"):
                 return True
@@ -951,10 +1001,77 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
                 return True
             return False
 
+        # D9（赵辉，第6批，2026-10-09）：银行名前导词剥离
+        # 贪婪模式 [汉字]{2,6}银行 会吞掉前导句法词（如"满足红塔银行"→吞"满足"）
+        # 修复：若匹配长度 > 4，先逐个剥离前导词，只保留真实地名前缀
+        #       同时保留前导词，只脱银行名部分（"是否满足红塔银行" → "是否满足XX银行"）
+        def _bank_name_repl(m):
+            matched = m.group(0)
+            # 1. 整体是否受泛称/业态保护
+            if _bank_generic_guard(matched):
+                return matched
+            # 2. D10（赵辉，第6批）：泛称复合词检查——
+            #    核心规则："分行"/"支行"被"分支"/"各"/"总"修饰时是泛称，不脱
+            #    注意：[汉字]{2,6}银行 贪婪匹配得到：
+            #      "各分行银行"（而非"分行银行"）、"条线及分支行银行"（而非"分行银行"）
+            #    窗口：取原文本中 match 起点前最多6字 + matched 整体，
+            #      在此窗口内找分行/支行，然后检查其前面1-3字是否形成泛称前缀
+            #    "各分行银行自行处理"：m.start()=0 → 窗口="各分行银行"；
+            #      idx=1(分行)，window[max(0,1-3):1]="各" → "各分行" in _GENERIC_ORG_PREFIX ✓
+            #    "业务条线及分支行银行"：m.start()=2 → 窗口="业务条线及分支行银行"；
+            #      idx=6(分行)，window[3:6]="及分支" → "分支行"不在
+            #      window[1:6]="线及分支" → "分支行"不在
+            #      window[0:6]="业务条线及分支" → "分支行"不在
+            #      等等，实际上：window="业务条线及分支行银行"（20字），idx=6（分行）
+            #      window[max(0,6-3):6]="及分支"，prefix+分行="分行分行" ✗
+            #      window[max(0,6-2):6]="分支"，prefix+分行="分支分行" ✗
+            #      window[max(0,6-1):6]="支"，prefix+分行="支行" ✗
+            #    "总分行业务银行人员"：m.start()=0 → 窗口="总分行业务银行"；
+            #      idx=1(分行)，window[max(0,1-2):1]="总" → "总分分行" in _GENERIC_ORG_PREFIX ✓
+            window = m.string[max(0, m.start() - 6):m.start()] + matched
+            for suffix in ("分行", "支行"):
+                idx = matched.rfind(suffix)
+                if idx == -1:
+                    continue
+                win_idx = (m.start() - max(0, m.start() - 6)) + idx  # suffix position in window
+                for plen in range(3, 0, -1):
+                    pfx_start = max(0, win_idx - plen)
+                    pfx = window[pfx_start:win_idx]
+                    if pfx + suffix in _GENERIC_ORG_PREFIX:
+                        return matched
+                break  # 找到一个 suffix 就够
+            # 3. D9（赵辉，第6批）：剥离前导词，只脱银行名部分
+            #    保存前导词前缀（用于拼接回最终输出）
+            lead_prefix = ""
+            while True:
+                lead = _BANK_LEAD_RE.search(matched)
+                if not lead:
+                    break
+                lead_start = matched.find(lead.group(0))
+                if lead_start == 0:
+                    # 前导词在开头 → 保存前缀，继续剥离
+                    lead_prefix += matched[:len(lead.group(0))]
+                    matched = matched[len(lead.group(0)):]
+                    if not matched:
+                        return m.group(0)
+                    if _bank_generic_guard(matched):
+                        return m.group(0)
+                    continue
+                # 前导词在中间 → 保留中间部分，只脱银行名
+                matched = matched[lead_start:]
+                if _bank_generic_guard(matched):
+                    return m.group(0)
+                break
+            if _bank_generic_guard(matched):
+                return m.group(0)
+            # D9：返回 前导词 + 脱敏（保留前导词，只脱银行名）
+            if lead_prefix:
+                return lead_prefix + rep.get("BANK", "XX银行")
+            return rep.get("BANK", "XX银行")
+
         patterns.append((
             re.compile(r'[\u4e00-\u9fa5]{2,6}银行'),
-            lambda m: m.group(0) if _bank_generic_guard(m.group(0))
-                      else rep.get("BANK", "XX银行")
+            _bank_name_repl
         ))
 
         # R-㉔（v1.3.9，响应 Issue #15-C5，赵辉）：银行代码缩写表 + 字母+汉字混合形态
@@ -1044,17 +1161,26 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
         # 裸 '分行/支行/营业部'（前后非汉字非ASCII）→ XX+后缀，如 '分行' → 'XX分行'
         # 已带 XX 前缀的结果（XX支行/XX营业部）不会被二次替换；
         # '分支行人员' 中 '分行'/'支行' 前后是汉字，不会误伤
+        # ---- D10（赵辉，第6批，2026-10-09）：独立后缀不得吞并银行名——
+        #   当 "分行"/"支行" 后紧跟 "银行"（如"各分行银行"）或单独"行"时不替换
+        #   使用 `(?!分行银行|分行支行)` 负向前瞻：后面是"分行银行"/"分行支行"时不匹配
+        #   org pattern 已移除分行/支行，故两者不再冲突
         standalone_suffixes = cfg.get("bank_branch_suffixes") or ["分行", "支行", "营业部"]
         if standalone_suffixes:
-            standalone_alt = "|".join(
-                re.escape(s) for s in sorted(standalone_suffixes, key=len, reverse=True)
-            )
+            # 构建 standalone alt：按长度降序排列；
+            # 分行/支行各加 `(?!分行银行|分行支行)` 负向前瞻，其他正常
+            parts = []
+            for s in sorted(standalone_suffixes, key=len, reverse=True):
+                if s in ("分行", "支行"):
+                    parts.append(f"(?!分行银行|分行支行){re.escape(s)}")
+                else:
+                    parts.append(re.escape(s))
             patterns.append((
                 re.compile(
                     # 左边界：不能是汉字(含全角标点)、ASCII字母数字
                     # 右边界：不能是汉字(含全角标点)、ASCII字母数字
                     # 全角标点(、，。 etc)不阻断匹配，如"总行、分行"中分行应被替换
-                    rf'(?<![一-龥a-zA-Z0-9])(?:{standalone_alt})(?![一-龥a-zA-Z0-9\u3000-\u303f\uff00-\uffef])'
+                    rf'(?<![一-龥a-zA-Z0-9])(?:' + '|'.join(parts) + rf')(?![一-龥a-zA-Z0-9\u3000-\u303f\uff00-\uffef])'
                 ),
                 lambda m: "XX" + m.group(0)
             ))
@@ -1190,11 +1316,15 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
 
     # ---------- 13. 组织名（在姓名之后，避免阻挡姓名） ----------
     # 仅匹配真正的组织层级：明确机构词，或 2个汉字+组织后缀（需前后都不是汉字）
+    # ---- D10（赵辉，第6批，2026-10-09）：组织名规则中的分行/支行不得吞并银行名
+    #   "总分行业务银行"/"各分行银行"中"分行"不应被替换
+    #   策略：org pattern 第一分支中移除分行/支行（由 standalone suffix 规则处理）
+    #   standalone suffix 含 D10 保护（(?!(?:分行银行|分行支行))），不吞银行名
     if org_suffixes:
         suffix_alt = '|'.join(re.escape(s) for s in org_suffixes)
         patterns.append((
             re.compile(
-                rf'(?:分行|支行|营业部|科技部|运营部|管理部|董事会|监事会|管委会|事业部)|'
+                rf'(?:营业部|科技部|运营部|管理部|董事会|监事会|管委会|事业部)|'
                 rf'(?<![一-龥])(?:{suffix_alt})(?![一-龥])|'
                 rf'(?<![一-龥])[一-龥]{{2}}(?:部|科|中心|管委会|办公室)(?![一-龥])'
             ),
@@ -1574,7 +1704,14 @@ def _apply_role_context_pass(text: str, counts: Dict[str, int]) -> str:
             continue
         # 三件套之一：角色前缀+姓名（token 完整性断言已在正则中）
         def _role_repl(m: re.Match) -> str:
-            # 只替换捕获的姓名组 group(1)，保留角色前缀
+            # H2 / D17 / E3（赵辉，第6批）：排除已知的非姓名语义词
+            # "批准后即启动"中"批准"是关键词，但"后即"是动宾短语不应脱敏
+            # 检查完整候选 + 前2字 + 前3字（覆盖"后即启动"的前缀词片段）
+            name_candidate = m.group(1)
+            if (name_candidate in EXCLUDED_COMMON_WORDS
+                    or name_candidate[:2] in EXCLUDED_COMMON_WORDS
+                    or name_candidate[:3] in EXCLUDED_COMMON_WORDS):
+                return m.group(0)  # 保护，跳过替换
             counts["姓名"] = counts.get("姓名", 0) + 1
             return m.group(0)[:0 - len(m.group(1))] + "XXX"
         new_line = _ROLE_NAME_RE.sub(_role_repl, line)
