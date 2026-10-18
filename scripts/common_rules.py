@@ -1416,6 +1416,23 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
 # ---------- 13. 人员姓名（2-3个汉字，粗筛） ----------
     # ↓↓↓ 姓名规则从本行开始单独归组：apply_redactions 中地址通道在其之前执行 ↓↓↓
     _pre_pattern_count = len(patterns)
+
+    # D16（陈黎 Issue #45，2026-10）：精确全名匹配（7398人名优先于字符池规则）
+    # - 从 config.json full_name_list 加载 7398 个已知全名
+    # - 长名优先排序（防止"欧阳"截断"欧阳娜娜"）
+    # - 边界：仅排除 ASCII/数字（允许中文连接符如"和/在/是/等"）
+    # - 执行顺序：精确匹配 → 字符池规则
+    _full_name_list: List[str] = cfg.get("full_name_list", [])
+    if _full_name_list:
+        # 长名优先（降序），确保复姓等长名不被短名截断
+        _sorted_names = sorted(_full_name_list, key=len, reverse=True)
+        # 边界：排除 ASCII/数字前后跟随；允许中文跟随（如"邹阳和陈黎"）
+        _exact_pattern_str = '|'.join(re.escape(n) for n in _sorted_names)
+        _exact_pattern = re.compile(
+            rf'(?<![a-zA-Z0-9])(?:{_exact_pattern_str})(?![a-zA-Z0-9])'
+        )
+        patterns.append((_exact_pattern, rep.get("NAME", "XXX")))
+
     # Python 3.9 不支持变长 lookbehind，移除 excluded 检查
     # 姓氏后必须跟 1-2 个名字汉字，防止单字被误判
     # 名字用字池从 config.json name_pool 动态读取
