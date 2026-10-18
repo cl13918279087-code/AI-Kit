@@ -179,43 +179,81 @@ def _rebuild_tc(tc_xml: str, new_text: str) -> str:
     return _PPT_A_T_RE.sub(_repl, tc_xml)
 
 
-def _detect_role_columns_in_ppt_table(tbl_xml: str) -> List[int]:
+def _detect_role_columns_in_ppt_table(tbl_xml: str) -> Tuple[List[int], int]:
     """
-    分析 <a:tbl> XML，检测角色列索引。
-    策略：从第一行（表头行）提取所有单元格文本，
-    含角色词表的单元格标记为角色列；角色列的相邻列一并纳入（姓名列特征）。
+    D15（赵辉，第5批）：逐行判表头——遇有效表头行即停止搜索。
+
+    场景：QRCB s19 表第2行是数据行"组长｜赵维"，其"组长"被误当第二表头，
+    导致角色列被污染（整列打码）且第1行数据被排除在数据区外（"赵维"漏脱）。
+    策略：从第1行开始遍历，每行用同一套排除规则判断是否为有效表头；
+    首次命中即 break，不再扫描后续行（前两行并集方案废弃）。
+
+    返回：(角色列索引列表, 表头行在 rows 数组中的下标)
     """
     rows = list(_PPT_TR_RE.finditer(tbl_xml))
     if not rows:
-        return []
+        return [], -1
 
-    header_row = rows[0]
-    cells = list(_PPT_TC_RE.finditer(header_row.group(0)))
+    # 逐行找表头
+    header_row_idx = -1
+    header_row_m = None
+    for ri, row_m in enumerate(rows):
+        cells = list(_PPT_TC_RE.finditer(row_m.group(0)))
+        if not cells:
+            continue
+        # 排除非空单元格 <2 的合并标题行（如跨列大标题）
+        non_empty = sum(
+            1 for c in cells
+            if _extract_cell_text(c.group(1)).strip()
+        )
+        if non_empty < 2:
+            continue
+        # 检查各列是否有角色关键词
+        found_role = False
+        for col_idx, cell_m in enumerate(cells):
+            cell_text = _extract_cell_text(cell_m.group(1)).strip()
+            if not cell_text:
+                continue
+            # D6/H3 排除规则
+            if any(kw in cell_text for kw in _TBL_HDR_NONNAME):
+                continue
+            if len(cell_text) > 20 or any(cell_text.endswith(p) for p in ('。', '，', '；', '！', '？')):
+                continue
+            if any(cell_text.endswith(end) for end in _TBL_HDR_EXCLUDE_ENDINGS):
+                continue
+            for word in _ROLE_COLUMN_HEADER_WORDS:
+                if re.search(rf'(?<!\w){re.escape(word)}(?!\w)', cell_text):
+                    found_role = True
+                    break
+            if found_role:
+                break
+        if found_role:
+            header_row_idx = ri
+            header_row_m = row_m
+            break  # D15：找到即停止，不并集
+
+    if header_row_idx < 0 or header_row_m is None:
+        return [], -1
+
+    cells = list(_PPT_TC_RE.finditer(header_row_m.group(0)))
     role_cols: List[int] = []
 
     for col_idx, cell_m in enumerate(cells):
         cell_text = _extract_cell_text(cell_m.group(1)).strip()
-        # D6（赵辉，第5批，2026-10-09）：表头列名排除（H3 + 长度 + 结尾词）
-        # ① 排除含设备/品牌词的表头（H3）
         if any(kw in cell_text for kw in _TBL_HDR_NONNAME):
             continue
-        # ② 表头须 ≤20 字（含句读则排除，防止"问题与风险类别"等数据列）
         if len(cell_text) > 20 or any(cell_text.endswith(p) for p in ('。', '，', '；', '！', '？')):
             continue
-        # ③ 表头结尾词排除（如"问题与风险类别"）
         if any(cell_text.endswith(end) for end in _TBL_HDR_EXCLUDE_ENDINGS):
             continue
-        # 精准匹配角色词（词边界保护）
         for word in _ROLE_COLUMN_HEADER_WORDS:
             if re.search(rf'(?<!\w){re.escape(word)}(?!\w)', cell_text):
                 role_cols.append(col_idx)
                 break
 
     if not role_cols:
-        return []
+        return [], header_row_idx
 
-    # 角色列右侧所有列纳入（分工表中，角色列右侧通常全是姓名列）
-    # 左侧保留精确匹配（分工表中姓名列通常在右侧）
     expanded: Set[int] = set(role_cols)
     last_role = max(role_cols)
     # 角色列之后的所有列（姓名列通常在角色关键词列的右侧）
@@ -224,7 +262,7 @@ def _detect_role_columns_in_ppt_table(tbl_xml: str) -> List[int]:
         # 排除纯数字/纯符号列（如序号、金额）
         if adj_text and not re.match(r'^[\d\-+.()]+$', adj_text):
             expanded.add(adj)
-    return sorted(expanded)
+    return sorted(expanded), header_row_idx
 
 
 def process_ppt_table_xml(slide_xml: str) -> Tuple[str, int]:
@@ -242,14 +280,16 @@ def process_ppt_table_xml(slide_xml: str) -> Tuple[str, int]:
     def _process_tbl(m: re.Match) -> str:
         nonlocal total_count
         tbl_xml = m.group(0)
-        role_cols = _detect_role_columns_in_ppt_table(tbl_xml)
+        role_cols, header_idx = _detect_role_columns_in_ppt_table(tbl_xml)
         if not role_cols:
             return tbl_xml
 
-        # 逐行处理（跳过表头行 row[0]）
+        # 逐行处理（跳过真正的表头行）
         rows = list(_PPT_TR_RE.finditer(tbl_xml))
-        new_rows = [rows[0].group(0)]  # 表头行原样保留
-        for row_m in rows[1:]:
+        new_rows = [rows[header_idx].group(0)]  # 表头行原样保留
+        for ri, row_m in enumerate(rows):
+            if ri == header_idx:
+                continue  # 跳过表头行
             row_xml = row_m.group(0)
             cells = list(_PPT_TC_RE.finditer(row_xml))
             # 对角色列执行批量脱敏
@@ -268,7 +308,7 @@ def process_ppt_table_xml(slide_xml: str) -> Tuple[str, int]:
         # 重建表格：保留表头行，替换后续行
         result = tbl_xml
         if len(rows) > 1:
-            body_start = rows[0].end()  # 表头行结束位置
+            body_start = rows[header_idx].end()  # 真正的表头行结束位置
             body_end = tbl_xml.rfind("</a:tbl>")
             new_body_rows = "".join(new_rows[1:])
             result = tbl_xml[:body_start] + new_body_rows + tbl_xml[body_end:]
@@ -307,41 +347,94 @@ def _cell_ref_col(ref: str) -> int:
     return idx - 1
 
 
-def _detect_role_columns_in_xlsx_worksheet(ws_xml: str) -> List[int]:
+def _detect_role_columns_in_xlsx_worksheet(ws_xml: str) -> Tuple[List[int], int]:
     """
-    分析 XLSX worksheet XML，检测角色列索引（基于第一行表头）。
+    D15（赵辉，第5批）：逐行判表头——XLSX 版本。
+
+    返回：(角色列索引列表, 表头行号)；无表头时返回 ([], -1)。
     """
     rows = list(_XLSX_ROW_RE.finditer(ws_xml))
     if not rows:
-        return []
+        return [], -1
 
-    first_row = rows[0]
-    cells = list(_XLSX_CELL_RE.finditer(first_row.group(0)))
+    # 逐行找表头
+    header_row_num = -1
+    header_row_cells = None
+    for row_m in rows:
+        row_nums = re.findall(r'\br="(\d+)"', row_m.group(0))
+        if not row_nums:
+            continue
+        try:
+            row_num = int(row_nums[0])
+        except ValueError:
+            continue
+        cells = list(_XLSX_CELL_RE.finditer(row_m.group(0)))
+        if not cells:
+            continue
+        # 排除非空单元格 <2 的合并标题行
+        non_empty = 0
+        for c in cells:
+            inner = c.group(2)
+            v_m = _XLSX_V_RE.search(inner)
+            is_m = re.search(r'<is><t[^>]*>(.*?)</t></is>', inner, re.S)
+            cell_text = ""
+            if v_m:
+                cell_text = v_m.group(1).strip()
+            elif is_m:
+                cell_text = _html_unescape(is_m.group(1))
+            if cell_text:
+                non_empty += 1
+        if non_empty < 2:
+            continue
+        # 检查是否有角色关键词
+        found_role = False
+        for cell_m in cells:
+            inner = cell_m.group(2)
+            v_m = _XLSX_V_RE.search(inner)
+            cell_text = v_m.group(1).strip() if v_m else ""
+            is_m = re.search(r'<is><t[^>]*>(.*?)</t></is>', inner, re.S)
+            if is_m:
+                cell_text = _html_unescape(is_m.group(1))
+            if not cell_text:
+                continue
+            if any(kw in cell_text for kw in _TBL_HDR_NONNAME):
+                continue
+            if len(cell_text) > 20 or any(cell_text.endswith(p) for p in ('。', '，', '；', '！', '？')):
+                continue
+            if any(cell_text.endswith(end) for end in _TBL_HDR_EXCLUDE_ENDINGS):
+                continue
+            for word in _ROLE_COLUMN_HEADER_WORDS:
+                if re.search(rf'(?<!\w){re.escape(word)}(?!\w)', cell_text):
+                    found_role = True
+                    break
+            if found_role:
+                break
+        if found_role:
+            header_row_num = row_num
+            header_row_cells = cells
+            break  # D15：找到即停止
+
+    if header_row_num < 0 or header_row_cells is None:
+        return [], -1
+
     role_cols: List[int] = []
-
-    for cell_m in cells:
+    for cell_m in header_row_cells:
         cell_ref = _XLSX_CELL_ATTR_R.search(cell_m.group(1))
         if not cell_ref:
             continue
         col_idx = _cell_ref_col(cell_ref.group(1))
-        # 尝试从 <v> 提取文本
         inner = cell_m.group(2)
         v_m = _XLSX_V_RE.search(inner)
         cell_text = v_m.group(1).strip() if v_m else ""
-        # 还需要处理内联字符串 <is><t>...</t></is>
         is_m = re.search(r'<is><t[^>]*>(.*?)</t></is>', inner, re.S)
         if is_m:
             cell_text = _html_unescape(is_m.group(1))
         if not cell_text:
             continue
-        # D6（赵辉，第5批，2026-10-09）：表头列名排除（H3 + 长度 + 结尾词）
-        # ① 排除含设备/品牌词的表头（H3）
         if any(kw in cell_text for kw in _TBL_HDR_NONNAME):
             continue
-        # ② 表头须 ≤20 字（含句读则排除，防止"问题与风险类别"等数据列）
         if len(cell_text) > 20 or any(cell_text.endswith(p) for p in ('。', '，', '；', '！', '？')):
             continue
-        # ③ 表头结尾词排除
         if any(cell_text.endswith(end) for end in _TBL_HDR_EXCLUDE_ENDINGS):
             continue
         for word in _ROLE_COLUMN_HEADER_WORDS:
@@ -350,18 +443,18 @@ def _detect_role_columns_in_xlsx_worksheet(ws_xml: str) -> List[int]:
                 break
 
     if not role_cols:
-        return []
+        return [], header_row_num
 
     # 角色列右侧所有列纳入
     expanded: Set[int] = set(role_cols)
     last_role = max(role_cols)
-    for adj in range(last_role + 1, len(cells)):
-        adj_ref = _XLSX_CELL_ATTR_R.search(cells[adj].group(1))
+    for adj in range(last_role + 1, len(header_row_cells)):
+        adj_ref = _XLSX_CELL_ATTR_R.search(header_row_cells[adj].group(1))
         if adj_ref:
             adj_col_idx = _cell_ref_col(adj_ref.group(1))
             if adj_col_idx == adj:
                 expanded.add(adj)
-    return sorted(expanded)
+    return sorted(expanded), header_row_num
 
 
 def process_xlsx_worksheet(ws_xml: str) -> Tuple[str, int]:
@@ -373,7 +466,7 @@ def process_xlsx_worksheet(ws_xml: str) -> Tuple[str, int]:
     返回：(处理后 XML, 脱敏处数)
     """
     total_count = 0
-    role_cols = _detect_role_columns_in_xlsx_worksheet(ws_xml)
+    role_cols, header_row_num = _detect_role_columns_in_xlsx_worksheet(ws_xml)
     if not role_cols:
         return ws_xml, 0
 
@@ -384,7 +477,7 @@ def process_xlsx_worksheet(ws_xml: str) -> Tuple[str, int]:
     def _process_row(row_m: re.Match) -> str:
         nonlocal total_count
         row_xml = row_m.group(0)
-        # 判断本行是否是第一行（表头行）
+        # 判断本行是否是真正的表头行（用 D15 逐行检测结果）
         row_idx_matches = re.findall(r'\br="(\d+)"', row_xml)
         if not row_idx_matches:
             return row_xml
@@ -392,8 +485,8 @@ def process_xlsx_worksheet(ws_xml: str) -> Tuple[str, int]:
             row_num = int(row_idx_matches[0])
         except ValueError:
             return row_xml
-        if row_num == 1:
-            return row_xml  # 表头行不处理
+        if row_num == header_row_num:
+            return row_xml  # 真正的表头行不处理
 
         new_row = row_xml
         for cell_m in _XLSX_CELL_RE.finditer(row_xml):
@@ -486,11 +579,14 @@ def collect_table_names(xml_content: str) -> set:
     # 预扫 PPT 表格
     for tbl_m in _PPT_TBL_RE.finditer(xml_content):
         tbl_xml = tbl_m.group(0)
-        role_cols = _detect_role_columns_in_ppt_table(tbl_xml)
+        role_cols, header_idx = _detect_role_columns_in_ppt_table(tbl_xml)
         if not role_cols:
             continue
-        # 扫描所有行（跳过表头行）
-        for row_m in _PPT_TR_RE.finditer(tbl_xml):
+        # 扫描所有行（跳过真正的表头行）
+        rows = list(_PPT_TR_RE.finditer(tbl_xml))
+        for ri, row_m in enumerate(rows):
+            if ri == header_idx:
+                continue  # 跳过表头行
             row_xml = row_m.group(0)
             cells = list(_PPT_TC_RE.finditer(row_xml))
             for col_idx, cell_m in enumerate(cells):
@@ -500,37 +596,44 @@ def collect_table_names(xml_content: str) -> set:
                 names = _collect_names_from_role_column(cell_text)
                 collected.update(names)
 
-    # 预扫 XLSX 工作表（单 sheet）
-    for row_m in _XLSX_ROW_RE.finditer(xml_content):
-        row_xml = row_m.group(0)
-        row_num_matches = re.findall(r'\br="(\d+)"', row_xml)
-        if not row_num_matches:
+    # 预扫 XLSX 工作表（D15：逐 sheet 检测表头行）
+    # 每个 <worksheet>...</worksheet> 独立检测表头行号
+    _XLSX_SHEET_RE = re.compile(r'<worksheet\b[^>]*>.*?</worksheet>', re.S)
+    for sheet_m in _XLSX_SHEET_RE.finditer(xml_content):
+        ws_xml = sheet_m.group(0)
+        role_cols, header_row_num = _detect_role_columns_in_xlsx_worksheet(ws_xml)
+        if not role_cols:
             continue
-        try:
-            row_num = int(row_num_matches[0])
-        except ValueError:
-            continue
-        if row_num == 1:
-            continue  # 跳过表头行
-        for cell_m in _XLSX_CELL_RE.finditer(row_xml):
-            cell_full = cell_m.group(0)
-            cell_ref_m = _XLSX_CELL_ATTR_R.search(cell_m.group(1))
-            if not cell_ref_m:
+        for row_m in _XLSX_ROW_RE.finditer(ws_xml):
+            row_xml = row_m.group(0)
+            row_num_matches = re.findall(r'\br="(\d+)"', row_xml)
+            if not row_num_matches:
                 continue
-            col_idx = _cell_ref_col(cell_ref_m.group(1))
-            # 用 _detect_role_columns_in_xlsx_worksheet 判断（需传完整 worksheet XML）
-            # 简化：直接复用 _ROLE_COLUMN_EXCLUDED 做格级判断
-            inner = cell_m.group(2)
-            v_m = _XLSX_V_RE.search(inner)
-            is_m = re.search(r'<is><t[^>]*>(.*?)</t></is>', inner, re.S)
-            cell_text = ""
-            if v_m:
-                cell_text = v_m.group(1).strip()
-            if is_m:
-                cell_text = _html_unescape(is_m.group(1))
-            if cell_text:
-                names = _collect_names_from_role_column(cell_text)
-                collected.update(names)
+            try:
+                row_num = int(row_num_matches[0])
+            except ValueError:
+                continue
+            if row_num == header_row_num:
+                continue  # 跳过真正的表头行
+            for cell_m in _XLSX_CELL_RE.finditer(row_xml):
+                cell_full = cell_m.group(0)
+                cell_ref_m = _XLSX_CELL_ATTR_R.search(cell_m.group(1))
+                if not cell_ref_m:
+                    continue
+                col_idx = _cell_ref_col(cell_ref_m.group(1))
+                if col_idx not in role_cols:
+                    continue
+                inner = cell_m.group(2)
+                v_m = _XLSX_V_RE.search(inner)
+                is_m = re.search(r'<is><t[^>]*>(.*?)</t></is>', inner, re.S)
+                cell_text = ""
+                if v_m:
+                    cell_text = v_m.group(1).strip()
+                if is_m:
+                    cell_text = _html_unescape(is_m.group(1))
+                if cell_text:
+                    names = _collect_names_from_role_column(cell_text)
+                    collected.update(names)
 
     _TABLE_COLLECTED_NAMES.update(collected)
     return collected

@@ -541,54 +541,365 @@ def _header_footer_image_names(tmp_dir: Path) -> set:
 
 
 # ---------------------------------------------------------------------------
-# EMF/WMF 矢量图内嵌文字字节级等长脱敏（R-⑳，v1.3.9，响应 Issue #15-C1，赵辉）
+# EMF/WMF 矢量图内嵌文字字节级等长脱敏
+# R-⑳（v1.3.9）+ E4 跨记录配对（图标内文本漏脱）+ E5 紧凑日期串占位
+# 响应 Issue #15-C1 / Issue G，赵辉
 # ---------------------------------------------------------------------------
+
+# 紧凑日期时间串正则（E5）
+# 匹配整段连续的 YYYYMMDD / YYYYMMDDHHmm / YYYYMMDDHHmmss
+# 刻意排除含斜杠/连字符的日期（项目信息）和孤立年份
+_EMF_WMF_COMPACT_DT_RE = re.compile(
+    r"^(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])"
+    r"(?:(?:[01]\d|2[0-3])[0-5]\d(?:[0-5]\d)?)?$"
+)
+
+
+def _mask_compact_datetime(text: str) -> str:
+    """
+    E5（_mask_compact_datetime）：将 WMF/EMF 内紧凑日期时间串等长替换为占位符。
+    必须在年份规则之前执行——否则 `20250120` 被切为 `YYYY0120`。
+
+    规则（仅覆盖文本记录区间，已由 _wmf_text_spans / _emf_text_spans 限定）：
+      8  位 YYYYMMDD   → YYYYMMDD（占 8 符）
+      12 位 YYYYMMDDHHmm → YYYYMMDDHHmm
+      14 位 YYYYMMDDHHmmss → YYYYMMDDHHmmss
+
+    刻意不处理：斜杠日期 `2025/10/17`、孤立年份 `2025`。
+    """
+    result = []
+    i = 0
+    while i < len(text):
+        # 从当前位置尝试最长匹配
+        remaining = text[i:]
+        for end in range(len(remaining), 0, -1):
+            if _EMF_WMF_COMPACT_DT_RE.match(remaining[:end]):
+                n = len(remaining[:end])
+                if n == 8:
+                    result.append("YYYYMMDD")
+                elif n == 12:
+                    result.append("YYYYMMDDHHmm")
+                elif n == 14:
+                    result.append("YYYYMMDDHHmmss")
+                # else: shouldn't happen given regex anchors
+                i += end
+                break
+        else:
+            # 无匹配，单字符透传
+            result.append(text[i])
+            i += 1
+    return "".join(result)
+
+
+def _wmf_text_spans(buf: bytes):
+    """
+    E4（_wmf_text_spans）：解析 WMF 二进制，返回文本记录载荷区间列表。
+
+    WMF record: [rdType=WORD 2B][rdSize=WORD 2B][data...]
+
+    rdSize 以"字"计（1 word = 2 bytes），总字节数 = rdSize * 2。
+
+    支持两种文本记录：
+      - META_TEXTOUT     (0x0521)：字符串紧跟记录头，无长度前缀
+      - META_EXTTEXTOUT  (0x0A32)：若有 ETO_CLIPPED(0x0004) 或 ETO_OPAQUE(0x0002)，
+                                    记录头后有 8 字节 rclBounds（跳 4 words = 8 bytes）
+
+    返回: list[tuple(offset_bytes, length_bytes, str)]
+    第一步尝试 GBK 解码（WMF 中文编码），失败则跳过该记录。
+    """
+    import struct
+
+    spans = []
+    off = 0
+
+    # placeable WMF 头：22 字节；若检测到 AKZ magic 则跳过
+    if len(buf) >= 22:
+        key = struct.unpack_from("<I", buf, 0)[0]
+        if key == 0x9AC6CDDB:
+            off = 22
+
+    while off + 4 <= len(buf):
+        rec_type, rec_size_words = struct.unpack_from("<HH", buf, off)
+        rec_size_bytes = rec_size_words * 2
+        if rec_size_words < 3 or off + rec_size_bytes > len(buf):
+            break
+        if rec_type == 0x0000:  # META_EOF
+            break
+
+        if rec_type == 0x0521:  # META_TEXTOUT
+            text_off = off + 4          # 2B rdType + 2B rdSize
+            # rdSize = 2 + ceil(n/2)，n 为文本字节数（含 null 终止符）；
+            # rdSize 含 rdType+rdSize 自身（2 words）
+            n_text_bytes = rec_size_bytes - 4
+            text_end_soft = text_off
+            while text_end_soft < off + rec_size_bytes and buf[text_end_soft] != 0:
+                text_end_soft += 1
+            text_bytes = buf[text_off:text_end_soft]
+            try:
+                s = text_bytes.decode("gbk", errors="strict")
+                if s:
+                    spans.append((text_off, len(text_bytes), s))
+            except (UnicodeDecodeError, ValueError):
+                pass
+
+        elif rec_type == 0x0A32:  # META_EXTTEXTOUT
+            # rclBounds 跳项：若 Options & 0x0006 != 0 则 rclBounds 存在（8 bytes）
+            opts_off = off + 4 + 8      # after rdType+rdSize(4) + nXStart+nYStart(8)
+            if opts_off + 2 <= off + rec_size_bytes:
+                fu_opts = struct.unpack_from("<H", buf, opts_off)[0]
+                skip = 8 if (fu_opts & 0x0006) else 0
+            else:
+                skip = 0
+            text_off = opts_off + 2 + skip   # after fuOptions(2) + optional rclBounds(8)
+            # WMF EXTTEXTOUT: 2-byte length prefix (WORD cb)
+            if text_off + 2 > off + rec_size_bytes:
+                off += rec_size_bytes
+                continue
+            cb_chars = struct.unpack_from("<H", buf, text_off)[0]
+            str_off = text_off + 2
+            str_end = str_off + cb_chars
+            if str_end > off + rec_size_bytes:
+                str_end = off + rec_size_bytes
+            text_bytes = buf[str_off:str_end]
+            try:
+                s = text_bytes.decode("gbk", errors="strict")
+                if s:
+                    spans.append((str_off, str_end - str_off, s))
+            except (UnicodeDecodeError, ValueError):
+                pass
+
+        off += rec_size_bytes
+
+    return spans
+
+
+def _emf_text_spans(buf: bytes):
+    """
+    E4（_emf_text_spans）：解析 EMF 二进制，返回文本记录载荷区间列表。
+
+    EMF record: [iType=DWORD 4B][nSize=DWORD 4B][data...]
+
+    支持四种文本记录（iType）：
+      EMR_EXTTEXTOUTA   (83): ANSI 编码
+      EMR_EXTTEXTOUTW   (84): UTF-16LE 编码
+      EMR_POLYTEXTOUTA  (96): ANSI 编码
+      EMR_POLYTEXTOUTW  (97): UTF-16LE 编码
+
+    emrtext 结构（各记录共用）：
+      [rclBounds: 16B][cbText: 4B][offString: 4B][fuOptions: 4B] + extra + string
+
+    offString 相对记录头，cbText 以字符计（UTF-16LE 时 2 字节/字符）。
+
+    编码判定：先尝试 UTF-16LE，失败则用 ANSI/GBK。
+
+    返回: list[tuple(offset_bytes, length_bytes, str)]
+    """
+    import struct
+
+    spans = []
+
+    # EMF 头：固定 80 字节（EMFPLUS_RECORD_HEADER 前 4+4）
+    header_size = 80
+    if len(buf) < header_size + 8:
+        return spans
+    off = header_size
+
+    while off + 8 <= len(buf):
+        rec_type, rec_size = struct.unpack_from("<II", buf, off)
+        if rec_size < 8 or off + rec_size > len(buf):
+            break
+        if rec_type == 0x0000000E:  # EMR_EOF
+            break
+
+        # emrtext base starts at off+8
+        off_text = off + 8
+        # rclBounds = 16B, cbText = 4B, offString = 4B, fuOptions = 4B = 28 bytes
+        if off_text + 28 > off + rec_size:
+            off += rec_size
+            continue
+        cb_text, off_string = struct.unpack_from("<II", buf, off_text + 16)
+
+        # offString 相对记录头
+        str_off = off + off_string
+        str_len = cb_text * 2          # UTF-16LE: 2 bytes per char
+
+        if str_off < off_text or str_off + str_len > off + rec_size:
+            off += rec_size
+            continue
+        # EMF 规范：offString 相对记录头（含 type+size = 8 字节）
+        str_off_abs = off + 8 + off_string
+
+        if str_off_abs < off_text or str_off_abs + str_len > off + rec_size:
+            off += rec_size
+            continue
+
+        text_bytes = buf[str_off_abs:str_off_abs + str_len]
+
+        # Unicode 变体（0x53/0x60）：EMR_EXTTEXTOUTW / EMR_POLYTEXTOUTW → UTF-16LE
+        # ANSI 变体（0x54/0x61）：EMR_EXTTEXTOUTA / EMR_POLYTEXTOUTA → GBK
+        # 注意：ANSI bytes 对 UTF-16LE 不抛异常（有效但错误），不能 try/except fallback
+        if rec_type in (0x00000053, 0x00000060):          # W → UTF-16LE
+            try:
+                s = text_bytes.decode("utf-16-le", errors="strict")
+                if s:
+                    spans.append((str_off_abs, str_len, s))
+            except (UnicodeDecodeError, ValueError):
+                pass
+        elif rec_type in (0x00000054, 0x00000061):        # A → GBK
+            try:
+                s = text_bytes.decode("gbk", errors="strict")
+                if s:
+                    spans.append((str_off_abs, str_len, s))
+            except (UnicodeDecodeError, ValueError):
+                pass
+
+        off += rec_size
+
+    return spans
+
+
+def _redact_record_split_words(spans, is_utf16le: bool):
+    """
+    E4（_redact_record_split_words）：跨记录片段配对——解决 WMF/EMF 把同一个词
+    拆进两条文本记录的漏脱问题。
+
+    现象示例（QRCB 图标 WMF）：
+      记录1 → "QRCB_秦"（末尾 "秦" 是人名首字）
+      记录2 → "领工程..."（"领" 是人名尾字，与记录1末尾构成 "秦领"）
+
+    策略：按原始字节序拼接全量文本（保留 span 边界），对含中文的 span 做：
+      1. 跨 span 配对（上一 span 末 1~2 字符 + 当前 span 首 1~2 字符），
+         检查拼接后是否为敏感词，若是则对两段各自等长打码；
+      2. span 内部全词匹配打码（GBK/UTF-16LE 等长替换）。
+
+    参数:
+      spans: list[tuple(offset, length_bytes, str_text)]，已按文件顺序排列
+      is_utf16le: True → UTF-16LE（EMF），每字符 2 字节；False → GBK（WMF）
+
+    返回: list[tuple(offset, length_bytes, str_text)]，已打码的 span
+    """
+    if not spans:
+        return spans
+
+    # 阶段一：跨 span 配对——用 common_rules 姓名/机构规则检测
+    # 导入放在函数内部避免循环依赖
+    try:
+        import common_rules as cr
+    except ImportError:
+        try:
+            from scripts import common_rules as cr
+        except ImportError:
+            return spans
+
+    new_spans = []
+    for i, (off, nbytes, s) in enumerate(spans):
+        if i == 0:
+            new_spans.append((off, nbytes, s))
+            continue
+
+        prev_off, prev_nbytes, prev_s = new_spans[-1]
+        prev_tail = prev_s[-4:] if len(prev_s) >= 4 else prev_s
+        curr_head = s[:4] if len(s) >= 4 else s
+
+        # 尝试 1+1、2+2、1+2、2+1 组合
+        paired = False
+        for tail_n in range(1, min(len(prev_tail), 3) + 1):
+            for head_n in range(1, min(len(curr_head), 3) + 1):
+                candidate = prev_tail[-tail_n:] + curr_head[:head_n]
+                if len(candidate) < 2:
+                    continue
+                # 用 common_rules 的 apply_redactions 检测是否为敏感词
+                # 若返回与输入不同，说明被规则命中
+                masked = cr.apply_redactions(candidate)
+                if masked != candidate:
+                    # 命中！对 prev span 末尾 tail_n 字符打码
+                    if is_utf16le:
+                        # UTF-16LE：每字符 2 字节，等长替换
+                        prev_tail_bytes = tail_n * 2
+                        replacement = "X" * (prev_tail_bytes // 2)
+                        new_prev = prev_s[:-tail_n] + replacement
+                    else:
+                        # GBK：变长，但打码到等长字节数
+                        # 取 prev_s 末尾 tail_n 个字符的 GBK 字节数，打成等长 'X'
+                        prev_tail_str = prev_s[-tail_n:]
+                        tail_bytes = len(prev_tail_str.encode("gbk", errors="replace"))
+                        replacement = "X" * tail_bytes
+                        new_prev = prev_s[:-tail_n] + replacement
+                    # 对 curr span 开头 head_n 字符打码
+                    if is_utf16le:
+                        curr_head_bytes = head_n * 2
+                        replacement2 = "X" * (curr_head_bytes // 2)
+                        new_curr = replacement2 + s[head_n:]
+                    else:
+                        curr_head_str = s[:head_n]
+                        head_bytes = len(curr_head_str.encode("gbk", errors="replace"))
+                        replacement2 = "X" * head_bytes
+                        new_curr = replacement2 + s[head_n:]
+                    new_spans[-1] = (prev_off, len(new_prev.encode(
+                        "utf-16-le" if is_utf16le else "gbk", errors="replace")), new_prev)
+                    s = new_curr
+                    paired = True
+                    break
+            if paired:
+                break
+
+        if not paired:
+            new_spans[-1] = (prev_off, len(prev_s.encode(
+                "utf-16-le" if is_utf16le else "gbk", errors="replace")), prev_s)
+
+        new_spans.append((off, nbytes, s))
+
+    # 阶段二：span 内部全词匹配（通用规则）
+    final_spans = []
+    for off, nbytes, s in new_spans:
+        masked = cr.apply_redactions(s)
+        if masked != s:
+            s = masked
+        final_spans.append((off, nbytes, s))
+
+    return final_spans
+
 
 def _redact_emf_buffer(buf: bytes) -> bytes:
     """
     对 EMF（Enhanced Metafile）二进制缓冲区执行字节级等长脱敏。
 
-    EMF ExtTextOutW 记录使用 UTF-16LE 编码传输文本。
-    策略：扫描 EMR_EXTTEXTOUTW 记录（recordType = 0x00000053），找到其中的
-    UTF-16LE 字符串，对可打印中文字符（\u4e00-\u9fff）字节级替换为 'X'；
-    页码形态（\d+/\d+）和 M/D 日期（\d/\d）保护断言。
+    E4（_wmf_text_spans / _emf_text_spans / _redact_record_split_words）：
+      - 解析所有文本记录（EMR_EXTTEXTOUTA/W、EMR_POLYTEXTOUTA/W）
+      - 对跨记录切分的敏感词做前缀/后缀配对，等长打码
+    E5（_mask_compact_datetime）：
+      - 在年份规则之前，将紧凑日期串（YYYYMMDD 等）替换为占位符
+    中文替换：UTF-16LE 字节级等长 X 替换（0x5800）
 
     返回等长 bytes。若解析失败返回原 buf。
     """
-    import struct, sys
-    try:
-        result = bytearray(buf)
-        off = 0
-        EMR_EXTTEXTOUTW = 0x00000053
-        CHARSET_ANSI = 0x00000000
+    import struct
 
-        while off + 8 <= len(result):
-            rec_type, rec_size = struct.unpack_from("<II", result, off)
-            if rec_size < 8 or off + rec_size > len(result):
-                break
-            if rec_type == EMR_EXTTEXTOUTW:
-                # 解析 emrtext 结构
-                off_text = off + 8
-                if off_text + 20 > off + rec_size:
-                    off += rec_size
-                    continue
-                cb_text, pt_ref, fu_options, icolor = struct.unpack_from("<IiiI", result, off_text)
-                off_string = off_text + 20
-                # 提取 UTF-16LE 字符串（每个字符 2 字节）
-                text_bytes = bytes(result[off_string:off_string + cb_text * 2])
-                # 解码为字符列表
-                chars = []
-                for i in range(0, len(text_bytes) - 1, 2):
-                    wchar = struct.unpack_from("<H", text_bytes, i)[0]
-                    chars.append(wchar)
-                # 对中文可打印字符做字节级 X 替换（等长）
-                for i, wchar in enumerate(chars):
-                    # 保护断言：页码 \d+/\d+ 和 M/D 日期 \d/\d
-                    if 0x4e00 <= wchar <= 0x9fff:
-                        # 中文字符：替换为 X（UTF-16LE: 0x5800）
-                        struct.pack_into("<H", result, off_string + i * 2, 0x5800)
-            off += rec_size
+    try:
+        # 步骤1：提取文本记录 span（UTF-16LE）
+        spans = _emf_text_spans(buf)
+        if not spans:
+            return buf
+
+        # 步骤2：跨记录配对 + 内部规则打码（E4）
+        spans = _redact_record_split_words(spans, is_utf16le=True)
+
+        # 步骤3：紧凑日期时间串等长占位（E5，必须在年份规则之后）
+        # 注意：E5 在跨记录配对后执行，这样完整文本才可匹配
+        spans = [(off, nbytes, _mask_compact_datetime(s)) for off, nbytes, s in spans]
+
+        # 步骤4：写回字节数组
+        result = bytearray(buf)
+        for off, nbytes, s in spans:
+            if s.encode("utf-16-le", errors="replace") != buf[off:off + nbytes]:
+                # 逐字符写回（等长替换：中文 2 字节 ASCII 1 字节）
+                # UTF-16LE：'X' = 0x0058 (L, then 0x00 as second byte)
+                encoded = s.encode("utf-16-le", errors="replace")
+                for i in range(min(len(encoded), nbytes)):
+                    result[off + i] = encoded[i]
+
         return bytes(result)
+
     except Exception:
         return buf
 
@@ -597,41 +908,58 @@ def _redact_wmf_buffer(buf: bytes) -> bytes:
     """
     对 WMF（Windows Metafile）二进制缓冲区执行字节级等长脱敏。
 
-    WMF META_TEXTOUT 记录使用 ANSI/OEM 代码页编码传输文本，
-    中文通常使用 GBK（CP936）。策略：扫描 META_TEXTOUT 记录
-    （recordType = 0x0621），对 GBK 编码的中文字节序列（双字节高bit置1）
-    替换为 'X'；页码和 M/D 日期保护断言。
+    E4（_wmf_text_spans / _redact_record_split_words）：
+      - 解析所有文本记录（META_TEXTOUT、META_EXTTEXTOUT）
+      - 对跨记录切分的敏感词做前缀/后缀配对，等长打码
+    E5（_mask_compact_datetime）：
+      - 紧凑日期串（YYYYMMDD 等）替换为占位符（在年份规则之前）
+    中文替换：GBK 字节级等长 X 替换（双字节高bit置1 → 0x58 0x00）
+
+    编码判定：先按 WMF 解析（GBK），失败则按 EMF 解析（UTF-16LE）。
+    这处理了"扩展名为 .emf 但实际是 WMF"的情况（农芯 image19.emf）。
 
     返回等长 bytes。若解析失败返回原 buf。
     """
     import struct
-    try:
-        result = bytearray(buf)
-        off = 0
-        META_TEXTOUT = 0x0621
 
-        while off + 6 <= len(result):
-            rec_type, rec_size = struct.unpack_from("<HH", result, off)
-            if rec_size < 3 or off + rec_size * 2 > len(result):
-                break
-            if rec_type == META_TEXTOUT:
-                text_off = off + 6
-                text_end = off + rec_size * 2
-                pos = text_off
-                while pos + 1 < text_end:
-                    b0 = result[pos]
-                    if b0 & 0x80:  # GBK 高字节置1 → 中文字符
-                        # 替换为 'X'
-                        result[pos] = 0x58  # 'X' ASCII
-                        if pos + 1 < text_end:
-                            result[pos + 1] = 0x00  # GBK 低字节
-                        pos += 2
-                    elif b0 == 0:
-                        pos += 1  # 字符串终止
-                    else:
-                        pos += 1
-            off += rec_size * 2
+    try:
+        # 步骤1：尝试 WMF 解析（GBK）
+        spans = _wmf_text_spans(buf)
+
+        if not spans:
+            # 步骤1b：WMF 解析无文本记录，尝试 EMF 解析
+            spans = _emf_text_spans(buf)
+            if not spans:
+                return buf
+            is_utf16le = True
+        else:
+            is_utf16le = False
+
+        # 步骤2：跨记录配对 + 内部规则打码（E4）
+        spans = _redact_record_split_words(spans, is_utf16le=is_utf16le)
+
+        # 步骤3：紧凑日期时间串等长占位（E5）
+        spans = [(off, nbytes, _mask_compact_datetime(s)) for off, nbytes, s in spans]
+
+        # 步骤4：写回字节数组
+        result = bytearray(buf)
+        for off, nbytes, s in spans:
+            if is_utf16le:
+                encoded = s.encode("utf-16-le", errors="replace")
+            else:
+                encoded = s.encode("gbk", errors="replace")
+            # 等长替换：若新编码与原字节数相同，直接写入
+            if len(encoded) == nbytes:
+                for i in range(nbytes):
+                    result[off + i] = encoded[i]
+            else:
+                # 编码长度变化（罕见，如纯 ASCII → 变短），逐字节写入
+                # GBK/UTF-16LE：中文变短（2字节→1字节），仅在边界安全时写入
+                for i in range(min(len(encoded), nbytes)):
+                    result[off + i] = encoded[i]
+
         return bytes(result)
+
     except Exception:
         return buf
 
@@ -697,11 +1025,15 @@ def _redact_bank_logos(media_dir: Path, force_names: set = None) -> None:
                 # R7：失败不再静默——EMF 等无法解析的格式显式标记人工检查
                 _mark_manual_check(img_file.name, f"遮盖失败（{reason}）: {e}")
         elif img_file.suffix.lower() == ".emf":
-            # R-⑳（v1.3.9，响应 Issue #15-C1，赵辉）：
-            # EMF 矢量图内嵌文字字节级等长脱敏（UTF-16LE）
+            # E4（编码判定）：先按 WMF 解析，失败再按 EMF 解析。
+            # 实测有".emf"扩展名的文件实际是 WMF（农芯 image19.emf）。
             try:
                 orig_bytes = img_file.read_bytes()
-                redacted = _redact_emf_buffer(orig_bytes)
+                # 先尝试 WMF 解析（含 GBK）
+                redacted = _redact_wmf_buffer(orig_bytes)
+                if redacted == orig_bytes:
+                    # WMF 无命中，再尝试 EMF 原生解析
+                    redacted = _redact_emf_buffer(orig_bytes)
                 if redacted != orig_bytes:
                     tmp = tempfile.NamedTemporaryFile(suffix=".emf", delete=False)
                     tmp.close()

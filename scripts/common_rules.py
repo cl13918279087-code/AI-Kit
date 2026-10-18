@@ -1275,6 +1275,88 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
     # 采用回溯式地址脱敏通道 _apply_address_pass()（见下方函数定义），
     # 在 apply_redactions 中于姓名规则之前执行，此处不再注册正则规则。
 
+    # ========== D5（赵辉，第3批，2026-10-08）：城市列举句逐项脱敏 ==========
+    # 场景："总行营业部及昆明、昭通、曲靖、大理、红河、楚雄等分行"
+    #   → 当前 _CITY_BANK_RE 只匹配"楚雄等分行"（最后一项）；
+    #     其余城市（昆明/昭通/曲靖/大理/红河）因后接顿号均不匹配
+    # 方案：先匹配"城市1、城市2、...城市N[等]分行/支行/营业部"整体，
+    #       再在替换函数中逐项脱敏城市名（用同一套城市表），保留机构名
+    # 城市列表：广西/四川/云南/贵州/湖南/湖北/安徽/河南/广东 各市
+    # 注意：此块必须定义在 _CITY_BANK_RE 之前，且其 patterns.append 先于 _CITY_BANK_RE，
+    #       防止 _CITY_BANK_RE 的 fallback 误吞独立城市名（如"玉溪"）。
+    # 注：每个省份名改为可选 (?：省份名)?，使独立城市名（如"玉溪"）也可匹配
+    _CITY_ENUM_CITIES = (
+        "(?:广西)?(?:桂林|柳州|南宁|梧州|北海|防城港|钦州|贵港|玉林|百色|贺州|河池|来宾|崇左)|"
+        "(?:四川)?(?:成都|绵阳|德阳|南充|宜宾|泸州|内江|乐山|自贡|眉山|雅安|广元|遂宁|攀枝花|达州|孝感|黄冈)|"
+        "(?:云南)?(?:昆明|大理|丽江|红河|曲靖|玉溪|保山|昭通|临沧|普洱)|"
+        "(?:贵州)?(?:贵阳|遵义|毕节|六盘水|安顺|铜仁|黔东南|黔南|黔西南)|"
+        "(?:湖南)?(?:长沙|株洲|湘潭|衡阳|邵阳|岳阳|常德|张家界|益阳|郴州|永州|怀化|娄底|湘西)|"
+        "(?:湖北)?(?:武汉|宜昌|襄阳|荆州|黄石|十堰|孝感|荆门|鄂州|黄冈|咸宁|随州|恩施)|"
+        "(?:安徽)?(?:合肥|芜湖|蚌埠|淮南|马鞍山|淮北|铜陵|安庆|黄山|阜阳|宿州|滁州|六安|宣城|池州|亳州)|"
+        "(?:河南)?(?:郑州|开封|洛阳|平顶山|安阳|鹤壁|新乡|焦作|濮阳|许昌|漯河|三门峡|南阳|商丘|信阳|周口|驻马店)|"
+        "(?:广东)?(?:广州|深圳|珠海|汕头|佛山|韶关|湛江|肇庆|江门|茂名|惠州|梅州|汕尾|河源|阳江|清远|东莞|中山|潮州|揭阳|云浮)|"
+        "(?:其他)?(?:北京|上海|天津|重庆)"
+    )
+    # 城市列举：城市1顿号城市2顿号...城市N（等?分行/支行/营业部/医院/学校/交易中心）
+    # 核心修复（2026-10-11）："及昆明、昭通..."中"及"与第一个城市之间可能有顿号分隔符，
+    #   须用 (?:(?:、|和|与)?及)? 替代 (?:及)?，让分隔符在"及"之后可选。
+    # 第一分支：含列举标记（顿号/和/与/及/等）的完整列举句
+    #   场景："总行营业部及昆明、昭通、...、楚雄等分行"
+    # 第二分支：单城市+后缀兜底（无列举标记时直接整体替换为 XX）
+    # D5 专业后缀（不含泛化机构名）：只匹配有特定语义的场景，
+    # 泛化机构名（分行/支行/营业部/分理处/信用社）由银行机构规则独立处理。
+    _SUFFIX_CITY_ENUM = (
+        "保证金系统|公共资源交易中心保证金系统|公共资源交易中心"
+        "|交易中心|医院|学校"
+    )
+    _CITY_ENUM_RE = re.compile(
+        rf'(?:(?:、|和|与)?及)?(?:{_CITY_ENUM_CITIES}(?:、|和|与))*'
+        rf'({_CITY_ENUM_CITIES})'
+        rf'(?:(?:、|和|与)({_CITY_ENUM_CITIES}))*'
+        rf'(?:等)?(?:{_SUFFIX_CITY_ENUM})'
+        rf'|(?:{_CITY_ENUM_CITIES})(?:{_SUFFIX_CITY_ENUM})',
+        re.I
+    )
+    _CITY_NAME_LIST_RE = re.compile(
+        rf'(?:(?:、|和|与)?{_CITY_ENUM_CITIES}(?:、|和|与))*({_CITY_ENUM_CITIES})',
+        re.I
+    )
+    def _city_enum_repl(m: re.Match) -> str:
+        """
+        城市列举句：逐项脱敏城市名，保留顿号/机构名。
+
+        has_enum=True（含顿号/和/与/及/等）+ base 以顿号结尾：
+          完整列举句，去掉机构后缀后逐项脱敏城市名，再拼回后缀。
+        其他情况（含"等分行"、无列举标记的单城市）：直接返回 "XX"，
+          防止"分行等分行"等边界情况被错误处理。
+        """
+        full = m.group(0)
+        has_enum = any(sep in full for sep in ("、", "和", "与", "及", "等"))
+        if not has_enum:
+            # 单城市兜底：整体替换为固定值，避免后缀被后续机构规则二次命中。
+            # "昭通交易中心" → "XX机构"（防止 PAT[35] 再吞"中心"→"XXXXXX"）
+            # "玉溪保证金系统" → "XX机构"（单城市语义已脱敏，后缀可省略）
+            return "XX机构"
+        # 完整列举（含顿号/和/与/及/等）：去掉机构后缀，逐项脱敏城市名
+        # 与 _SUFFIX_CITY_ENUM 保持一致（不含泛化机构名）
+        for suf in ("保证金系统", "公共资源交易中心保证金系统", "公共资源交易中心",
+                    "交易中心", "医院", "学校"):
+            if full.endswith(suf):
+                base = full[:-len(suf)]
+                break
+        else:
+            base = full
+        # 逐项脱敏城市名
+        def _r(m2: re.Match) -> str:
+            city = m2.group(0)
+            return "XX" * ((len(city) + 1) // 2)  # GBK 等长
+        result = re.sub(_CITY_NAME_LIST_RE, _r, base)
+        if not full.endswith(base):
+            result += full[len(base):]
+        return result
+    # D5 先于 _CITY_BANK_RE append，防止 fallback 吞独立城市名
+    patterns.append((_CITY_ENUM_RE, _city_enum_repl))
+
     # D5（赵辉，第3批，2026-10-08）：桂林/柳州等常见城市名（配置外补充）
     # 桂林银行、柳州银行等机构名 → XX银行；单独出现 → XX（配合地址通道）
     # 须在姓名规则之前执行，防止"桂林张明"被截胡为"桂XXX明"
@@ -1300,7 +1382,6 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
             return "XX" + full[-2:]
         return "XX"
     patterns.append((_CITY_BANK_RE, _city_bank_repl))
-
     # ---------- 12. 密码信息 ----------
     # 匹配"密码"后紧跟的数字串，替换为 ******
     # 同时兼容"密码为/密码：/密码 " 等格式
@@ -1432,6 +1513,9 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
 
     # 拆分：姓名规则单独归组，供 apply_redactions 在地址通道之后执行
     _PATTERNS_PRE = patterns[:_pre_pattern_count]
+    # D11 注入姓名组最前面（姓氏规则之前）——行首姓名列表优先匹配
+    # 场景："梁红兵、各系统行方项目经理" → 行首姓名先被 D11 处理，
+    # 姓氏规则对 "XXXX、各系统..." 中的 "方项" 无从下手。
     _PATTERNS_NAME = patterns[_pre_pattern_count:]
 
     return patterns
@@ -1760,6 +1844,92 @@ _ANCHOR_COLON_RE = re.compile(
     + r")[:：]\s*)(.+)"
 )
 
+# D16（赵辉，第3批，2026-10-08）：顿号名单保形规则
+# 场景："工具支持：窦磊、王富生、王根利"（冒号+名单）或纯顿号名单"窦磊、王富生、王根利"
+# 策略：
+#   ① 含冒号名单：已由 _ANCHOR_COLON_RE + _apply_anchor_expand_pass 处理
+#   ② 无冒号顿号名单：用 _LIST_NAME_RE 捕获"纯2-4字CJK块顿号"序列，
+#      替换时逐块等长打码，保留顿号（保形）
+# ③ 残字虚词守卫：_RESIDUE_STOP 防止 XXX 的B角 → XXXB角
+_RESIDUE_STOP = set("的了和与及或等是在中上下将把被由从向对为以并而同则着过们")
+_LIST_NAME_RE = re.compile(
+    r"^[\u4e00-\u9fa5]{2,4}(?:[、，][\u4e00-\u9fa5]{2,4}){1,}$"
+)
+def _list_name_repl(m: re.Match) -> str:
+    """顿号名单保形：逐块脱敏，保留顿号/逗号"""
+    text = m.group(0)
+    parts = re.split(r'([、，])', text)
+    result = []
+    for p in parts:
+        if re.match(r'^[\u4e00-\u9fa5]{2,4}$', p):
+            # 检查残字：若替换后前一块末字+当前块=残字组合则跳过
+            if result and len(p) >= 2 and p[0] in _RESIDUE_STOP:
+                result.append(p)
+            else:
+                result.append("XX" * (len(p) // 2))
+        else:
+            result.append(p)
+    return "".join(result)
+
+# D11（赵辉，第3批，2026-10-08）：名单续行守卫
+# 场景："梁红兵、各系统行方项目经理、实施厂商项目经理"
+#   → 行首姓名 + 顿号 + 含人事语义词（项目经理/厂商/实施/组员/成员/负责人）
+# 约束：后半段须含人事语义词（防止"核心、外围"等普通并列被误伤）
+_PERSONNEL_HINT = {
+    "经理", "厂商", "实施", "组员", "成员", "负责人",
+    "主任", "总监", "部长", "处长", "科长", "主管",
+    "工程师", "设计师", "架构师", "开发", "测试", "运维",
+    "组长", "副组长", "顾问",
+}
+_LIST_CONTINUATION_RE = re.compile(
+    # 非捕获组让贪婪 .* 吞掉整行；捕获组仅包裹行首模式
+    # 分支1：纯CJK姓名（2-4字）+顿号/逗号（含全角，U+FF0C）
+    # 分支2：XXX（3字母）+顿号/逗号 → 二字姓名被姓氏规则处理后
+    # 分支3：XXX+单CJK+顿号/逗号 → 三字姓名被姓氏规则处理后
+    # 贪婪 .* 确保吞掉整行内容（无换行符时不用 $ 锚点）
+    r'^(?:[\u4e00-\u9fa5]{2,4}[、，,]|[X]{3}[、，,]|[X]{3}[\u4e00-\u9fa5][、，,]).*',
+    re.MULTILINE
+)
+
+
+def _list_continuation_repl(m: re.Match) -> str:
+    """名单续行守卫：仅替换行首姓名，保留顿号和后半段。
+
+    正则匹配行首姓名（纯CJK或已处理XXX+单CJK）到行末，
+    replacement 函数找第一个顿号来分离行首姓名和后半段。
+    姓氏规则先于 D11 执行，输入可能是 "梁红兵、..." 或 "XXX兵、..."
+    ——D11 只处理顿号分隔的多元素名单，且后半段必须含人事关键词。
+    """
+    full = m.group(0)
+    # 残字守卫
+    if len(full) >= 2 and full[0] in _RESIDUE_STOP:
+        return full
+    # 第一个顿号/逗号 = 行首姓名与后半段的分界点
+    # 头模式最多匹配 4 CJK + 1 逗号 = 5 字符；从位置 5 起找第一个逗号
+    # 这样可以避免后半段含多个顿号时取到错误的分隔符
+    comma_pos = len(full)  # 默认取到末尾
+    for sep in ('、', ',', '，'):
+        idx = full.find(sep)
+        if 0 <= idx < comma_pos:
+            comma_pos = idx
+    if comma_pos >= 5:
+        comma_pos = len(full)  # 第一个分隔符在头模式之后，说明头模式吞掉了分隔符
+    if comma_pos < 0 or comma_pos >= len(full):
+        return full
+    # 人事关键词守卫：后半段必须含人事关键词，才启用 D11
+    tail = full[comma_pos:]
+    if not any(kw in tail for kw in _PERSONNEL_HINT):
+        return full
+    # head = 行首姓名（纯CJK或XXX+单CJK），len(head) 为字符数
+    head = full[:comma_pos]
+    head_len = len(head)  # 字符数
+    if head_len < 2:
+        return full
+    # 行首姓名 mask：按字符数折半（向上取整），最小 2
+    mask_chars = max((head_len + 1) // 2, 2)
+    masked_head = "XX" * mask_chars
+    return masked_head + tail
+
 # 姓名块正则：2-4 连续CJK字符（排除词/数字为主）
 _NAME_BLOCK_RE = re.compile(
     "[\u4e00-\u9fa5]{2,4}"
@@ -1775,6 +1945,45 @@ _ANCHOR_EXCLUDED_NAMES: set = {
 }
 # D11/D16/H1（赵辉，第3批）：合并顿号名单保形守卫 + 序号守卫
 _ANCHOR_EXCLUDED_NAMES.update(_ROLE_LIST_EXCLUDED)
+
+
+def _apply_plain_list_pass(text: str, counts: Dict[str, int]) -> str:
+    """
+    D16（赵辉，第3批）：顿号名单保形——无冒号的纯顿号姓名列表。
+
+    场景：段落中含"窦磊、王富生、王根利"（无角色前缀），
+    逐块脱敏姓名、保留顿号。
+    残字守卫：若前一块末字 + 当前块=残字组合，跳过。
+    人事关键词守卫：若行含人事关键词，跳过（由 D11 续行守卫处理）。
+    """
+    if not text or not isinstance(text, str):
+        return text
+    out_lines = []
+    for line in text.split("\n"):
+        # 人事关键词守卫：含人事关键词的顿号名单由 D11 处理
+        if any(kw in line for kw in _PERSONNEL_HINT):
+            out_lines.append(line)
+            continue
+        new_line = re.sub(_LIST_NAME_RE, _list_name_repl, line)
+        out_lines.append(new_line)
+    return "\n".join(out_lines)
+
+
+def _apply_list_continuation_pass(text: str, counts: Dict[str, int]) -> str:
+    """
+    D11（赵辉，第3批）：名单续行守卫。
+
+    场景："梁红兵、各系统行方项目经理、实施厂商项目经理"
+    行首姓名 + 顿号 + 含人事语义词（项目经理/厂商/实施/组员等）→ 仅脱行首姓名。
+    约束：后半段含人事语义词门槛，防止普通并列（"核心、外围"）误伤。
+    """
+    if not text or not isinstance(text, str):
+        return text
+    out_lines = []
+    for line in text.split("\n"):
+        new_line = _LIST_CONTINUATION_RE.sub(_list_continuation_repl, line)
+        out_lines.append(new_line)
+    return "\n".join(out_lines)
 
 
 def _apply_anchor_expand_pass(text: str, counts: Dict[str, int]) -> str:
@@ -1862,7 +2071,8 @@ def _name_guard_sub_counted(pattern: re.Pattern, text: str, replacement: str,
         if _get_skip_texts() and m.group(0) in _get_skip_texts():
             return m.group(0)
         counts["姓名"] = counts.get("姓名", 0) + 1
-        return replacement
+        # 支持函数型 replacement（如 D11 的 _list_continuation_repl）
+        return replacement(m) if callable(replacement) else replacement
 
     return pattern.sub(_repl, text)
 
@@ -1988,6 +2198,12 @@ def apply_redactions_counted(text: str) -> Tuple[str, Dict[str, int]]:
     # N-B 层（Issue #16 REQ-NAME-001）：角色锚点扩散——冒号后姓名批量脱敏
     # 在三件套之后叠加执行，专注处理"角色：名单"格式
     result = _apply_anchor_expand_pass(result, counts)
+
+    # D16（赵辉）：顿号名单保形——无冒号的顿号名单逐块打码
+    result = _apply_plain_list_pass(result, counts)
+
+    # D11（赵辉，第3批）：名单续行守卫——行首姓名脱敏，保留顿号和后半段
+    result = _apply_list_continuation_pass(result, counts)
 
     # R4 层（Issue #17）：分词边界 + 上下文评分
     # 仅当 name_mode 为 "r4" 或 "both" 时启用；"enum" 模式保持 v1.3.10 行为不变
