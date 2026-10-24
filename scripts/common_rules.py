@@ -113,6 +113,11 @@ def _load_config() -> Dict[str, Any]:
         Path(__file__).parent.parent / "config.json",
         Path("config.json"),
     ]
+    # Issue #49：允许通过环境变量指定配置文件路径（测试隔离用）。
+    # 测试不再覆写/删除仓库内真实 config.json，避免破坏性副作用。
+    env_cfg = os.environ.get("AIKIT_CONFIG_PATH", "").strip()
+    if env_cfg:
+        config_paths.insert(0, Path(env_cfg))
     for p in config_paths:
         if p.exists():
             raw = p.read_text(encoding="utf-8")

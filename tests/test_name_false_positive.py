@@ -95,15 +95,25 @@ CURRENT_NAME_COUNT = 1285
 
 @pytest.fixture(scope="module")
 def cfg():
+    # Issue #49：确保不受其他测试文件的 AIKIT_CONFIG_PATH 环境影响，
+    # 始终读取仓库内真实 config.json
+    os.environ.pop("AIKIT_CONFIG_PATH", None)
+    common_rules._CONFIG_CACHE = None
+    common_rules._PATTERNS = None
+    common_rules._PATTERNS_PRE = []
+    common_rules._PATTERNS_NAME = []
     return _load_config()
 
 
 @pytest.fixture(scope="module")
 def patterns():
-    """重建规则组（确保使用当前 config.json）"""
+    """重建规则组（确保使用当前 config.json，且不受其他测试文件污染）"""
+    os.environ.pop("AIKIT_CONFIG_PATH", None)
+    common_rules._CONFIG_CACHE = None
     common_rules._PATTERNS = None
     common_rules._PATTERNS_PRE = []
     common_rules._PATTERNS_NAME = []
+    common_rules._AGENT_DECISIONS_OVERRIDE = None
     pre, name = common_rules._get_pattern_groups()
     return pre + name
 

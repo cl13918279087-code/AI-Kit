@@ -78,9 +78,9 @@ def _fake_config(overrides: dict = None):
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(defaults, f, ensure_ascii=False)
 
-    # 写入工作目录 config.json（优先于临时路径）
-    cfg_dir = Path(__file__).parent
-    (cfg_dir / "config.json").write_text(json.dumps(defaults, ensure_ascii=False), encoding="utf-8")
+    # Issue #49：不再覆写/删除仓库内真实 config.json（会破坏 full_name_list 等资产）。
+    # 改为通过 AIKIT_CONFIG_PATH 环境变量指向临时配置文件，实现测试隔离。
+    os.environ["AIKIT_CONFIG_PATH"] = path
 
     # 重置所有缓存：_CONFIG_CACHE + _PATTERNS（SURNAME_SET 依赖 _load_config 重建）
     common_rules._CONFIG_CACHE = None
@@ -99,12 +99,12 @@ def _cleanup_config(path):
         os.unlink(path)
     except Exception:
         pass
-    try:
-        os.unlink(Path(__file__).parent / "config.json")
-    except Exception:
-        pass
+    # 恢复真实配置加载路径（Issue #49：真实 config.json 全程未被触碰）
+    os.environ.pop("AIKIT_CONFIG_PATH", None)
     common_rules._CONFIG_CACHE = None
     common_rules._PATTERNS = None
+    common_rules._PATTERNS_PRE = []
+    common_rules._PATTERNS_NAME = []
 
 
 # ---------------------------------------------------------------------------
