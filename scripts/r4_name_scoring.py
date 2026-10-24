@@ -113,9 +113,11 @@ def _get_name_pool_chars() -> Set[str]:
     if _name_pool_chars is not None:
         return _name_pool_chars
     try:
-        from common_rules import _load_config
+        from common_rules import _load_config, _get_name_pool_chars
         cfg = _load_config()
-        chars = cfg.get("name_pool", "")
+        # M9（Issue #49）：载入期清洗 + 空池兜底，与规则层共用同一来源，
+        # 避免规则层与 R4 评分层取到的名字池不一致
+        chars = _get_name_pool_chars(cfg)
         _name_pool_chars = set(chars) if chars else set()
     except ImportError:
         _name_pool_chars = set()

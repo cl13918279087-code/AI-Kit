@@ -90,7 +90,10 @@ REAL_DOC_MISFIRE_FRAGMENTS = [
 BASELINE_SURNAME_COUNT = 196
 BASELINE_NAME_COUNT = 152
 CURRENT_SURNAME_COUNT = 415
-CURRENT_NAME_COUNT = 1285
+# M9（Issue #49）：原值 1285 含 2 个标点污染字符（`、` `/`），
+# 实际有效字数为 1283。守卫口径改为「有效汉字数」，
+# 既防 #45 扩池成果回滚，又不因 M9 的污染清理而误报。
+CURRENT_NAME_COUNT = 1283
 
 
 @pytest.fixture(scope="module")
@@ -248,6 +251,135 @@ def test_real_doc_misfire_fragments(cfg):
     # 允许少量残留（整改为渐进式），但不得过半
     assert len(still_bad) <= len(REAL_DOC_MISFIRE_FRAGMENTS) * 0.2, (
         f"仍有 {len(still_bad)}/{len(REAL_DOC_MISFIRE_FRAGMENTS)} 个真实误伤片段被规则A 捕获: {still_bad}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 7. M9 字池清洗守卫（Issue #49）
+# ---------------------------------------------------------------------------
+
+def test_name_pool_punctuation_removed(cfg):
+    """M9：config.json 的 name_pool 不得含标点/符号类污染字符。
+
+    根因：#45 扩池把 `、` `/` 误采进 name_pool，规则A 的名字字符类
+    `姓 + [name_pool]{1,3}` 会把「李思远、」当成 4 字姓名，
+    导致名单整段吞并。
+    """
+    bad = [ch for ch in cfg["name_pool"] if common_rules._is_name_pool_pollution(ch)]
+    assert not bad, (
+        f"name_pool 含标点/符号类污染字符 {bad}（Issue #49 M9）。\n"
+        f"这些字符会被规则A 当作「名字用字」，造成名单整段吞并。"
+    )
+
+
+def test_name_pool_sanitizer_isolates_punctuation():
+    """M9：载入期清洗器必须剔除标点，保留汉字与占位符字母。
+
+    这是**结构性防护**：字池由人工维护，后续任何一次扩池都可能再次
+    混入标点。只改 config.json 等于把「下次再犯」留给未来维护者。
+    """
+    clean = common_rules._clean_name_pool
+    # 标点必须被剔除
+    assert clean("伟、/张") == "伟张"
+    assert clean("A·B") == "AB"
+    assert clean("【】{}") == ""
+    # 汉字与占位符大写字母必须保留
+    assert clean("测试X光") == "测试X光"
+    assert clean("正常汉字") == "正常汉字"
+    # 占位符集只有大写，小写字母不属于占位符字符集
+    assert clean("abc-def") == ""
+    # 去重且保持原顺序
+    assert clean("王王李李张") == "王李张"
+
+
+def test_name_pool_cleaner_applied_in_rules():
+    """M9：规则层实际使用的名字字符类必须已清洗（防接入点遗漏）。
+
+    守卫口径：直接检查「规则层取用的池字符串」本身已清洗，
+    而非从编译后的正则里反推字符类 —— 后者会与 D16 的
+    边界守卫类 `[a-zA-Z0-9]` 混淆，误报。
+    """
+    cleaned = common_rules.get_name_pool_chars()
+    bad = [c for c in cleaned if common_rules._is_name_pool_pollution(c)]
+    assert not bad, f"规则层取用的 name_pool 仍含污染字符: {bad!r}"
+
+    # 规则A 的名字字符类必须完全来自清洗后的池
+    pool = set(cleaned)
+    assert pool, "清洗后的 name_pool 为空，配置异常"
+    # 编译后的规则能正常工作（字符类未被破坏成非法正则）
+    pre, name = common_rules._get_pattern_groups()
+    assert name, "名字规则组为空，守卫失效"
+
+
+def test_list_swallow_not_regression():
+    """M9：名单顿号场景不得再整段吞并（修复「负责需求梳理」被吃掉）。"""
+    text = "项目组成员如下：李思远、周慧敏、王根利负责需求梳理与方案设计"
+    out = common_rules.apply_redactions(text)
+    assert "负责需求梳理" in out, (
+        f"名单顿号场景仍整段吞并，后续业务词被误吃: {out}"
+    )
+    # 三个名单项应各自脱敏，且顿号保留
+    assert out.count("XXX") == 3, f"名单项数不符: {out}"
+
+
+def test_empty_name_pool_fallback_no_indexerror():
+    """空 name_pool 不得触发 IndexError（连词规则分组编号被破坏）。
+
+    回归背景：name_pool 为空时名字字符类退化为 `[]`，Python re 把 `]`
+    当作字符类首字符处理，字符类一路吞到下一个 `]`，导致
+    `(surname+names)(连词)(surname+names)` 的 3 个分组塌成 1 个，
+    `_conj_repl` 调用 `m.group(2)` 抛 `IndexError: no such group`。
+    """
+    cfg = common_rules._load_config()
+    original = cfg.get("name_pool")
+    original_cache = common_rules._role_conj_re_cache
+    try:
+        cfg["name_pool"] = ""
+        common_rules._role_conj_re_cache = None
+
+        # 兜底后仍须有可用名字池
+        chars = common_rules._get_name_pool_chars(cfg)
+        assert chars, "空池未回退到内置兜底池"
+
+        # 名字字符类必须是合法正则（非空字符集）
+        cls = common_rules._build_name_char_class(chars)
+        assert cls not in ("[]", ""), f"名字字符类退化: {cls!r}"
+
+        # 分组数必须保持 3，且替换回调不得抛 IndexError
+        pattern = common_rules._get_role_conjunction_re()
+        assert pattern.groups == 3, (
+            f"连词正则分组数应为 3，实际 {pattern.groups}（字符类未正确闭合）"
+        )
+
+        counts = {}
+        text = "项目组成员如下：李思远、周慧敏负责需求梳理"
+        out = common_rules.apply_redactions(text)
+        assert "负责需求梳理" in out, f"空池下业务词被吞: {out}"
+    finally:
+        if original is None:
+            cfg.pop("name_pool", None)
+        else:
+            cfg["name_pool"] = original
+        common_rules._role_conj_re_cache = original_cache
+
+
+def test_name_char_class_escapes_metacharacters():
+    """名字字符类必须转义正则元字符，污染字符不得破坏字符类边界。
+
+    核心不变量：即使池中混入 `]`、`^`、`-`、反斜杠，字符类仍须是
+    **单一合法字符集**（不多不少一个闭合方括号），否则会像空池的 `[]`
+    那样一路吞并后续正则文本、破坏分组编号。
+    """
+    import re
+    cls = common_rules._build_name_char_class("伟]张-^李\\")
+    compiled = re.compile(cls)
+    # 正常汉字仍可匹配
+    assert compiled.match("伟"), "转义后无法匹配正常汉字"
+    # 关键：字符类未被污染字符撑开 —— 池外字符不得被误纳入
+    assert not compiled.match("A"), f"字符类被污染撑开，纳入了池外字符: {cls}"
+    # 字符集大小应等于池字符数（去重后），说明未吞入额外字符
+    assert compiled.pattern.count("[") == 1 and compiled.pattern.count("]") == 2, (
+        f"字符类括号不配对: {compiled.pattern}"
     )
 
 

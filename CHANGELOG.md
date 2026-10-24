@@ -1,5 +1,24 @@
 # Changelog
 
+## [Unreleased] - 2026-10-25（Issue #49）
+
+### 修复（#49 M9：`name_pool` 标点类污染，贡献者：赵辉）
+
+- **M9-A 数据修复**：`scripts/config.json` 的 `name_pool` 移除 `、`（顿号）与 `/`（斜杠）两个标点字符，1285 → **1283** 字；`surname_pool` / `full_name_list` 零改动
+- **M9-B 载入期结构性防护**：`scripts/common_rules.py` 新增 `_is_name_pool_pollution()` / `_clean_name_pool()`，在载入期统一清洗字池（剔除 Unicode `P*`/`S*` 类别 + ASCII 非字母数字 + 正则元字符，保留汉字与占位符大写字母）；规则层 5 处消费点（`common_rules` ×3、`r4_name_scoring` ×1、`redact_iterative_compare` ×1）全部改用清洗后的池——**根治**「下次扩池再污染」
+- **M9-C 名单整段吞并修复**：顿号混入字池导致规则A 把「李思远、」识别为 4 字姓名，进而吞掉后续「负责需求梳理」。修复后：`项目组成员如下：李思远、周慧敏、王根利负责需求梳理与方案设计` → `项目组成员如下：XXX、XXX、XXX负责需求梳理与方案设计`（逐项脱敏、顿号保留）
+- **M9-D 附带修复（既有缺陷，非 M9 引入）**：空 `name_pool` 会让名字字符类退化为 `[]`——Python `re` 把 `]` 当作字符类首字符，字符类一路吞到下一个 `]`，撑破正则分组编号（3 组 → 1 组），`_conj_repl` 调用 `m.group(2)` 抛 `IndexError: no such group`。现统一为 `_get_name_pool_chars()` 入口（清洗 → 空则回退内置兜底池，带缓存）+ `_build_name_char_class()`（元字符 `]` `^` `-` `\` `[` 转义）。正常配置下输出**逐字节不变**
+
+### 门禁
+
+- `tests/test_name_false_positive.py` 新增 6 项回归守卫：数据层无污染 / 清洗器行为 / 规则层实际用池已清洗 / 名单吞并不回滚 / 空池兜底不抛 `IndexError` / 字符类元字符转义
+- 66 份真实文档（md/docx/xlsx/pptx）M9 前后全量逐字符比对：差异全为误伤修复，D16 全名库残留 0、名单内真名残留 0
+- 量化指标：通用语料误伤 52/102（51.0%）、真名召回 12/12 —— 与 M9 前**一致**（M9 是根因修复，非降误伤主力；降误伤待 #49 P1 分级改造）
+- 全量测试 138 passed / 2 failed（既有问题，与本次无关）/ 3 errors（pytest 沙箱权限）
+- 性能：清洗 0.41ms（载入期一次，带缓存）；全文脱敏 6000 字 173ms（M9 前 173ms），无退化
+
+---
+
 ## [1.4.0] - 2026-XX-XX（Issue #17）
 
 ### 改进（R4 层：分词边界 + 上下文评分，Issue #17，AIKit 自动实施）

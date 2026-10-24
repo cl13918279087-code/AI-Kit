@@ -163,6 +163,142 @@ def _build_surname_set() -> set:
 SURNAME_SET = _build_surname_set()
 
 # ---------------------------------------------------------------------------
+# M9（Issue #49，2026-10）：字池载入期清洗
+#
+# 背景：#45 扩池时把 17 个非汉字字符误采进 name_pool：
+#   - 2 个标点（`、` `/`）—— 真正的污染。规则A 的名字字符类
+#     `姓 + [name_pool]{1,3}` 会把「李思远、」当成 4 字姓名，
+#     导致名单整段吞并（"项目组成员如下：XXX…" 把「负责需求梳理」一起吃掉）。
+#   - 15 个大写字母（X L J S H C T N Z G E B X D K）—— 扩池时误采的冗余项，
+#     会被规则A 当作"名字用字"，使「张三ABC」「李四X光」类混合串被误判为姓名。
+#     注：脱敏占位符（XXX / XXXXXXXXXXXXXXXXXX / YYYY/MM/DD）实际来自
+#     config.json 的 `replacement` 字段，与 name_pool 无耦合 —— 故字母污染
+#     的危害独立于 M9 存在，由规则层的「姓名形态须全为汉字」约束另行处理。
+#
+# M9 的准确口径（见 docs/Issue-049-姓名池误伤整改方案.md §五）：
+#   **移除标点类字符，保留占位符字母**；字母污染改由规则层的
+#   「姓名形态判定须全为汉字」约束处理。
+#
+# 为什么必须在**载入期**清洗而不能只改 config.json：
+#   字池是人工维护的，后续任何一次扩池都可能再次混入标点。
+#   只改数据等于把"下次再犯"的成本留给未来的维护者；
+#   在载入期做一次结构性拦截，才能让 M9 真正根治。
+#
+# 清洗规则：**只剔除标点/符号类字符（Unicode category P*/S*）**，
+# 汉字与占位符大写字母一律保留 —— 字母问题的处置不在 M9 范围内。
+# ---------------------------------------------------------------------------
+
+# 正则字符类中需要转义的元字符（即便清洗后也应防御性排除）
+_NAME_POOL_EXCLUDE_META = set("[]^-\\")
+
+# 脱敏占位符字母集：与 config.json replacement 字段保持一致
+# （NAME=XXX / ID_CARD=X*18 / DATE=YYYY/MM/DD / EMAIL / IP / MAC / MOBILE / PHONE）
+_PLACEHOLDER_LETTERS = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+
+def _is_name_pool_pollution(ch: str) -> bool:
+    """判断单个字符是否为 name_pool 污染（标点/符号类）。
+
+    保留：汉字 + 占位符大写字母（`_PLACEHOLDER_LETTERS`）。
+    剔除：标点、符号，以及**小写字母**（占位符集只用大写，
+    小写字母进入名字字符类会额外扩大匹配面且无占位符用途）。
+    """
+    if ch in _NAME_POOL_EXCLUDE_META:
+        return True
+    # ASCII 字母：仅保留占位符所用的大写
+    if ch.isascii() and ch.isalpha():
+        return ch not in _PLACEHOLDER_LETTERS
+    # ASCII 可见的非字母数字字符（标点、符号）
+    if ch.isascii() and not ch.isalnum():
+        return True
+    # Unicode 标点与符号类别（顿号、斜杠、全角标点、破折号等）
+    try:
+        import unicodedata
+        cat = unicodedata.category(ch)
+        if cat.startswith("P") or cat.startswith("S"):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _clean_name_pool(pool: str) -> str:
+    """清洗 name_pool：剔除标点/符号类污染，保留汉字与占位符字母。
+
+    M9（Issue #49）。返回保持原顺序、去重后的字符序列。
+    """
+    if not pool:
+        return ""
+    seen = set()
+    out = []
+    for ch in pool:
+        if ch in seen:
+            continue
+        if _is_name_pool_pollution(ch):
+            continue
+        seen.add(ch)
+        out.append(ch)
+    return "".join(out)
+
+
+def get_name_pool_chars() -> str:
+    """读取清洗后的 name_pool 字符序列（供规则层与 R4 共用）。"""
+    cfg = _load_config()
+    pool = cfg.get("name_pool", "")
+    if not pool:
+        return ""
+    return _clean_name_pool(pool)
+
+
+
+# 内置兜底名字池：config.json 的 name_pool 缺失或清洗后为空时启用。
+# 作用有二：
+#   ① 保证姓名规则始终有可用的名字字符类（空池会让字符类退化为 `[]`）；
+#   ② 空字符类会破坏正则分组编号，导致 _conj_repl 抛 IndexError。
+_FALLBACK_NAME_POOL = (
+    "伟强志建华文静宇轩浩然俊杰明辉晨曦鹏飞洪红霞丽娟秀英敏芳兰婷玉军平立业德永海波涛"
+    "清北胜利福生财腾广坤传王泓郭艳林微陈卓怡君佩瑶心如梦雨萱晓思彤欣涵晖润峰山宏翠"
+    "冰勃项韬鑫昊毅春为斌少凡梅娥昀铄智诗标芸仁铭侃楷肇乐曹潘李张欧詹郑丁周娜萍燕雅雯"
+    "菲彩佳倩洁慧琳芬蓉澜蕊黛媛娇璐豪超刚勇磊龙荣逸朗天行健自不息东宁瑀"
+)
+
+# 原始池字符串 → 清洗后序列（含兜底）的缓存。
+# 只保留最新一项，避免热路径反复清洗带来运行期开销。
+_NAME_POOL_CACHE: Dict[str, str] = {}
+
+
+def _get_name_pool_chars(cfg: Optional[Dict] = None) -> str:
+    """取清洗后的 name_pool 字符序列；为空时回退到内置兜底池。
+
+    M9（Issue #49）新增。规则层所有构造名字字符类的位置都应走本函数，
+    避免空池导致字符类退化为 `[]`（进而破坏正则分组编号）。
+
+    清洗按原始池字符串做缓存——XX 恢复段在每次 apply_redactions 调用中
+    都会取用名字池，缓存后运行期零开销。
+    """
+    if cfg is None:
+        cfg = _load_config()
+    raw = cfg.get("name_pool", "") or ""
+    cached = _NAME_POOL_CACHE.get(raw)
+    if cached is not None:
+        return cached
+    chars = _clean_name_pool(raw) or _FALLBACK_NAME_POOL
+    _NAME_POOL_CACHE.clear()
+    _NAME_POOL_CACHE[raw] = chars
+    return chars
+
+
+def _build_name_char_class(chars: str) -> str:
+    """由名字用字序列构造安全的正则字符类。
+
+    - 空序列回退到内置兜底池（`[]` 会让 re 报 unterminated character set）；
+    - 转义 `]`、`^`、`-`、反斜杠等正则元字符，避免污染字符破坏字符类边界。
+    """
+    chars = chars or _FALLBACK_NAME_POOL
+    escaped = "".join("\\" + c if c in "\\]^-[" else c for c in chars)
+    return "[" + escaped + "]"
+
+# ---------------------------------------------------------------------------
 # 排除词表（全局通用术语，不是敏感信息）
 # ---------------------------------------------------------------------------
 
@@ -1442,14 +1578,10 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
     # 姓氏后必须跟 1-2 个名字汉字，防止单字被误判
     # 名字用字池从 config.json name_pool 动态读取
     surname_alt = '|'.join(re.escape(s) for s in SURNAME_SET)
-    name_pool_chars = cfg.get("name_pool", "")
-    if not name_pool_chars:
-        name_pool_chars = ("伟强志建华文静宇轩浩然俊杰明辉晨曦鹏飞洪红霞丽娟秀英敏芳兰婷玉军平立业德永海波涛"
-                          "清北胜利福生财腾广坤传王泓郭艳林微陈卓怡君佩瑶心如梦雨萱晓思彤欣涵晖润峰山宏翠"
-                          "冰勃项韬鑫昊毅春为斌少凡梅娥昀铄智诗标芸仁铭侃楷肇乐曹潘李张欧詹郑丁周娜萍燕雅雯"
-                          "菲彩佳倩洁慧琳芬蓉澜蕊黛媛娇璐豪超刚勇磊龙荣逸朗天行健自不息东宁瑀")
+    # M9（Issue #49）：载入期清洗，剔除标点/符号类污染（防后续扩池再次污染）
+    name_pool_chars = _get_name_pool_chars(cfg)
     # 名字汉字类（供两个规则使用）
-    name_char_class = '[' + name_pool_chars + ']'
+    name_char_class = _build_name_char_class(name_pool_chars)
 
     # 规则A：姓氏 + 1-3个名字汉字（支持二字和三字人名如"陈斌""郑学钟"）
     # 左边界：阻止 ASCII/数字前缘（防止英文单词残段匹配）
@@ -1725,9 +1857,10 @@ def _get_role_conjunction_re() -> re.Pattern:
     sp = cfg.get("surname_pool", "")
     if not sp:
         sp = "赵钱孙李周吴郑王冯陈褚卫蒋沈韩杨朱秦尤许何吕施张孔曹严华金魏陶姜戚谢邹喻柏水窦章云苏潘葛奚范彭郎鲁韦昌马苗凤花方俞任袁柳酆鲍史唐费廉岑薛雷贺倪汤滕殷罗毕郝邬安常乐于时傅皮卞齐康伍余元卜顾孟平黄和穆萧尹姚邵湛汪祁毛禹狄米贝明臧计伏成戴谈宋茅庞熊纪舒屈项祝董梁杜阮蓝闵席季麻强贾路娄危江童颜郭梅盛林刁钟徐骆高夏蔡田樊胡凌霍虞万支柯昝管卢莫经房裘缪干解应宗丁宣邓单洪包诸左石崔吉钮龚林门龙段郑孔牛童浦施零厉付肖闫覃刘"
-    np_chars = cfg.get("name_pool", "伟强志建华文静宇轩浩然俊杰明辉晨曦")
+    # M9（Issue #49）：载入期清洗，剔除标点/符号类污染
+    np_chars = _get_name_pool_chars(cfg)
     surname_alt = "|".join(re.escape(c) for c in sp)
-    name_class = "[" + np_chars + "]"
+    name_class = _build_name_char_class(np_chars)
     _role_conj_re_cache = re.compile(
         rf'({surname_alt}{name_class}{{1,3}})(和|与|及|或者|以及)'
         rf'({surname_alt}{name_class}{{1,3}})'
@@ -2154,7 +2287,8 @@ def apply_redactions_counted(text: str) -> Tuple[str, Dict[str, int]]:
     # 策略：扫描 "姓氏+XX+名字池单字" 模式，如"黄XX镇" → "XXX"
     # 姓氏后面紧跟 XX（地址占位符），XX后是名字池中的单字（镇/璇/钟等）
     cfg = _load_config()
-    name_pool_chars = cfg.get("name_pool", "")
+    # M9（Issue #49）：载入期清洗，剔除标点/符号类污染
+    name_pool_chars = _get_name_pool_chars(cfg)
     _surname_set_recovery = SURNAME_SET  # 引用全局姓氏集
     _name_chars = set(name_pool_chars)  # 名字用字集合
     # R-⑱（v1.3.8，响应 Issue #14）：机构后缀守卫——恢复段本为修复地址通道截断

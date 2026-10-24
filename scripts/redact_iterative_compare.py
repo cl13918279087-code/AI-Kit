@@ -342,7 +342,12 @@ def build_name_set_from_pool():
     """从name_pool构建姓氏和名字集合"""
     cfg = get_config()
     surname_set = set(cfg.get('surname_pool', ''))
-    name_pool = set(cfg.get('name_pool', ''))
+    # M9（Issue #49）：载入期清洗 + 空池兜底，与规则层共用同一来源
+    try:
+        from common_rules import _get_name_pool_chars
+        name_pool = set(_get_name_pool_chars(cfg))
+    except ImportError:
+        name_pool = set(cfg.get('name_pool', ''))
     compound = set(cfg.get('compound_surnames', []))
     return surname_set, name_pool, compound
 
