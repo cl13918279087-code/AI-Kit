@@ -1064,8 +1064,25 @@ def _redact_bank_logos(media_dir: Path, force_names: set = None) -> None:
 
 # ---------------------------------------------------------------------------
 # 表头驱动列脱敏（R-㉘，v1.3.9，响应 Issue #15-C9，赵辉）
+#
+# N-C 层（Issue #50 §4.6）：Word 表格接入补齐
+#
+# 【改造前的问题】
+#   1. 表头词表仅 14 词，**不含「姓名」「成员」「组员」「联系人」「参会人」**
+#      → Word 表格的「姓名」列根本不触发列级脱敏，只能靠规则A 在正文里
+#        逐字乱抓——这使 Word 成为规则A 误伤的主要放大器。
+#   2. 逐 `<w:t>` 节点调用 apply_redactions → **跨 run 拆分的姓名漏脱**
+#      （实测「樊霖」被拆成「樊」+「霖」两个 run，节点级处理看不到完整姓名，
+#       导致脱敏失败）。
+#
+# 【改造后】
+#   1. 表头词表统一走 N-C 的 T1 共用函数 `detect_name_columns()`：
+#      **表头角色词 + 值列形态一致性**双重判定（§4.2）。
+#   2. 姓名列的单元格按**整格文本**脱敏，再用 `redistribute_paragraph`
+#      把差异精确回写到各 run 节点 → 跨 run 姓名不再漏脱。
 # ---------------------------------------------------------------------------
 
+# 保留旧表头词表（兼容既有行为与外部引用）；新增词由 N-C 锚点词表提供
 _TABLE_HEADER_COL_KEYWORDS = (
     "变更人", "修改人", "审核人", "复核人", "修订人", "编写人", "编制人",
     "审批人", "批准人", "登记人", "操作人", "经办人", "责任人", "负责人",
@@ -1074,7 +1091,14 @@ _TABLE_HEADER_COL_KEYWORDS = (
 
 def _process_table_columns(doc_xml: Path, counts: dict) -> None:
     """
-    遍历 document.xml 中的所有表格，对表头含敏感关键词的列执行姓名脱敏。
+    遍历 document.xml 中的所有表格，对判定为「姓名列」的列执行姓名脱敏。
+
+    N-C 改造（Issue #50 §4.6）：
+      - 姓名列判定改用 T1 共用函数 `detect_name_columns()`
+        （表头角色词 + 值列形态一致性），表头词表统一到 N-C 锚点词表，
+        补齐「姓名/成员/组员/联系人/参会人」等词；
+      - 单元格按整格文本脱敏，跨 run 姓名不再漏脱；
+      - 回写用 `redistribute_paragraph` 做差异级精确分配，未变更 run 原样保留。
 
     策略：遍历 <w:tbl>，收集表头行（<w:tr> 首行）的各单元格文本；
     含关键词的列，对该列所有单元格执行姓名规则替换。跳过纯数字表头（如"序号"）。
@@ -1087,12 +1111,16 @@ def _process_table_columns(doc_xml: Path, counts: dict) -> None:
         root = tree.getroot()
         W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 
+        from name_region_detector import detect_name_columns
+
         modified = False
         for tbl in root.iter(f"{W}tbl"):
             rows = list(tbl.iter(f"{W}tr"))
             if not rows:
                 continue
             # 收集表头行（取前2行作为候选表头行）
+            # N-C（§4.6）：表头可能跨多行 → 逐行**聚合**而非覆盖，
+            # 否则第 2 行（实为首个数据行）会覆盖真表头，导致列判定失效
             header_rows = rows[:2]
             header_cols = []  # List of (col_idx, header_text)
             for row in header_rows:
@@ -1105,38 +1133,96 @@ def _process_table_columns(doc_xml: Path, counts: dict) -> None:
                     if cell_text and not cell_text.isdigit():
                         header_cols.append((ci, cell_text))
 
-            # 确定需脱敏的列索引
-            redact_cols = set()
-            for ci, htext in header_cols:
-                for kw in _TABLE_HEADER_COL_KEYWORDS:
-                    if kw in htext:
-                        redact_cols.add(ci)
-                        break
+            # N-C T1：表头角色词 + 值列形态一致性 → 姓名列
+            # （旧逻辑仅按表头词匹配，且词表缺「姓名」类词）
+            #
+            # 【表头行数自适应】Word 表格的表头可能是 1 行也可能是 2 行，
+            # 固定取前 2 行会把首个数据行误当表头（实测「樊霖」行被吞，
+            # 导致该行未被脱敏）。故按 1→2 顺序尝试，取**首个能判定出
+            # 姓名列**的表头行数。
+            redact_cols: set = set()
+            header_count = 2
+            for hcount in (1, 2):
+                if hcount > len(rows):
+                    break
+                cand_header_cols = []
+                for row in rows[:hcount]:
+                    for ci, cell in enumerate(row.iter(f"{W}tc")):
+                        cell_text = "".join(
+                            t.text or "" for t in cell.iter(f"{W}t")
+                        ).strip()
+                        if cell_text and not cell_text.isdigit():
+                            cand_header_cols.append((ci, cell_text))
+                if not cand_header_cols:
+                    continue
+                max_cols = max((ci for ci, _ in cand_header_cols), default=-1) + 1
+                header_texts = [""] * max_cols
+                for ci, htext in cand_header_cols:
+                    # 聚合多行表头（用换行分隔，供 T1 逐行匹配）
+                    if header_texts[ci]:
+                        header_texts[ci] = header_texts[ci] + "\n" + htext
+                    else:
+                        header_texts[ci] = htext
+                data_rows = []
+                for row in rows[hcount:]:
+                    cells = list(row.iter(f"{W}tc"))
+                    data_rows.append([
+                        "".join(t.text or "" for t in cell.iter(f"{W}t")).strip()
+                        for cell in cells
+                    ])
+                cand_cols = set(detect_name_columns(header_texts, data_rows))
+                # 兼容旧行为：旧表头词表命中的列也纳入
+                for ci, htext in cand_header_cols:
+                    for kw in _TABLE_HEADER_COL_KEYWORDS:
+                        if kw in htext:
+                            cand_cols.add(ci)
+                            break
+                if cand_cols:
+                    redact_cols = cand_cols
+                    header_count = hcount
+                    break
+                if hcount == 1:
+                    header_count = 2  # 1 行表头未判定出姓名列，保留 2 行表头语义
 
             if not redact_cols:
                 continue
 
             # 对非表头行（含数据行）的指定列执行姓名脱敏
-            for row in rows[2:]:  # 跳过表头行
+            for row in rows[header_count:]:  # 跳过表头行
                 cells = list(row.iter(f"{W}tc"))
                 for ci in redact_cols:
                     if ci >= len(cells):
                         continue
                     cell = cells[ci]
-                    # 遍历 cell 内的 <w:t> 节点
-                    for t_elem in cell.iter(f"{W}t"):
-                        if t_elem.text:
-                            from common_rules import apply_redactions
-                            new_text = apply_redactions(t_elem.text)
-                            if new_text != t_elem.text:
-                                t_elem.text = new_text
-                                modified = True
-                                counts["表头列脱敏"] = counts.get("表头列脱敏", 0) + 1
+                    # N-C：整格文本脱敏 → 差异回写各 run
+                    t_nodes = list(cell.iter(f"{W}t"))
+                    if not t_nodes:
+                        continue
+                    node_texts = [t.text or "" for t in t_nodes]
+                    combined = "".join(node_texts)
+                    if not combined.strip():
+                        continue
+                    from common_rules import apply_redactions, redistribute_paragraph
+                    new_combined = apply_redactions(combined)
+                    # N-C：列头已声明该列是人名 → 对全局规则漏网的项补漏
+                    # （如「樊霖」这类高危姓+单字名，全局字频闸门会漏掉）
+                    if new_combined == combined:
+                        from name_region_detector import redact_name_cell
+                        new_combined = redact_name_cell(combined)
+                    if new_combined == combined:
+                        continue
+                    new_texts = redistribute_paragraph(node_texts, new_combined)
+                    for t_elem, old, new in zip(t_nodes, node_texts, new_texts):
+                        if old != new:
+                            t_elem.text = new
+                            modified = True
+                            counts["表头列脱敏"] = counts.get("表头列脱敏", 0) + 1
 
         if modified:
             tree.write(str(doc_xml), encoding="UTF-8", xml_declaration=True)
     except Exception:
         pass  # 表格解析失败不影响主流程
+
 
 
 # ---------------------------------------------------------------------------

@@ -20,7 +20,12 @@ from html import unescape as _html_unescape
 # ---------------------------------------------------------------------------
 
 # 表头角色词（精准匹配，大小写不敏感但目前均为中文）
-_ROLE_COLUMN_HEADER_WORDS: Set[str] = {
+#
+# N-C（Issue #50 §4.7「锚点词表收敛」）：本表与 common_rules 的段落角色词、
+# redact_word 的 Word 表头词表原本**分散三处、口径不一致**。现统一到
+# config.json 的 `name_anchor_words.role`，本表保留为**兜底最小集**
+# （配置缺失时使用），两者取并集，保证既有能力不退化。
+_ROLE_COLUMN_HEADER_WORDS_LOCAL: Set[str] = {
     # 核心角色列
     "姓名", "负责人", "联系人", "组长", "组员", "成员",
     # 扩展角色列
@@ -30,6 +35,25 @@ _ROLE_COLUMN_HEADER_WORDS: Set[str] = {
     # 机构角色
     "承办人", "主持人", "主讲人", "记录人",
 }
+
+
+def _load_anchor_role_words() -> Set[str]:
+    """从 config.json 的 name_anchor_words.role 读取表头角色词。
+
+    配置缺失或读取失败时返回空集（调用方回退到本地最小集）。
+    """
+    try:
+        from common_rules import _load_config
+        cfg = _load_config()
+        raw = (cfg.get("name_anchor_words") or {}).get("role") or []
+        return {w for w in raw if isinstance(w, str) and w}
+    except Exception:
+        return set()
+
+
+_ROLE_COLUMN_HEADER_WORDS: Set[str] = (
+    _ROLE_COLUMN_HEADER_WORDS_LOCAL | _load_anchor_role_words()
+)
 
 # 排除短语（出现则不触发该列的批量脱敏）
 _ROLE_COLUMN_EXCLUDED: Set[str] = {

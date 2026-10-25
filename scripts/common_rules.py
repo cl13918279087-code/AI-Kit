@@ -250,6 +250,24 @@ def get_name_pool_chars() -> str:
     return _clean_name_pool(pool)
 
 
+# D16 精确全名库（Issue #50 N-C 层需要「D16 命中」作为区域判定的种子信号）
+_FULL_NAME_SET_CACHE: Optional[set] = None
+
+
+def get_full_name_set() -> set:
+    """返回 D16 精确全名库（已剔除字段标签型污染条目）。
+
+    Issue #50 N-C 区域检测层把「区域内至少一项命中 D16」作为
+    上下文性准则的种子信号（§4.3 准则 2 / §4.5）。
+    """
+    global _FULL_NAME_SET_CACHE
+    if _FULL_NAME_SET_CACHE is None:
+        cfg = _load_config()
+        names = cfg.get("full_name_list", []) or []
+        _FULL_NAME_SET_CACHE = {n for n in names if n not in _D16_NON_NAME_ENTRIES}
+    return _FULL_NAME_SET_CACHE
+
+
 
 # 内置兜底名字池：config.json 的 name_pool 缺失或清洗后为空时启用。
 # 作用有二：
