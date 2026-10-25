@@ -1310,7 +1310,7 @@ def _merge_counts(base: dict, new: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# .doc 处理（通过 LibreOffice 转换为 .docx）
+# .doc 处理（多级备用转换链）
 # ---------------------------------------------------------------------------
 
 def _find_converter() -> Optional[str]:
@@ -1324,56 +1324,203 @@ def _find_converter() -> Optional[str]:
     return find_libreoffice()
 
 
+# R-㊸（Issue #33）：.doc 转换备用通道
+# ---------------------------------------------------------------------------
+# 【缺口】.doc（Word 97-2003 OLE2）脱敏此前**只有一条**通道：LibreOffice。
+#   实测问题：
+#     ① LibreOffice 未安装 → .doc 全部无法脱敏（#9 已定性为硬失败，但无兜底）
+#     ② LibreOffice 已安装但转换失败（DeploymentException / 文档损坏 /
+#       profile 占用）→ 直接 raise RuntimeError，该文件彻底无法处理
+#   两种情况下，用户只能手工「另存为 .docx」再重跑，批量作业直接中断。
+#
+# 【方案】三级备用转换链，逐级降级：
+#   L1 LibreOffice（保真最好，保留表格/页眉/页脚）——首选
+#   L2 textutil（macOS 系统自带，可转 .doc → .docx；保真略逊但可用）
+#   L3 antiword（Linux 常见，仅提取纯文本）→ 用 python-docx 重建 .docx
+#      （**仅保正文文字**，表格/格式丢失；作为最后兜底）
+#   全链失败 → 明确的错误信息 + 强制列入人工检查清单（沿用 #9 的安全口径：
+#   严禁以任何形式复制原文件充当输出，防「假脱敏」泄漏路径）。
+#
+# 【安全约束】L3 重建的 .docx **只含提取到的正文文字**，
+#   表格结构与格式信息会丢失。因此降级使用 L3 时必须：
+#     ① 在返回值中标记 degraded_level，供上层提示人工复核；
+#     ② 在人工检查清单中登记「格式信息丢失，需人工比对」。
+# ---------------------------------------------------------------------------
+
+def _convert_doc_via_libreoffice(input_path: str, tmp_dir: Path) -> Optional[Path]:
+    """L1：LibreOffice 转换。成功返回 .docx 路径，失败返回 None。"""
+    converter = _find_converter()
+    if not converter:
+        return None
+    try:
+        result = subprocess.run(
+            [
+                converter,
+                # R-⑪连带加固（v1.3.5）：独立用户 profile——
+                # 规避 GUI 实例占用/系统 profile 损坏导致的
+                # DeploymentException 偶发转换失败（本机实测复现）
+                "-env:UserInstallation=" + (tmp_dir / "lo_profile").as_uri(),
+                "--headless",
+                "--convert-to", "docx",
+                "--outdir", str(tmp_dir),
+                str(Path(input_path).resolve()),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        print(f"  [降级] LibreOffice 转换异常: {type(exc).__name__}: {exc}")
+        return None
+    if result.returncode != 0:
+        print(f"  [降级] LibreOffice 转换失败(returncode={result.returncode}): "
+              f"{(result.stderr or '')[:200]}")
+        return None
+    converted = next(tmp_dir.glob("*.docx"), None)
+    if converted is None:
+        print("  [降级] LibreOffice 未产出 .docx 文件")
+        return None
+    return converted
+
+
+def _convert_doc_via_textutil(input_path: str, tmp_dir: Path) -> Optional[Path]:
+    """L2：macOS 系统自带 textutil 转换 .doc → .docx。
+
+    textutil 属于 macOS 基础系统工具（/usr/bin/textutil），不需额外安装；
+    在 Linux/Windows 上不存在，直接跳过。
+    """
+    textutil = shutil.which("textutil")
+    if not textutil:
+        return None
+    out_dir = tmp_dir / "textutil"
+    out_dir.mkdir(exist_ok=True)
+    try:
+        result = subprocess.run(
+            [textutil, "-convert", "docx", "-output",
+             str(out_dir / "converted.docx"), str(Path(input_path).resolve())],
+            capture_output=True, text=True, timeout=120,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        print(f"  [降级] textutil 转换异常: {type(exc).__name__}: {exc}")
+        return None
+    if result.returncode != 0:
+        print(f"  [降级] textutil 转换失败: {(result.stderr or '')[:200]}")
+        return None
+    converted = out_dir / "converted.docx"
+    if not converted.exists() or converted.stat().st_size == 0:
+        print("  [降级] textutil 未产出有效 .docx 文件")
+        return None
+    return converted
+
+
+def _convert_doc_via_antiword(input_path: str, tmp_dir: Path) -> Optional[Path]:
+    """L3：antiword 提取纯文本 → python-docx 重建 .docx（最后兜底）。
+
+    ⚠️ 本级**丢失全部格式与表格结构**，仅保留正文文字。
+       调用方必须据此标记 degraded_level 并提示人工复核。
+    """
+    antiword = shutil.which("antiword")
+    if not antiword:
+        return None
+    try:
+        result = subprocess.run(
+            [antiword, "-m", "UTF-8.txt", str(Path(input_path).resolve())],
+            capture_output=True, timeout=120,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        print(f"  [降级] antiword 提取异常: {type(exc).__name__}: {exc}")
+        return None
+    if result.returncode != 0 or not result.stdout:
+        print("  [降级] antiword 提取失败或无内容")
+        return None
+    try:
+        import docx as _docx
+    except ImportError:
+        print("  [降级] python-docx 不可用，无法重建 .docx")
+        return None
+    try:
+        text = result.stdout.decode("utf-8", errors="replace")
+    except Exception:  # pragma: no cover - 防御
+        print("  [降级] antiword 输出解码失败")
+        return None
+    try:
+        document = _docx.Document()
+        # 按空行切段，保留基本段落结构（段落级文字仍会进入脱敏流程）
+        for para in [p.strip() for p in text.split("\n")]:
+            if para:
+                document.add_paragraph(para)
+        out = tmp_dir / "antiword_rebuilt.docx"
+        document.save(str(out))
+    except Exception as exc:  # pragma: no cover - 防御
+        print(f"  [降级] python-docx 重建失败: {type(exc).__name__}: {exc}")
+        return None
+    return out
+
+
+# 备用转换链：按保真度从高到低逐级尝试
+_DOC_CONVERTERS = (
+    ("LibreOffice", _convert_doc_via_libreoffice),
+    ("textutil", _convert_doc_via_textutil),
+    ("antiword", _convert_doc_via_antiword),
+)
+
+
 def redact_doc_to_docx(input_path: str, output_docx: str, detector=None) -> dict:
     """
-    将 .doc 转换为 .docx（LibreOffice）后处理。
-    注意：此转换会丢失部分旧格式（如 VBS 宏），普通文档格式基本保留。
+    将 .doc 转换为 .docx 后处理（多级备用转换链，Issue #33）。
+
+    转换链：LibreOffice → textutil（macOS）→ antiword 纯文本重建。
+    逐级降级，每级失败自动进入下一级；全链失败则终止并列入人工检查清单
+    （沿用 Issue #9 安全口径：**严禁复制原文件充当输出**）。
+
+    返回值额外含 `degraded_level`（None 表示未降级，取值为转换器名），
+    上层据此提示人工复核——L3（antiword）会丢失格式与表格结构。
     """
-    converter = _find_converter()
     tmp_dir = Path(tempfile.mkdtemp(prefix="doc_convert_"))
 
     try:
-        if converter:
-            result = subprocess.run(
-                [
-                    converter,
-                    # R-⑪连带加固（v1.3.5）：独立用户 profile——
-                    # 规避 GUI 实例占用/系统 profile 损坏导致的
-                    # DeploymentException 偶发转换失败（本机实测复现）
-                    "-env:UserInstallation=" + (tmp_dir / "lo_profile").as_uri(),
-                    "--headless",
-                    "--convert-to", "docx",
-                    "--outdir", str(tmp_dir),
-                    str(Path(input_path).resolve()),
-                ],
-                capture_output=True,
-                text=True,
-                timeout=120,
-            )
-            if result.returncode != 0:
-                print(f"  [警告] LibreOffice 转换失败: {result.stderr[:200]}")
-                raise RuntimeError("conversion failed")
+        converted = None
+        used_converter = None
+        for name, fn in _DOC_CONVERTERS:
+            converted = fn(input_path, tmp_dir)
+            if converted is not None:
+                used_converter = name
+                if name != "LibreOffice":
+                    print(f"  [降级] 已使用备用转换器 {name} 完成 .doc → .docx 转换")
+                break
+            print(f"  [降级] {name} 通道不可用，尝试下一级")
 
-            converted = next(tmp_dir.glob("*.docx"), None)
-            if converted is None:
-                raise RuntimeError("no output file found")
-            shutil.copy2(converted, output_docx)
-        else:
-            # R-④（v1.3.2，响应 Issue #9）：环境无 LibreOffice 时 .doc 无法脱敏。
+        if converted is None:
+            # R-④（v1.3.2，响应 Issue #9）：全链失败时 .doc 无法脱敏。
             # 严禁以任何形式复制原文件充当输出（防"假脱敏"泄漏路径），
             # 改为终止处理并强制列入人工检查清单。
             _mark_manual_check(
                 Path(input_path).name,
-                "环境未安装 LibreOffice，.doc 文件未脱敏。请安装 LibreOffice "
+                ".doc 转换全链失败（LibreOffice / textutil / antiword 均不可用或失败），"
+                "文件未脱敏。请安装 LibreOffice "
                 "(https://www.libreoffice.org/) 后重跑，或先在 Word/WPS 中"
                 "另存为 .docx 再处理。处理完成前该文件须按未脱敏文件管理。",
             )
             raise RuntimeError(
-                "未找到 LibreOffice，.doc 文件无法脱敏（已拒绝生成输出文件）。"
+                ".doc 转换全链失败（已尝试 LibreOffice / textutil / antiword），"
+                ".doc 文件无法脱敏（已拒绝生成输出文件）。"
                 "请安装 LibreOffice 或将文件另存为 .docx 后重试。"
             )
 
-        return redact_docx(output_docx, output_docx, detector=detector)
+        shutil.copy2(converted, output_docx)
+
+        result = redact_docx(output_docx, output_docx, detector=detector)
+        # 记录实际使用的转换器，供上层提示人工复核
+        degraded = None if used_converter == "LibreOffice" else used_converter
+        if isinstance(result, dict):
+            result["doc_converter"] = used_converter
+            result["degraded_level"] = degraded
+            if degraded:
+                result["degraded_note"] = (
+                    f".doc 经 {degraded} 转换，格式/表格结构可能丢失，"
+                    f"需人工比对确认脱敏完整。"
+                )
+        return result
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 

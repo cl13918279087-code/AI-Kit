@@ -722,6 +722,136 @@ _COMMON_BIGRAMS: set = {
 }
 
 
+# ---------------------------------------------------------------------------
+# R-㊷（Issue #49 收尾，2026-10-26）：业务词保护守卫（跨词边界误伤收敛）
+#
+# 【问题】尖刀语料实测的 17 处剩余误伤，除「名单块误判」外，绝大多数是
+#   **跨词边界切词误伤**：姓名规则以「姓氏+名字池字」形态切出的片段，
+#   实际横跨了两个业务词的边界（词的尾字 + 下一词的首字）：
+#     「保证金子户」→ 切出「金子」   （保证金|子户）
+#     「保函赔付金额」→ 切出「付金」 （赔付|金额）
+#     「金额不能大于可转出」→ 切出「于可」（大于|可转出）
+#     「逾期剩余本金」→ 切出「余本金」（剩余|本金）
+#     「白名单维护」→ 切出「单维」 （名单|维护）
+#     「核对池业务台账」→ 切出「池业」（核对池|业务）
+#
+# 【解法】业务词保护表（config.json 的 biz_guard_words）+ 三类守卫：
+#   G1 跨界守卫：命中片段 [s,e) 若与某业务词的出现区间 [ws,we) 交叉
+#       （即该业务词的尾字落在命中内、或命中片段首字落在该业务词内部），
+#       则说明这是「切开了一个业务词」而非识别出一个人名 → 保留原文。
+#   G2 整体命中守卫：命中片段本身即为某业务词（全部/单位/名单…）→ 保留原文。
+#   G3 指示词守卫：命中片段由指示词/代词构成（上述所有/以下/相关…）→ 保留原文。
+#
+# 【词表来源】真实语料（119 份文档 + 通用语料 102 条）挖掘的高频 2~4 字业务词，
+#   并**双向剔除**与 D16 全名库（7398 条）、824 条金标真名有包含关系的词——
+#   即保护表内不可能含任何真名，故本守卫不会造成真名漏脱。
+# ---------------------------------------------------------------------------
+
+_BIZ_GUARD_WORDS: Optional[set] = None
+_BIZ_GUARD_MAXLEN: int = 0
+_BIZ_WORDS_BY_FIRST: Optional[Dict[str, set]] = None
+
+
+def _get_biz_guard_words() -> set:
+    """取业务词保护表（config.json → biz_guard_words），带缓存。"""
+    global _BIZ_GUARD_WORDS, _BIZ_GUARD_MAXLEN
+    if _BIZ_GUARD_WORDS is None:
+        cfg = _load_config()
+        words = {w for w in (cfg.get("biz_guard_words") or []) if isinstance(w, str) and w}
+        _BIZ_GUARD_WORDS = words
+        _BIZ_GUARD_MAXLEN = max((len(w) for w in words), default=0)
+    return _BIZ_GUARD_WORDS
+
+
+# 指示词/代词：本身绝不可能是人名，被切出来即为误伤
+_BIZ_INDICATOR_WORDS: set = {
+    "上述", "以下", "如下", "前述", "相关", "其他", "其它", "所有",
+    "全部", "各个", "各项", "各类", "本行", "该行", "本行",
+}
+
+
+def _find_biz_word_spans(text: str, window: Optional[Tuple[int, int]] = None) -> List[Tuple[int, int]]:
+    """在文本中找出所有业务词保护词的出现区间 [(start, end), ...]。
+
+    【性能】按首字建倒排索引，单次扫描 O(len(seg) × 该首字下的词数)，
+    避免对每个候选位置全量遍历 135+ 个词。
+    【窗口】window=(lo, hi) 表示只在 text[lo:hi] 内查找，返回绝对坐标。
+    """
+    words = _get_biz_guard_words()
+    if not words or not text:
+        return []
+    lo, hi = window if window else (0, len(text))
+    seg = text[lo:hi]
+    if not seg:
+        return []
+    spans: List[Tuple[int, int]] = []
+    by_first = _get_biz_words_by_first()
+    for i, ch in enumerate(seg):
+        cands = by_first.get(ch)
+        if not cands:
+            continue
+        for w in cands:
+            if seg.startswith(w, i):
+                spans.append((lo + i, lo + i + len(w)))
+    return spans
+
+
+def _get_biz_words_by_first() -> Dict[str, set]:
+    """业务词按首字分组的倒排索引（带缓存）。"""
+    global _BIZ_WORDS_BY_FIRST
+    if _BIZ_WORDS_BY_FIRST is None:
+        by_first: Dict[str, set] = {}
+        for w in _get_biz_guard_words():
+            by_first.setdefault(w[0], set()).add(w)
+        _BIZ_WORDS_BY_FIRST = by_first
+    return _BIZ_WORDS_BY_FIRST
+
+
+def _is_protected_by_biz_word(text: str, start: int, end: int,
+                              biz_spans: Optional[List[Tuple[int, int]]] = None) -> bool:
+    """判断姓名命中片段 text[start:end] 是否属于业务词误伤。
+
+    G1 跨界守卫：命中片段与某业务词区间交叉（词的尾字在命中内，
+       或命中首字在词内部）→ 说明切词切到了业务词上。
+    G2 整体命中：命中片段本身就是业务词。
+    G3 指示词：命中片段由指示词/代词构成。
+    """
+    matched = text[start:end]
+    if not matched:
+        return False
+
+    # G3 指示词守卫：命中片段内含指示词且整体不是姓名形态
+    # （"上述所有" 含 "上述"+"所有"，但不含姓氏位）
+    if any(ind in matched for ind in _BIZ_INDICATOR_WORDS):
+        if matched not in _get_biz_guard_words():
+            # 片段整体也可能是真名（极少），仅当不含姓氏字时才判定为指示词
+            if not (matched[0] in SURNAME_SET and len(matched) <= 3):
+                return True
+
+    words = _get_biz_guard_words()
+    if not words:
+        return False
+
+    # G2 整体命中守卫：命中片段本身就是业务词
+    if matched in words:
+        return True
+
+    # G1 跨界守卫：命中片段与某业务词区间交叉
+    # 【窗口】跨界只可能发生在命中边界附近，业务词最长 4 字，
+    #   故左右各取 6 字足以覆盖跨界判定，避免全文本扫描。
+    if biz_spans is not None:
+        spans = biz_spans
+    else:
+        lo = max(0, start - 6)
+        hi = min(len(text), end + 6)
+        spans = _find_biz_word_spans(text, window=(lo, hi))
+    for ws, we in spans:
+        # 命中片段与业务词区间相交（含被完全包含）→ 切词误伤
+        if ws < end and start < we:
+            return True
+    return False
+
+
 def _is_protected_by_common_word(text: str, start: int, end: int) -> bool:
     """判断 text[start:end] 命中片段是否被某个排除常用词完整覆盖。"""
     matched = text[start:end]
@@ -752,6 +882,9 @@ def _name_guard_sub(pattern: re.Pattern, text: str, replacement: str) -> str:
     """带常用词保护的姓名规则替换。"""
     def _repl(m: re.Match) -> str:
         if _is_protected_by_common_word(m.string, m.start(), m.end()):
+            return m.group(0)
+        # R-㊷：业务词保护守卫（G1 跨界 / G2 整体 / G3 指示词）
+        if _is_protected_by_biz_word(m.string, m.start(), m.end()):
             return m.group(0)
         return replacement
     return pattern.sub(_repl, text)
@@ -1330,7 +1463,7 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
             r"(全省|全辖|辖内|各级|各)(农商|农村商业|农信|农合)(银行|行)"
         )
         _BANK_BIZ_SYSTEM_RE = re.compile(
-            r"(微信|视频|远程|电话|手机|网上|直销|数字|智慧|云|个人)(?=银行)"
+            r"(微信|视频|远程|电话|手机|网上|直销|数字|智慧|云|个人|电子)(?=银行)"
         )
         _BANK_DEPT_SUFFIX_RE = re.compile(
             r"[\u4e00-\u9fa5]{2,6}银行[部处科局]"
@@ -1919,6 +2052,14 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
             return block  # 无确认真名 → 不动（避免把业务词并列误判为名单）
         if _is_protected_by_common_word(m.string, m.start(), m.end()):
             return block
+        # R-㊷（业务词守卫）：块内任一项命中业务词 → 整块放弃。
+        # 理由：名单块的一致性证据建立在「块内各项都是同一类东西」上，
+        # 一旦出现「白名单、单位」「活期、定期」这类业务词并列，
+        # 说明整个块是业务枚举而非人员名单，不应按名单脱敏。
+        for it in items:
+            s = it.strip()
+            if s and _is_protected_by_biz_word(it, 0, len(it)):
+                return block
         out = []
         for it in items:
             if re.fullmatch(_list_sep, it):
@@ -1989,6 +2130,11 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
             if s[0] not in _s4_gated_surnames:
                 return block
             if any(c not in name_pool_chars for c in s[1:]):
+                return block
+            # R-㊷（业务词守卫）：项命中业务词 → 整块放弃。
+            # S4 的证据是「块内每项都是严格姓名形态」，一旦某项其实是
+            # 业务词（白名单/单位/活期/定期…），说明整个块不是人员名单。
+            if _is_protected_by_biz_word(it, 0, len(it)):
                 return block
         out = []
         for it in parts:
@@ -2612,6 +2758,9 @@ def _list_name_repl(m: re.Match) -> str:
             # 检查残字：若替换后前一块末字+当前块=残字组合则跳过
             if result and len(p) >= 2 and p[0] in _RESIDUE_STOP:
                 result.append(p)
+            # R-㊷：列表项本身命中业务词（活期/定期/票据池/商票保贴…）→ 保留原项
+            elif _is_protected_by_biz_word(p, 0, len(p)):
+                result.append(p)
             else:
                 result.append("XX" * (len(p) // 2))
         else:
@@ -2813,6 +2962,9 @@ def _name_guard_sub_counted(pattern: re.Pattern, text: str, replacement: str,
 
     def _repl(m: re.Match) -> str:
         if _is_protected_by_common_word(m.string, m.start(), m.end()):
+            return m.group(0)
+        # R-㊷：业务词保护守卫（G1 跨界 / G2 整体 / G3 指示词）
+        if _is_protected_by_biz_word(m.string, m.start(), m.end()):
             return m.group(0)
         # Agent 评审决策跳过：若本轮匹配文本在 skip 集合中，不遮盖
         if _get_skip_texts() and m.group(0) in _get_skip_texts():

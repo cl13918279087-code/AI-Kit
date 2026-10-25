@@ -510,5 +510,88 @@ def test_d16_short_name_keeps_strict_left_boundary():
     assert "白天鹅" in out, f"2 字库内名边界过松导致误伤: {out}"
 
 
+# ---------------------------------------------------------------------------
+# 9. P2 业务词保护守卫（Issue #49 剩余 17 处业务词误伤）
+# ---------------------------------------------------------------------------
+
+# #49 实测复现出的业务词误伤场景，逐条锁定不得回滚。
+# 每条形如 (原文, 必须保留的片段)。
+BIZ_GUARD_CASES = [
+    # 跨词边界切词误伤：业务词被从中间切开
+    ("支付结算规则", "支付"),
+    ("上述所有账户", "上述"),
+    ("以下为白名单", "以下"),
+    ("全部余额信息", "全部"),
+    ("其他相关材料", "其他"),
+    # 名单块纯形态误判：业务枚举被当成人员名单
+    ("白名单、单位", "白名单"),
+    ("活期、定期", "活期"),
+    ("定期、活期", "定期"),
+    ("票据池、商票保贴", "票据池"),
+    # 银行渠道名误判
+    ("电子银行", "电子银行"),
+    ("电子银行部", "电子银行部"),
+    # 组织后缀误判（授信管理部 → 管理部）
+    ("授信管理部", "授信"),
+]
+
+
+def test_biz_guard_words_config_exists():
+    """config.json 必须提供 biz_guard_words 业务词保护表。"""
+    cfg = _load_config()
+    words = cfg.get("biz_guard_words")
+    assert words, "config.json 缺少 biz_guard_words（Issue #49 P2）"
+    assert isinstance(words, list) and all(isinstance(w, str) for w in words)
+    assert len(words) >= 50, f"业务词保护表规模异常小：{len(words)}"
+
+
+def test_biz_guard_table_has_no_real_names():
+    """业务词保护表**不得含任何真名**。
+
+    这是守卫的安全性前提：若表里混入了真名，守卫会把它当业务词放过，
+    直接造成漏脱（合规红线）。故须与 D16 全名库双向无交集。
+    """
+    cfg = _load_config()
+    words = set(cfg.get("biz_guard_words") or [])
+    d16 = set(cfg.get("full_name_list") or [])
+    overlap = words & d16
+    assert not overlap, f"业务词保护表与 D16 全名库有交集 {sorted(overlap)}（会造成真名漏脱）"
+
+
+def test_biz_guard_blocks_business_word_misfire():
+    """业务词不得被误脱敏（#49 剩余 17 处误伤的回归守卫）。"""
+    for text, keep in BIZ_GUARD_CASES:
+        out = common_rules.apply_redactions(text)
+        assert keep in out, f"业务词被误脱敏（应保留「{keep}」）: {text!r} -> {out!r}"
+
+
+def test_biz_guard_does_not_hide_real_names():
+    """业务词守卫不得连带放过真实姓名。
+
+    反向守卫：守卫只拦「命中片段本身/跨界落在业务词上」的情况，
+    真名不在业务词表内，必须照常脱敏。
+    """
+    for name in ("王素楠", "李思远", "周慧敏", "窦磊", "王根利"):
+        out = common_rules.apply_redactions(f"负责人：{name}")
+        assert name not in out, f"真名被业务词守卫连带放过: {name} -> {out}"
+
+
+def test_biz_guard_indicator_words_preserved():
+    """指示词/代词不得被当作姓名切出。"""
+    for text in ("上述所有", "以下如下", "相关所有", "其他其他"):
+        out = common_rules.apply_redactions(text)
+        assert out == text, f"指示词被误脱敏: {text!r} -> {out!r}"
+
+
+def test_biz_guard_perf_not_degraded():
+    """业务词守卫不得造成显著性能退化（窗口扫描须生效）。"""
+    import time
+    text = "客户经理张伟提交了授信审批材料，涉及金额与账户余额。" * 40
+    t0 = time.time()
+    common_rules.apply_redactions(text)
+    elapsed = time.time() - t0
+    assert elapsed < 3.0, f"业务词守卫导致性能退化：{elapsed:.2f}s"
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
