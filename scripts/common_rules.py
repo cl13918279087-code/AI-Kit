@@ -3062,6 +3062,25 @@ def apply_redactions_counted(text: str) -> Tuple[str, Dict[str, int]]:
         "银行", "支行", "分行", "营业部", "分理处",
         "公司", "中心", "学校", "学院", "大学", "医院", "集团", "研究院",
     )
+    # 路型后缀守卫（2026-10-26，修复 #45 扩池引入的既有回归）
+    #
+    # 背景：Issue #45 精确全名匹配把姓名池从 152 扩到 1283 字，「路/道/号」
+    # 等**地址用字**随之进入名字池。于是本恢复段把地址通道**自身输出的**
+    # 「XX路」「XX号」占位符误判为"被截断的姓名片段"，合并成 XXX：
+    #     位于XX路XX号  →  XXXXX号      （期望：位于XX路XX号）
+    # 即地址占位符被吃掉、路名与门牌号的结构丢失（R15 门禁用例
+    # test_address_tail 实测失败，二分定位引入点为 86f0bd5 / Issue #45）。
+    #
+    # 判别依据：恢复段的语义是"地址通道把一个**姓名**截断了 → 还原成完整姓名"。
+    # 若 XX 后紧跟的字是**路型/门牌型后缀**（街路巷弄道号），说明这个 XX 是
+    # 地址通道自己吐出的占位符（地址通道的终态就是「XX路XX号」），而不是被
+    # 截断的姓名片段——此时绝不合并。
+    #
+    # 与机构后缀守卫（R-⑱）的关系：R-⑱ 拦的是"XX+机构名"（XX银行/XX支行），
+    # 本守卫拦的是"XX+路型/门牌后缀"（XX路/XX号）。**行政后缀（镇/村/县/区/
+    # 市/省）刻意不纳入**——「XX镇」是中间态而非终态，须由本段合并回姓名，
+    # 以保住"黄日镇→XXX"既有修复场景。
+    _RECOVERY_ROAD_SUFFIX_CHARS = frozenset("街路巷弄道号")
     # 扫描所有 XX{single_name_char} 的位置
     _pos = 0
     while True:
@@ -3076,6 +3095,10 @@ def apply_redactions_counted(text: str) -> Tuple[str, Dict[str, int]]:
                 if _idx + 2 < len(result):
                     _ch_after = result[_idx + 2]
                     if _ch_after in _name_chars:
+                        # 路型/门牌后缀守卫：XX 是地址通道自身的占位符，非姓名片段
+                        if _ch_after in _RECOVERY_ROAD_SUFFIX_CHARS:
+                            _pos = _idx + 2
+                            continue
                         # R-⑱：XX 后以机构后缀开头 → 机构占位符，非截断姓名，跳过
                         if any(result.startswith(suf, _idx + 2)
                                for suf in _RECOVERY_ORG_SUFFIXES):
