@@ -383,5 +383,132 @@ def test_name_char_class_escapes_metacharacters():
     )
 
 
+# ---------------------------------------------------------------------------
+# 9. Issue #49 P1 分层规则回归（2026-10-26 实证确认）
+# ---------------------------------------------------------------------------
+
+def test_d16_exact_layer_allows_following_digit():
+    """D16 精确层右边界不得因「名字后紧跟数字」而漏脱。
+
+    回归背景：原右边界为 `(?![a-zA-Z0-9])`，把「强峰4.3业务准备」这类
+    「名字+数字」形态整类拦掉——119 份真实文档中导致 60/824 条金标漏脱。
+    数字并非英文，应允许其跟随；字母仍需排除（库内 15 条带字母后缀的条目
+    如 刘磊CL/李丹JYEB 已按长名优先整体匹配）。
+    """
+    cfg = _load_config()
+    names = cfg.get("full_name_list") or []
+    assert names, "config.json 缺少 full_name_list"
+    # 挑一个库内真名（排除字段标签类条目），构造「真名+数字」形态
+    target = None
+    for n in names:
+        if (len(n) == 2 and all("一" <= c <= "鿿" for c in n)
+                and n not in common_rules._D16_NON_NAME_ENTRIES):
+            target = n
+            break
+    assert target, "库内无可用的双字中文全名"
+    out = common_rules.apply_redactions(f"{target}4.3业务准备")
+    assert target not in out, (
+        f"「{target}4.3」未被脱敏——D16 右边界错误排除了数字跟随: {out}"
+    )
+
+
+def test_list_block_rescue_keeps_separator_and_masks_all():
+    """名单块救援必须保留顿号，且块内各项**全部**脱敏。
+
+    回归背景：S2 名单块救援的回调有两个缺陷——
+      1. `re.split` 未保留分隔符 → 顿号被吞掉；
+      2. 只替换非 D16 项、保留 D16 项 → 替换占位符 `XXX`（ASCII 字母）
+         紧贴保留的 D16 名，使 D16 层右边界 `(?![a-zA-Z0-9])` 失效，
+         该 D16 名永远匹配不到（实测金标保留率从 88.7% 掉到 63.7%）。
+    现改为「块内各项统一替换」，与 D16 层的执行顺序彻底解耦。
+    """
+    text = "项目组成员如下：郑云、杨瑜"
+    out = common_rules.apply_redactions(text)
+    assert "、" in out, f"名单顿号被吞掉: {out}"
+    assert "郑云" not in out, f"块内确认真名未脱敏: {out}"
+    assert "杨瑜" not in out, f"块内非确认真名未脱敏: {out}"
+
+
+def test_list_block_rescue_no_false_positive_on_business_words():
+    """名单块救援不得把业务词并列误判为名单。"""
+    text = "本次调整涉及成本控制、需求变更两项内容"
+    out = common_rules.apply_redactions(text)
+    assert "成本控制" in out, f"业务词被误脱敏: {out}"
+    assert "需求变更" in out, f"业务词被误脱敏: {out}"
+
+
+def test_d16_non_name_entries_filtered():
+    """D16 库中的字段标签类条目（如「姓名」）不得被当作人名。
+
+    回归背景：库中混入了「姓名」这一字段标签，导致「请填写姓名」→「请填写XXX」。
+    修复方式为显式清单过滤（_D16_NON_NAME_ENTRIES），而非改数据文件——
+    上游修正 full_name_list 后可自动恢复。
+    """
+    assert "姓名" in common_rules._D16_NON_NAME_ENTRIES, (
+        "D16 非人名条目过滤清单丢失「姓名」"
+    )
+    out = common_rules.apply_redactions("请填写姓名")
+    assert "请填写姓名" in out, f"字段标签被误脱敏: {out}"
+
+
+def test_name_rule_mode_graded_is_default():
+    """默认必须走 graded（分层）模式，strict 仅作应急回退。"""
+    cfg = _load_config()
+    assert cfg.get("name_rule_mode") == "graded", (
+        f"name_rule_mode 应为 graded，实际 {cfg.get('name_rule_mode')!r}"
+    )
+
+
+def test_list_block_regex_captures_whole_block():
+    """名单块正则必须**真正捕获整块**，而不是只捕获「第一项+分隔符」。
+
+    回归背景：S2/S4 的块正则原写作 `(?:sep(?=item))+`——用**前瞻**表达
+    「分隔符 + 项」，导致捕获组 `block` 只含「第一项 + 分隔符」，
+    整个块并未被捕获。后果是本规则赖以成立的**块内一致性证据整体失效**：
+      S2「块内含 D16 确认真名」退化为「该单项是否在 D16」
+      S4「块内每一项都符合严格形态」退化为「该单项符合即可」
+    实测症状：真实文档「王松/吴学亮/叶新林/马娟」中，
+    块只捕获到「叶新林/」，叶新林反而漏脱。
+
+    本测试直接断言块正则捕获到的是**整块**。
+    """
+    text = "王松/吴学亮/叶新林/马娟"
+    out = common_rules.apply_redactions(text)
+    # 整块脱敏：四项全部消失，斜杠保留
+    for name in ("王松", "吴学亮", "叶新林", "马娟"):
+        assert name not in out, f"名单块整块未脱敏（{name} 残留）: {out}"
+    assert "/" in out, f"分隔符被吞掉: {out}"
+
+
+def test_d16_left_boundary_allows_ascii_prefix():
+    """D16 精确层左边界必须允许 ASCII/数字/标点前缀（3 字及以上）。
+
+    回归背景：原左边界 `(?<![a-zA-Z0-9])` 把「ASCII/数字 + 姓名」形态
+    整类拦掉。真实文档里这类形态极常见（表格里姓名紧贴系统代号/人数）：
+      IDATA-BDS季海涛 / FB-APPSVR卫海啸 / 研发组11张海翔
+    实测导致 119 份文档中多条**库内确认真名**漏脱。
+
+    修正为按长度分层：2 字名保持严格左边界（短名易与常用词碰撞），
+    3 字及以上放宽为 `(?<![\\u4e00-\\u9fa5])`（只排除紧跟汉字）。
+    """
+    # 3 字库内名 + ASCII 前缀 → 必须被脱敏
+    out = common_rules.apply_redactions("IDATA-BDS季海涛")
+    assert "季海涛" not in out, f"ASCII 前缀导致库内真名漏脱: {out}"
+    # 数字前缀同样放行
+    out = common_rules.apply_redactions("研发组11张海翔")
+    assert "张海翔" not in out, f"数字前缀导致库内真名漏脱: {out}"
+
+
+def test_d16_short_name_keeps_strict_left_boundary():
+    """2 字库内名必须保持严格左边界，不得因放宽而误伤常用词。"""
+    # 「白天鹅」中的「白天」——若 D16 有「白天」则不应误伤
+    cfg = _load_config()
+    fl = cfg.get("full_name_list") or []
+    if "白天" not in fl:
+        pytest.skip("D16 库中无「白天」，跳过该断言")
+    out = common_rules.apply_redactions("白天鹅")
+    assert "白天鹅" in out, f"2 字库内名边界过松导致误伤: {out}"
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

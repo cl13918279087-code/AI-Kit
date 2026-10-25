@@ -298,6 +298,251 @@ def _build_name_char_class(chars: str) -> str:
     escaped = "".join("\\" + c if c in "\\]^-[" else c for c in chars)
     return "[" + escaped + "]"
 
+
+# ---------------------------------------------------------------------------
+# Issue #49 P1：分级规则集（姓氏分档 + 名字位字频闸门）
+# ---------------------------------------------------------------------------
+#
+# 背景：#45 扩池后 surname_pool×name_pool 笛卡尔积从 ≈3 万扩到 ≈53 万，
+# 其中超出真实人名增量的部分全是日常汉语常用字，导致规则A 大面积误伤。
+#
+# P1 的判别主杠杆是「名字位字频闸门」——只允许在真实人名里高频出现的字
+# 充当名字位。字频来源是项目自带的 D16 全名库（full_name_list 7398 条）
+# **自举**：统计每个名字位（name[1:]）的字频，无需外部词表、无外部依赖。
+#
+# 关键设计：闸门用**字符类收紧**实现（名字字符类只含高频字），
+# 而不是在替换回调里做后置判定。原因是贪婪量词下后置判定会漏脱：
+#   "张明和" —— 全池字符类会先匹到 "张明和"，回调判定 "和" 非高频字而整体
+#   放弃 → "张明" 反而漏脱；字符类收紧则只匹 "张明"，"和" 留在外面。
+#
+# 姓名整体匹配（而非逐字）的取舍依据不变：漏脱属合规红线，误伤属可用性缺陷。
+
+# 名字位字频闸门参数（可经 config.json 覆盖）
+_NAME_GATE_MIN_FREQ = 12          # 名字位「热字」下限（尾字必须达到）
+_NAME_GATE_WARM_MIN_FREQ = 3      # 名字位「温字」下限（非尾字允许达到）
+_NAME_GATE_SURNAME_MIN_FREQ = 5   # 姓氏位字频下限（D16 库中作姓出现的次数）
+_NAME_GATE_LOW_RANGE = (1, 3)     # 低危姓：姓 + 1~3 名字字
+_NAME_GATE_HIGH_RANGE = (2, 3)    # 高危姓：姓 + 2~3 名字字
+_NAME_GATE_ANCHOR_RANGE = (1, 2)  # 上下文锚点：锚点 + 任意姓 + 1~2 名字字
+
+# 上下文锚点词表（复用 #38 D8/D11 角色槽位）
+_NAME_GATE_ANCHORS = (
+    "负责人", "联系人", "成员", "人员", "组长", "经理", "主任", "总监", "名单",
+    "参会", "出席", "签名", "签字", "汇报", "由", "请", "联系", "支持人员",
+    "配合人", "经办人", "办理人", "授权人", "审批人", "复核人", "申请人",
+    "填报人", "签字栏",
+)
+
+# 常见复姓（Issue #49 P1 新增）：无复姓表时「司马光」「欧阳娜娜」等
+# 会被拆成「司 + 马光」而漏掉末字，或让「马」单独充当姓。
+_NAME_GATE_COMPOUND_SURNAMES = (
+    "欧阳", "司马", "上官", "诸葛", "夏侯", "皇甫", "尉迟", "长孙", "慕容",
+    "司徒", "司空", "独孤", "南宫", "西门", "东方", "令狐", "宇文", "端木",
+    "公孙", "轩辕", "澹台", "闻人", "第五", "梁丘", "左丘", "东郭", "仲孙",
+    "钟离", "闾丘", "夹谷", "宰父", "谷梁", "拓跋", "百里", "呼延", "东野",
+    "羊舌", "微生", "公良", "太叔", "申屠", "公羊", "乐正", "壤驷", "公冶",
+    "淳于", "太叔",
+)
+
+# D16 全名库中的「非人名」条目（字段标签 / 表头），必须排除出精确匹配层。
+# 背景：实测 full_name_list 含「姓名」——它是文档字段名不是人名，
+# 精确层会把它替换成 XXX（「请填写姓名」→「请填写XXX」），属误伤。
+_D16_NON_NAME_ENTRIES = frozenset({"姓名"})
+
+# D16 全名库名字位字频缓存（按全名库内容 key）
+_NAME_CHAR_FREQ_CACHE: Dict[str, Any] = {}
+
+
+def _get_name_char_freq(cfg: Optional[Dict] = None) -> Dict[str, int]:
+    """从 D16 全名库自举名字位字频。
+
+    统计 full_name_list 中每个名字位（name[1:]，跳过姓位）的字频。
+    数据源完全自洽——不依赖 jieba、不依赖外部词表。
+
+    返回 {字: 字频}；全名库缺失时返回空 dict（调用方须降级到全池）。
+    """
+    if cfg is None:
+        cfg = _load_config()
+    names = cfg.get("full_name_list") or []
+    key = f"{len(names)}:{hash(tuple(names[:64]))}"
+    cached = _NAME_CHAR_FREQ_CACHE.get(key)
+    if cached is not None:
+        return cached
+    freq: Dict[str, int] = {}
+    for name in names:
+        for ch in name[1:]:
+            freq[ch] = freq.get(ch, 0) + 1
+    _NAME_CHAR_FREQ_CACHE.clear()
+    _NAME_CHAR_FREQ_CACHE[key] = freq
+    return freq
+
+
+def _get_gated_name_chars(cfg: Optional[Dict] = None) -> str:
+    """取名字位「热字」序列（已与清洗后的 name_pool 取交集）。
+
+    - 闸门阈值：名字位字频 ≥ `name_gate_min_freq`（默认 12，对应 D16 库
+      总字次的约千分之一，实测 261/1278 字通过）；
+    - 与 `name_pool` 取交集：闸门只做「收紧」不做「扩张」，
+      避免把 name_pool 之外的字引入字符类；
+    - 交集为空时回退到全池（闸门不可用时宁可多误伤也不漏脱）。
+    """
+    if cfg is None:
+        cfg = _load_config()
+    pool_chars = _get_name_pool_chars(cfg)
+    if not pool_chars:
+        return ""
+    threshold = cfg.get("name_gate_min_freq", _NAME_GATE_MIN_FREQ)
+    try:
+        threshold = int(threshold)
+    except (TypeError, ValueError):
+        threshold = _NAME_GATE_MIN_FREQ
+    if threshold <= 0:
+        return pool_chars
+    freq = _get_name_char_freq(cfg)
+    if not freq:
+        return pool_chars
+    hot = {ch for ch, f in freq.items() if f >= threshold}
+    gated = "".join(ch for ch in pool_chars if ch in hot)
+    return gated or pool_chars
+
+
+def _get_warm_name_chars(cfg: Optional[Dict] = None) -> str:
+    """取名字位「温字」序列（名字位非尾字允许的字）。
+
+    阈值 `name_gate_warm_freq`（默认 3）：D16 全名库中作为名字位出现 ≥3 次。
+
+    **为什么需要「温字」这一档**（Issue #49 P1 实证）：
+    「热字独占」判据（名字位每字都必须是热字）会漏掉真实人名 ——
+    「王根利」的「根」在 D16 名字位仅出现 3 次，但它是真实人名用字；
+    而「温字 + 尾字热」判据（尾字必须是热字，前 1~2 字允许温字）
+    既保住「王根利」，又能挡住「流程优化」这类
+    「冷姓 + 冷字 + 冷字」的常用词结构。
+
+    实证（102 条通用语料 / 12 条真名）：
+      尾字热 + 前字温（尾字热字 + 前 ≤2 温字） → 误伤 9、真名漏 1（樊霖）
+      尾字热 + 前字全热                       → 误伤 12、真名漏 1
+    """
+    if cfg is None:
+        cfg = _load_config()
+    pool_chars = _get_name_pool_chars(cfg)
+    if not pool_chars:
+        return ""
+    threshold = cfg.get("name_gate_warm_freq", _NAME_GATE_WARM_MIN_FREQ)
+    try:
+        threshold = int(threshold)
+    except (TypeError, ValueError):
+        threshold = _NAME_GATE_WARM_MIN_FREQ
+    if threshold <= 0:
+        return pool_chars
+    freq = _get_name_char_freq(cfg)
+    if not freq:
+        return pool_chars
+    warm = {ch for ch, f in freq.items() if f >= threshold}
+    gated = "".join(ch for ch in pool_chars if ch in warm)
+    return gated or pool_chars
+
+
+def _build_name_pos_class(hot_chars: str, warm_chars: str,
+                          min_len: int, max_len: int) -> str:
+    """按**名字位字数**显式构造名字位正则片段（Issue #49 P1）。
+
+    语义（必须显式按长度展开，不能写成 `TAIL{n,m}`）：
+      - 名字位长度 k 的形态 = (k-1) 个温字 + 1 个尾字；
+      - 尾字必须达到**热字**阈值（名字位字频 >= `name_gate_min_freq`）；
+      - 非尾字允许温字（字频 >= `name_gate_warm_freq`）。
+
+    为什么必须按长度显式展开：
+      旧实现返回 `[温]{0,2}[热]`，规则层再套 `{1,3}` -> 实际形态是
+      `[温]{0,2}[热]{1,3}`，**量词落在尾字类上**而非名字位上：
+        「李思远」可被拆成 温+热+热+热（4 字），尾字判定完全失效；
+        「流程优化」这类「冷姓 + 冷字 + 冷字」也因尾字可重复而漏挡。
+      显式展开后长度约束落在名字位整体，尾字判定与字数约束同时成立。
+
+    返回片段示例（hot != warm 时）：
+      `[温]{0,2}[热]`   -> 名字位 1~3 字，尾字热
+      `[温]{1,2}[热]`   -> 名字位 2~3 字，尾字热
+    当热字集与温字集相同（闸门退化到同一档）时，退化为普通长度量词。
+    """
+    hot = _build_name_char_class(hot_chars)
+    warm = _build_name_char_class(warm_chars)
+    if hot == warm:
+        # 闸门不可用（热/温同档或退化到全池）时退化为普通长度量词
+        return f"{hot}{{{min_len},{max_len}}}"
+    lo = max(0, min_len - 1)
+    hi = max(0, max_len - 1)
+    return f"{warm}{{{lo},{hi}}}{hot}"
+
+
+def _get_surname_char_freq(cfg: Optional[Dict] = None) -> Dict[str, int]:
+    """从 D16 全名库自举姓氏位字频（name[0] 位置的字频）。
+
+    与名字位字频分开统计：同一个字在姓位与名字位的分布截然不同
+    （如「明」名字位频次 146、姓位频次仅 2）。
+    """
+    if cfg is None:
+        cfg = _load_config()
+    names = cfg.get("full_name_list") or []
+    key = f"s:{len(names)}:{hash(tuple(names[:64]))}"
+    cached = _NAME_CHAR_FREQ_CACHE.get(key)
+    if cached is not None:
+        return cached
+    freq: Dict[str, int] = {}
+    for name in names:
+        if name:
+            freq[name[0]] = freq.get(name[0], 0) + 1
+    _NAME_CHAR_FREQ_CACHE[key] = freq
+    return freq
+
+
+def _get_gated_surnames(cfg: Optional[Dict] = None) -> List[str]:
+    """取姓氏位闸门放行的姓氏（按字序列出，保持确定性顺序）。
+
+    背景：残余误伤的真实入口是**姓氏位**，不是名字位。
+    实测误伤样本的结构是「冷僻姓 + 高频名字字」：
+        水平 = 水(姓位频次 0) + 平     单元 = 单(6) + 元
+        沙子 = 沙(1) + 子              明天 = 明(2) + 天
+    这些字作姓氏极罕见（D16 全名库中几乎不作为姓出现），
+    它们在句中作首字时是**词**不是**姓**（水平/单元/沙子/明天）。
+
+    阈值 `name_surname_min_freq` 默认 5——D16 库中作为姓氏出现 ≥5 次。
+    门槛不能更高：「韩」(47)、樊(15)这类真实姓氏的频次并不高，
+    卡太死会把真名挡在门外（漏脱是合规红线）。
+    """
+    if cfg is None:
+        cfg = _load_config()
+    pool = sorted(SURNAME_SET)
+    threshold = cfg.get("name_surname_min_freq", _NAME_GATE_SURNAME_MIN_FREQ)
+    try:
+        threshold = int(threshold)
+    except (TypeError, ValueError):
+        threshold = _NAME_GATE_SURNAME_MIN_FREQ
+    if threshold <= 0:
+        return pool
+    freq = _get_surname_char_freq(cfg)
+    if not freq:
+        return pool
+    gated = [s for s in pool if freq.get(s, 0) >= threshold]
+    return gated or pool
+
+
+def _get_name_rule_mode(cfg: Optional[Dict] = None) -> str:
+    """读取姓名规则模式（M2 开关）。
+
+    取值：
+      - `graded`（Issue #49 P1 默认）：姓氏分档 + 名字位字频闸门 + 上下文锚点
+      - `strict`：退回 #49 整改前的单档规则A（姓 + 名字字{1,3}），供应急回退
+      - `r4`：仅启用 #17 R4 评分层（保留给社区后续裁决，行为等同 strict + R4）
+
+    与 `r4_name_scoring.get_name_mode()`（取值 enum/r4/both）是**两个不同**的开关：
+    前者控制「规则A 是否分级」，后者控制「R4 评分层是否参与」。二者正交。
+    """
+    if cfg is None:
+        cfg = _load_config()
+    mode = cfg.get("name_rule_mode", "graded")
+    if mode not in ("graded", "strict", "r4"):
+        mode = "graded"
+    return mode
+
 # ---------------------------------------------------------------------------
 # 排除词表（全局通用术语，不是敏感信息）
 # ---------------------------------------------------------------------------
@@ -1564,15 +1809,17 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
     # - 边界：仅排除 ASCII/数字（允许中文连接符如"和/在/是/等"）
     # - 执行顺序：精确匹配 → 字符池规则
     _full_name_list: List[str] = cfg.get("full_name_list", [])
-    if _full_name_list:
-        # 长名优先（降序），确保复姓等长名不被短名截断
-        _sorted_names = sorted(_full_name_list, key=len, reverse=True)
-        # 边界：排除 ASCII/数字前后跟随；允许中文跟随（如"邹阳和陈黎"）
-        _exact_pattern_str = '|'.join(re.escape(n) for n in _sorted_names)
-        _exact_pattern = re.compile(
-            rf'(?<![a-zA-Z0-9])(?:{_exact_pattern_str})(?![a-zA-Z0-9])'
-        )
-        patterns.append((_exact_pattern, rep.get("NAME", "XXX")))
+    # D16 库净化：剔除「字段标签型」条目。
+    # 实测污染样本：「姓名」被当作人名全名收录，导致「请填写姓名」→「请填写XXX」。
+    # 这类条目不是人名，是文档字段名；用显式清单过滤而不是改数据文件，
+    # 便于上游修正 full_name_list 后自动恢复。
+    _full_name_list = [n for n in _full_name_list if n not in _D16_NON_NAME_ENTRIES]
+    # 【执行顺序修正（Issue #49 P1，2026-10-26）】
+    # D16 精确层的 pattern **延后**到 S2 名单块救援之后再 append。
+    # 原因：S2 的证据是「块内含 D16 已确认真名」；若 D16 先跑，
+    # 块内确认真名已被替换成 XXX → 救援信号自我销毁 → 名单块整块漏脱。
+    # 典型残留：`郑云、杨瑜` → `XXX、杨瑜`（杨瑜未脱敏）。
+    # D16 只做「文本精确匹配」，延迟 append 不影响其判定逻辑。
 
     # Python 3.9 不支持变长 lookbehind，移除 excluded 检查
     # 姓氏后必须跟 1-2 个名字汉字，防止单字被误判
@@ -1583,14 +1830,265 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
     # 名字汉字类（供两个规则使用）
     name_char_class = _build_name_char_class(name_pool_chars)
 
-    # 规则A：姓氏 + 1-3个名字汉字（支持二字和三字人名如"陈斌""郑学钟"）
-    # 左边界：阻止 ASCII/数字前缘（防止英文单词残段匹配）
-    # R-F（Issue #5，v1.3.1）：移除右边界 (?![a-zA-Z0-9])——名字字符类全为汉字，
-    # 右侧跟 ASCII/数字仍是真实姓名场景（"方培培0371-85519208"）；原边界与
-    # 贪婪量词组合会在遇数字时回溯降级为部分匹配（"方培培"→"方培"），残留"培"。
-    # 漏脱敏（红线）风险不对称于误伤，姓名整体匹配。
-    # 复姓优先：2字复姓 + 1-3个名字汉字（防止复姓第二字被单姓规则误匹配）
-    compound_surnames = cfg.get("compound_surnames", [])
+    # -----------------------------------------------------------------------
+    # Issue #49 P1（M2 开关）：规则A 分级改造
+    # -----------------------------------------------------------------------
+    #
+    # name_rule_mode = "graded"（默认）：
+    #   规则A（唯一**无上下文约束**的姓名规则）按姓氏分档拆成
+    #     R2（低危姓 + 1~3 名字字）/ R3（高危姓 + 2~3 名字字），
+    #   并施加「姓氏位字频闸门 + 名字位字频闸门」双重收紧；
+    #   另加 R4 上下文锚点规则（锚点 + 任意姓 + 1~2 名字字）。
+    #
+    # name_rule_mode = "strict"：
+    #   退回 #49 整改前的单档规则A（姓 + 名字字{1,3}，全池），供应急回退。
+    #
+    # 两个关键设计决定：
+    # 1) 闸门用**字符类收紧**实现，而非回调后置判定。贪婪量词下后置判定
+    #    会整体放弃匹配，反而漏脱姓名（「张明和」→ 漏「张明」）。
+    # 2) 闸门**不作用于上下文强的规则**。规则C-1/C/D/E 的左上下文是
+    #    冒号/介词/动词，置信度来源是上下文而非字频，再叠字频闸门属于
+    #    连坐，会误伤真实姓名（如「王根利」——「根」在 D16 名字位仅出现
+    #    3 次，但它是真实人名用字）。
+    #    但规则B 的左上下文只是「任意中文字」，属**弱上下文**——它正是
+    #    「流程优化/日常运营/业务发展/客户经理」4 条误伤的来源，
+    #    因此规则B 也必须加闸门（实测见下）。
+    #
+    # 3) 名字位判据是「尾字热 + 前字温」而非「全字都热」：
+    #        王根利  → 根(温,3) + 利(热,44)   ✓
+    #        流程优化 → 优(2) + 化(2)         ✗
+    _name_rule_mode = _get_name_rule_mode(cfg)
+
+    # -----------------------------------------------------------------------
+    # S2 名单块一致性救援规则（Issue #49 P1）
+    # -----------------------------------------------------------------------
+    #
+    # 【机制】顿号/逗号并列的**块**内，若存在一个已确认为真名的项（D16 精确表），
+    # 则同块其余项按真名处理。
+    #
+    # 【为什么这是最有效的救援通道】
+    #   实测 119 份真实文档：名单块信号覆盖 336 个真名金标，
+    #   而「字频宽松档」单独只能覆盖 428/453（且难例误伤 1817）。
+    #   名单块的误伤仅 19 条（对比字频宽松档的 1817）——
+    #   因为「业务词并列」不会与真名同块共现，而「同事名单」几乎必然并列真名。
+    #   这是**列表一致性**这一结构性证据的价值：它与字频弱相关，且几乎不误伤。
+    #
+    # 【与 D16 精确层的执行关系（2026-10-26 修正）】
+    #   本规则的证据是「块内含 D16 已确认真名」；若排在 D16 之后，
+    #   D16 名已被替换成 XXX → 救援信号自我销毁 → 名单块整块漏脱。
+    #   故本规则排在 D16 精确层**之前**。
+    #
+    #   但排在前面会带来第二个问题：D16 精确层的右边界是 `(?![a-zA-Z0-9])`，
+    #   而替换占位符 `XXX` 恰好是 ASCII 字母 → 若把非 D16 项替换成 XXX
+    #   且紧贴保留的 D16 名（`郑云XXX`），D16 层就再也匹配不到「郑云」，
+    #   实测金标保留率从 88.7% 掉到 63.7%。
+    #
+    #   **解法：块内所有项统一替换**，不把 D16 项留给精确层。
+    #   块的一致性证据已经判定「整块都是人名」，整块脱敏既正确，
+    #   又让本规则与 D16 层的执行顺序彻底解耦（谁先谁后都对）。
+    #
+    # 【项的形态】姓 + 1~3 个名字池字（不叠字频闸门——闸门在此属于连坐）。
+    _list_item = rf'(?:{surname_alt}){name_char_class}{{1,3}}'
+    _list_sep = r'[、，,/／]'
+    # 块 = 连续的「项(分隔符项)+」。
+    #
+    # 【实现缺陷修复（2026-10-26，实测发现）】
+    #   原写法把「分隔符 + 项」写成**前瞻** `(?={_list_item}...)`，
+    #   导致捕获组 block 只含「第一项 + 分隔符」——**整个块并未被捕获**。
+    #   后果是本规则赖以成立的「块内一致性证据」整体失效：
+    #     S2「块内含 D16 确认真名」退化为「该单项是否在 D16」
+    #     S4「块内每一项都符合严格形态」退化为「该单项符合即可」
+    #   实测症状：真实文档中「王松/吴学亮/叶新林/马娟」这类名单，
+    #   叶新林（D16 确认真名）反而因块只捕获到「叶新林/」而漏脱。
+    #   修正：改为**真正捕获**整块，块内一致性判据才真正生效。
+    _list_block_re = re.compile(
+        rf'(?<![a-zA-Z0-9])'
+        rf'(?P<block>(?:{_list_item})'
+        rf'(?:{_list_sep}(?:{_list_item})(?![a-zA-Z0-9]))+)'
+    )
+    _d16_confirmed = set(_full_name_list)
+    _name_rep_block = rep.get("NAME", "XXX")
+
+    def _list_rescue_repl(m: re.Match) -> str:
+        """名单块一致性救援：块内含 D16 真名 → 同块各项整体脱敏。"""
+        block = m.group("block")
+        # 分隔符用捕获组保留，避免 re.split 把顿号/逗号吃掉
+        items = re.split(f"({_list_sep})", block)
+        # 块内是否含 D16 已确认真名？
+        if not any(it.strip() in _d16_confirmed for it in items):
+            return block  # 无确认真名 → 不动（避免把业务词并列误判为名单）
+        if _is_protected_by_common_word(m.string, m.start(), m.end()):
+            return block
+        out = []
+        for it in items:
+            if re.fullmatch(_list_sep, it):
+                out.append(it)          # 分隔符原样保留
+                continue
+            stripped = it.strip()
+            if not stripped:
+                out.append(it)
+                continue
+            out.append(it.replace(stripped, _name_rep_block))
+        return "".join(out)
+
+    patterns.append((_list_block_re, _list_rescue_repl))
+
+    # -----------------------------------------------------------------------
+    # S4 名单块「纯姓名形态」救援规则（Issue #49 P1 新增）
+    # -----------------------------------------------------------------------
+    #
+    # 【缺口】S2 需要「块内含 D16 已确认真名」作证据，但真实文档里存在
+    #   **整组同事都不在 D16 库**的名单块（外来团队、乙方人员、新入职）。
+    #   实测：库外真名所在块的「同块 D16 邻居」命中率为 **0%**——
+    #   这条路对库外真名完全无效，缺口无法靠 S2 补上。
+    #
+    # 【替代证据】块内**全部**项都符合严格姓名形态（受闸门姓氏 + 名字池字 +
+    #   长度 2~3）——这是纯结构信号，不依赖任何外部名单。
+    #
+    # 【为什么误伤极低】
+    #   119 份真实文档全量扫描：满足「块内全为严格姓名形态」的项共 41 个，
+    #   其中 34 个本来就已被 D16/S1 覆盖，**新增覆盖仅 7 个**
+    #   （张榕/林润/卢蔷伊/张惠蓉/连玲典/陈雪香/刘宝香）——逐条核对全是人名，
+    #   **零业务词命中**。
+    #   通用语料 102 条：0 命中。
+    #
+    # 【为什么必须严】
+    #   S2 的块正则本身就能匹配业务词并列（「成本控制、需求变更」——
+    #   「成」是姓氏、「本控制」在名字池内）。所以 S4 必须比 S2 更严：
+    #   姓氏须过闸门（freq≥5）、长度限 2~3、且**块内每一项都须满足**，
+    #   任何一项是业务词则整块放弃。
+    #
+    # 【与 S2 的分工】
+    #   S2：块内含 D16 确认真名 → 整块脱敏（证据来自名单库）
+    #   S4：块内全部为严格姓名形态 → 整块脱敏（证据来自结构一致性）
+    #   两者互为补充，均为「列表一致性」这一结构性证据的两种取证方式。
+    _s4_gated_surnames = set(_get_gated_surnames(cfg)) if _name_rule_mode == "graded" else set(SURNAME_SET)
+    # 单项形态：受闸门姓氏 + 1~2 个名字池字（无命名组，便于内嵌到块正则）
+    _s4_item_pat = (
+        rf'(?<![a-zA-Z0-9])(?:{"|".join(re.escape(s) for s in sorted(_s4_gated_surnames))})'
+        rf'{name_char_class}{{1,2}}(?![a-zA-Z0-9])'
+    )
+    _s4_block_re = re.compile(
+        rf'(?<![a-zA-Z0-9])'
+        rf'(?P<block>(?:{_s4_item_pat})'
+        rf'(?:{_list_sep}(?:{_s4_item_pat})(?![a-zA-Z0-9]))+)'
+    )
+
+    def _s4_rescue_repl(m: re.Match) -> str:
+        """名单块纯姓名形态救援：块内每项都符合严格姓名形态 → 整块脱敏。"""
+        block = m.group("block")
+        if _is_protected_by_common_word(m.string, m.start(), m.end()):
+            return block
+        parts = re.split(f"({_list_sep})", block)
+        names = [p for p in parts if p and not re.fullmatch(_list_sep, p)]
+        # 每一项都必须是严格的姓名形态，否则整块放弃
+        for it in names:
+            s = it.strip()
+            if not (2 <= len(s) <= 3):
+                return block
+            if s[0] not in _s4_gated_surnames:
+                return block
+            if any(c not in name_pool_chars for c in s[1:]):
+                return block
+        out = []
+        for it in parts:
+            if re.fullmatch(_list_sep, it):
+                out.append(it)
+                continue
+            s = it.strip()
+            out.append(it.replace(s, _name_rep_block) if s else it)
+        return "".join(out)
+
+    patterns.append((_s4_block_re, _s4_rescue_repl))
+
+    # D16 精确层（延后到 S2 之后 append，理由见上方 S2 注释）
+    # 长名优先（降序），确保复姓等长名不被短名截断
+    # 边界：排除 ASCII/数字前后跟随；允许中文跟随（如"邹阳和陈黎"）
+    if _full_name_list:
+        _sorted_names = sorted(_full_name_list, key=len, reverse=True)
+        # 【边界按名字长度分层（2026-10-26，实测发现）】
+        #
+        # 原边界 `(?<![a-zA-Z0-9])(?:...)(?![a-zA-Z])` 把「ASCII/数字 + 姓名」
+        # 形态整类拦掉。真实文档里这类形态极常见（表格里姓名紧贴系统代号/人数）：
+        #   IDATA-BDS季海涛 / FB-APPSVR卫海啸 / 研发组11张海翔 / OF-BANK赵乐品
+        # 实测导致 119 份文档中多条**库内确认真名**漏脱。
+        #
+        # 但**不能无差别放宽**：把左边界改成「不排除 ASCII/数字」会让
+        # 「组余翔」「宋广举」这类「紧跟汉字的库内名」漏脱（实测多漏 8 个）。
+        #
+        # 【分层判据】按名字长度分别定边界——因为**误伤风险随长度递减**：
+        #   2 字名（1990 条）：短，最容易是常用词的一部分（"白天"/"叶子"/"单元"）
+        #        → 保持严格左边界 `(?<![a-zA-Z0-9])`，只放宽右边界（允许数字跟随）
+        #   3 字及以上（5407 条）：长，几乎不可能是常用词的一部分
+        #        → 左边界放宽为 `(?<![\u4e00-\u9fa5])`，允许 ASCII/数字/标点在前
+        #
+        # 实测（119 份文档 / 102 条通用语料）：
+        #   分层方案  金标 783→785（+2）、新增误伤 0、新增漏脱 0
+        _short_names = [n for n in _full_name_list if len(n) == 2]
+        _long_names = [n for n in _full_name_list if len(n) >= 3]
+        _d16_layers = []
+        if _short_names:
+            # 2 字名：左边界严格（排除 ASCII/数字在前），右边界允许数字/中文跟随
+            _alt = "|".join(re.escape(n) for n in sorted(_short_names, key=len, reverse=True))
+            _d16_layers.append(re.compile(rf'(?<![a-zA-Z0-9])(?:{_alt})(?![a-zA-Z])'))
+        if _long_names:
+            # 3 字及以上：左边界允许 ASCII/数字/标点，只排除紧跟汉字
+            _alt = "|".join(re.escape(n) for n in sorted(_long_names, key=len, reverse=True))
+            _d16_layers.append(re.compile(rf'(?<![\u4e00-\u9fa5])(?:{_alt})(?![a-zA-Z])'))
+        for _pat in _d16_layers:
+            patterns.append((_pat, rep.get("NAME", "XXX")))
+
+    # -----------------------------------------------------------------------
+    # Issue #49 P1：场景分层姓名规则（S1 裸姓名 / S2 名单块 / S3 强上下文）
+    # -----------------------------------------------------------------------
+    #
+    # 【为什么必须分层，而不是「一刀切收紧闸门」】
+    #
+    # 实测数据（824 条真名金标 / 178 条库外真名 / 102 条通用语料 / 2955 条难例）：
+    #
+    #   裸姓名场景的单维度字频判据有**结构性天花板**：
+    #     判据                      金标覆盖   库外覆盖   通用语料误伤  难例误伤
+    #     sur>=5 tail>=12              70%       69%          12        675
+    #     sur>=0 tail>=12              74%       70%          20        888
+    #     sur>=0 tail>=3               94%       92%          30       1817
+    #   → 放宽闸门能救回真名，但误伤同步爆炸；收紧闸门能压误伤，但真名漏脱。
+    #   → 字频单维度**不存在**同时满足「零漏脱 + 低误伤」的参数点。
+    #
+    #   但**上下文信号与字频弱相关**——上下文救回的库外真名，字频上完全不可分辨：
+    #     S1(严闸门 sur>=5/tail>=12) + S3(上下文全池) → 金标 92%、库外 98%、误伤仅 12
+    #   → 结论：**场景分层**。裸姓名用严闸门（此处真名/业务词冲突最激烈），
+    #     强上下文/名单块用宽匹配并由上下文本身充当证据。
+    #
+    # 【三个场景层】
+    #   S1 裸姓名（无任何上下文）：姓氏位闸门 + 名字位「尾字热 + 前字温」。
+    #      证据来自字频，故必须最严——这是误伤的主要来源地。
+    #   S2 名单块（顿号/逗号并列）：**块一致性救援**——块内若含 D16 已确认真名，
+    #      同块其他项按真名处理（列表一致性是强证据，且业务词并列不会
+    #      与真名同块共现）。
+    #   S3 强上下文（角色锚点 / 冒号 / 介词）：全池匹配。
+    #      证据来自上下文，字频闸门在此属于「连坐」，会误伤真实姓名。
+    #
+    # 【量词语义（关键 bug 修复）】
+    #   名字位必须按**长度**显式展开，不能写成 `TAIL{n,m}`：
+    #     旧形态 `[温]{0,2}[热]` 再套 `{1,3}` → 实际是 `[温]{0,2}[热]{1,3}`，
+    #     量词落在**尾字类**上而非名字位上：名字位可长达 5 字、尾字判定失效。
+    #   新形态（见 _build_name_pos_class）：
+    #     名字位 1~3 字 → `[温]{0,2}[热]`
+    #     名字位 2~3 字 → `[温]{1,2}[热]`
+    #     名字位 1~2 字 → `[温]{0,1}[热]`
+    _name_rule_mode = _get_name_rule_mode(cfg)
+    _hot_chars = _get_gated_name_chars(cfg)     # 名字位「热字」（尾字门槛）
+    _warm_chars = _get_warm_name_chars(cfg)     # 名字位「温字」（非尾字门槛）
+
+    # 规则A 专用：受字频闸门收紧的字符类（strict 模式下退化为全池）
+    _gated_name_class = name_char_class
+    if _name_rule_mode == "graded":
+        _gated_name_class = _build_name_char_class(_hot_chars)
+
+    # 复姓优先：2字复姓 + 1~3个名字汉字（防止复姓第二字被单姓规则误匹配）
+    # 复姓本身是强信号（双字姓氏在现代汉语里几乎不与常用词碰撞），
+    # 故复姓通道使用**全池**名字位，不叠字频闸门。
+    compound_surnames = cfg.get("compound_surnames") or list(_NAME_GATE_COMPOUND_SURNAMES)
     if compound_surnames:
         compound_alt = '|'.join(re.escape(s) for s in sorted(compound_surnames, key=len, reverse=True))
         patterns.append((
@@ -1600,24 +2098,92 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
             ),
             rep.get("NAME", "XXX")
         ))
-    patterns.append((
-        re.compile(
-            rf'(?<![a-zA-Z0-9])'
-            rf'(?:{surname_alt}){name_char_class}{{1,3}}'
-        ),
-        rep.get("NAME", "XXX")
-    ))
 
-    # 规则B：姓氏 + 2个名字汉字（左侧有中文词/冒号，右侧无ASCII/非汉字）
-    # 处理"总行支持人员：汪晶晶"和"组长：樊霖副组长"等场景
-    # R-F（Issue #5）：右边界同步移除（同规则A，防回溯降级部分匹配）
-    # 全角冒号 \uff1a 不在 [一-龥] 范围，需显式加入
-    patterns.append((
-        re.compile(
-            rf'(?<=[\u4e00-\u9fa5\uff1a])(?:{surname_alt}){name_char_class}{{2}}'
-        ),
-        rep.get("NAME", "XXX")
-    ))
+    if _name_rule_mode == "graded":
+        # S1 裸姓名：姓氏位闸门 + 名字位字频闸门（唯一无上下文约束的场景）
+        #
+        # 姓氏位闸门：只保留在 D16 全名库中确实作姓出现过的姓。
+        # 这是残余误伤的主入口——「水平」「单元」「沙子」「明天」的结构都是
+        # 「冷僻姓 + 高频名字字」，姓氏位才是判别点（详见 _get_gated_surnames）。
+        _gated_surnames = _get_gated_surnames(cfg)
+        _high_risk = set(cfg.get("high_risk_surnames") or "")
+        _low_surnames = sorted(s for s in _gated_surnames if s not in _high_risk)
+        _high_surnames = sorted(s for s in _gated_surnames if s in _high_risk)
+        # R2 / R3：按姓氏分档，名字位字数区间不同
+        # 高危姓（high_risk_surnames）更易与日常词首字碰撞 → 要求更长的名字位；
+        # 低危姓保留「姓 + 1 字」通道，避免"张明""李雷"这类二字名漏脱。
+        _lo_min, _lo_max = _NAME_GATE_LOW_RANGE
+        _hi_min, _hi_max = _NAME_GATE_HIGH_RANGE
+        if _low_surnames:
+            _low_alt = '|'.join(re.escape(s) for s in _low_surnames)
+            _low_pos = _build_name_pos_class(_hot_chars, _warm_chars, _lo_min, _lo_max)
+            patterns.append((
+                re.compile(
+                    rf'(?<![a-zA-Z0-9])'
+                    rf'(?:{_low_alt}){_low_pos}'
+                ),
+                rep.get("NAME", "XXX")
+            ))
+        if _high_surnames:
+            _high_alt = '|'.join(re.escape(s) for s in _high_surnames)
+            _high_pos = _build_name_pos_class(_hot_chars, _warm_chars, _hi_min, _hi_max)
+            patterns.append((
+                re.compile(
+                    rf'(?<![a-zA-Z0-9])'
+                    rf'(?:{_high_alt}){_high_pos}'
+                ),
+                rep.get("NAME", "XXX")
+            ))
+
+        # R3b：高危姓 + **单字名** + 「职位/职责后缀」右边界通道
+        #
+        # 【缺口】R3 要求高危姓的名字位 ≥2 字，导致「樊霖负责」「樊霖副组长」
+        #   这类「姓名 + 职位/动词后缀」的形态漏脱——名字后紧跟中文时，
+        #   贪婪量词回溯降级，S1 无法命中。
+        #
+        # 【为什么不能整体放宽高危姓的单字名】
+        #   实测「高危姓 + 单字热字名」在通用语料中命中 11 处
+        #   （宁波/方向/孔明/安庆/孟子/孔子/庄子/石家庄…）——放宽代价远大于收益。
+        #   且「樊霖」在 D16 库中不存在（姓+名对共现为 0），
+        #   无法用名单证据把它与「孔明」区分开。
+        #
+        # 【本通道的证据】**右边界**：名字后面紧跟职位/职责类词。
+        #   「樊霖负责」「樊霖副组长」中，「负责/副组长」证明前面的两字是
+        #   「人名 + 职务」的组合，而非一个双字常用词。
+        #   实测通用语料 102 条中该形态 **0 命中**（宁波银行等已被
+        #   银行/城市规则先行拦截），零误伤。
+        _role_suffixes = [
+            '负责', '牵头', '副组长', '组长', '主任', '经理', '主管', '专员',
+            '工程师', '负责人', '联系人', '成员', '参会', '出席', '签名', '签字',
+        ]
+        _role_suffix_alt = '|'.join(re.escape(s) for s in _role_suffixes)
+        _single_pos = _build_name_pos_class(_hot_chars, _warm_chars, 1, 1)
+        patterns.append((
+            re.compile(
+                rf'(?<![a-zA-Z0-9])'
+                rf'(?:{_high_alt}){_single_pos}'
+                rf'(?=(?:{_role_suffix_alt}))'
+            ),
+            rep.get("NAME", "XXX")
+        ))
+    else:
+        # strict：#49 整改前的单档规则A（全池）
+        patterns.append((
+            re.compile(
+                rf'(?<![a-zA-Z0-9])'
+                rf'(?:{surname_alt}){name_char_class}{{1,3}}'
+            ),
+            rep.get("NAME", "XXX")
+        ))
+
+    # -----------------------------------------------------------------------
+    # S3 强上下文姓名规则（Issue #49 P1）
+    # -----------------------------------------------------------------------
+    #
+    # 场景分层后，**有上下文约束**的规则统一走**全池**匹配：
+    #   证据来自上下文本身（角色槽位 / 冒号 / 介词），字频闸门在此属于「连坐」——
+    #   会误伤真实姓名（如「王根利」的「根」在 D16 名字位仅出现 3 次）。
+    #   实测：S1 严闸门 + S3 全池 → 金标 92%、库外 98%、通用语料误伤仅 12。
 
     # 规则C-1：半角冒号后姓名（如"联系人:方培培"）
     # 全角冒号已由 Rule C 处理；半角冒号(:)ASCII 不在 [\u4e00-\u9fa5] 范围，需单独处理
@@ -1663,6 +2229,32 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
         ),
         rep.get("NAME", "XXX")
     ))
+
+
+    # -----------------------------------------------------------------------
+    # S3' 角色锚点规则（Issue #49 P1 新增）
+    # -----------------------------------------------------------------------
+    #
+    # 「组长：樊霖」「负责人 王根利」这类场景的证据是**角色槽位**而非字频。
+    # 锚点后一律全池匹配——这一层是库外真名的主要救回通道
+    # （实测：锚点信号覆盖 45 个金标真名，含库外真名）。
+    #
+    # 锚点词表复用 #38 D8/D11 角色槽位；锚点后允许 0~3 个名字位。
+    # 右边界不设（与规则A 一致，避免贪婪回溯降级为部分匹配）。
+    _anchor_alt = '|'.join(re.escape(a) for a in _NAME_GATE_ANCHORS)
+    _anchor_re = re.compile(
+        rf'(?<![a-zA-Z0-9])'
+        rf'(?P<anchor>{_anchor_alt})'
+        rf'(?P<sep>[:：\s]*)'
+        rf'(?P<name>(?:{surname_alt}){name_char_class}{{1,3}})'
+    )
+    _name_rep = rep.get("NAME", "XXX")
+
+    def _anchor_repl(m: re.Match) -> str:
+        """锚点 + 姓名 → 保留锚点与分隔符，仅替换姓名部分。"""
+        return f"{m.group('anchor')}{m.group('sep')}{_name_rep}"
+
+    patterns.append((_anchor_re, _anchor_repl))
 
 
     # 拆分：姓名规则单独归组，供 apply_redactions 在地址通道之后执行
