@@ -38,6 +38,9 @@ from xml.sax.saxutils import escape as _xml_escape
 # XML 把中文写成 &#NNNNN; 导致规则层漏检（解码 CJK 区段可安全写回明文）
 _CJK_ENTITY_RE = re.compile(r'&#(\d{4,6});')
 
+# 提取 `<a:t>` 文本（文档级词频统计用）
+_PPT_TEXT_RE = re.compile(r'<a:t(?:\s[^>]*)?>(.*?)</a:t>', re.S)
+
 
 def _decode_cjk_entities(text: str) -> str:
     def _sub(m: re.Match) -> str:
@@ -88,6 +91,16 @@ def redact_pptx(input_path: str, output_path: str) -> dict:
                 if names:
                     inject_extra_names(names)
                     print(f"  [D15] 表格姓名注入 {len(names)} 个 → 全文联动脱敏")
+                # Issue #52：注入文档级 CJK 2~3 gram 频次（N-C D 级补漏闸门）
+                # ——业务词在全文中反复出现、姓名基本只出现一次，
+                #   这一条把「首字恰是姓氏」的常用词挡在 D 级之外。
+                try:
+                    from name_region_detector import (build_nc_doc_gram,
+                                                      set_nc_doc_gram)
+                    gram = build_nc_doc_gram(_PPT_TEXT_RE.findall(all_slides_content))
+                    set_nc_doc_gram(gram)
+                except Exception:
+                    pass
             for xml_file in sorted(slides_dir.glob("slide*.xml")):
                 c = _process_xml_file(xml_file, f"幻灯片 {xml_file.stem}")
                 _merge_counts(counts, c)
@@ -130,6 +143,11 @@ def redact_pptx(input_path: str, output_path: str) -> dict:
 
     finally:
         clear_extra_names()  # D15：清空表格姓名收集，避免跨文档污染
+        try:
+            from name_region_detector import clear_nc_doc_gram
+            clear_nc_doc_gram()  # Issue #52：清空文档级词频上下文
+        except Exception:
+            pass
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
     return counts

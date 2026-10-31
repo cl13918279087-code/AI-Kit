@@ -3163,8 +3163,15 @@ def apply_redactions_counted(text: str) -> Tuple[str, Dict[str, int]]:
             if name and len(name) >= 2:
                 # 使用词边界保护，避免子串误伤
                 pat = re.compile(rf'(?<!\w){re.escape(name)}(?!\w)')
-                result, n = _counting_sub(pat, result, _name_repl, counts)
-                # 计数已由 _counting_sub 处理
+                # 注意：_counting_sub 只返回字符串（不是 subn 的 (str, n) 元组）。
+                # 历史缺陷（d40fc57 起）：此处误按二元组解包，抛
+                # ValueError: too many values to unpack (expected 2)。
+                # 该异常发生在 apply_redactions_counted 的**末尾** D15 段，
+                # 会连带丢弃本函数此前所有脱敏结果；而调用方
+                # （redact_ppt/_excel 的 _process_xml_file）以 try/except
+                # 兜住异常并直接跳过文件写回 → 整页/整表零脱敏（真实泄漏）。
+                # 修复：只取返回值，计数由 _counting_sub 内部完成。
+                result = _counting_sub(pat, result, _name_repl, counts)
 
     return result, counts
 
