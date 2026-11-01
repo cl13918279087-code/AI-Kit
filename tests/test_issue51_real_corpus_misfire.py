@@ -23,6 +23,7 @@ import os
 import sys
 
 import pytest
+from pathlib import Path
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPTS = os.path.join(REPO, "scripts")
@@ -215,3 +216,57 @@ def test_short_slash_date_still_redacted():
     assert "MM/DD" in out, f"真实短日期未脱敏：{out!r}"
     out2 = common_rules.apply_redactions("验收日期3/4")
     assert "MM/DD" in out2, f"真实短日期未脱敏：{out2!r}"
+
+
+# ---------------------------------------------------------------------------
+# Issue #51 §4.3：keep_audit --corpus 输出保护词命中 + 误伤候选清单
+# ---------------------------------------------------------------------------
+
+def test_keep_audit_corpus_reports_guards_and_candidates():
+    """keep_audit 语料扫描须输出保护词命中频次与未登记误伤候选词。"""
+    import importlib.util
+    import shutil
+    import tempfile
+
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    ka_path = os.path.join(repo, "scripts", "keep_audit.py")
+    spec = importlib.util.spec_from_file_location("ka_issue51", ka_path)
+    ka = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ka)
+
+    tmp_root = tempfile.mkdtemp(prefix="issue51_ka_")
+    try:
+        corpus = Path(tmp_root) / "c"
+        corpus.mkdir()
+        (corpus / "a.txt").write_text(
+            "需求组张经理汇报进展\n说明如下\n重要产品全流程测试\n", encoding="utf-8"
+        )
+
+        result = ka._scan_corpus(corpus, min_freq=1)
+    finally:
+        shutil.rmtree(tmp_root, ignore_errors=True)
+    assert "guard_hits" in result and "candidates" in result
+    # 保护词命中须被统计到（「经理」在 common_word_guards 内）
+    guard_words = {w for w, _ in result["guard_hits"]}
+    assert "经理" in guard_words, f"保护词命中未被统计：{result['guard_hits']}"
+    # 候选清单中不得出现已登记的保护词
+    guards = set(common_rules._get_common_word_guards())
+    bad = {w for w, _ in result["candidates"]} & guards
+    assert not bad, f"候选清单混入了已登记保护词：{bad}"
+    # 报告渲染须包含两节
+    report = ka._render_corpus_report(result)
+    assert "保护词命中" in report and "误伤候选清单" in report
+
+
+def test_keep_audit_placeholder_stripped_from_candidates():
+    """候选片段提取须剔除脱敏占位符（只留原文实体）。"""
+    import importlib.util
+
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    ka_path = os.path.join(repo, "scripts", "keep_audit.py")
+    spec = importlib.util.spec_from_file_location("ka_issue51_b", ka_path)
+    ka = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ka)
+
+    frags = ka._replaced_fragments("由业务组长牵头推进", "由业务组长XXX")
+    assert frags == ["牵头推进"], frags

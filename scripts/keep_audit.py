@@ -22,8 +22,16 @@ import sys
 import re
 import zipfile
 import argparse
+from collections import Counter
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict
+
+
+# 脱敏占位符形态（diff 归因时需剔除，只留原文实体）
+_PLACEHOLDER_RE = re.compile(
+    r"X{2,}|M{2}|D{2}|Y{4}|年\d{2}月\d{2}日|\d{4}[-/]\d{2}[-/]\d{2}"
+    r"|\d{4}年|\d{2}月|\d{2}日"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -229,14 +237,48 @@ def _audit_diff(original_path: Path, redacted_path: Path) -> Dict:
 # 语料扫描（模式2：统计误伤触发率）
 # ---------------------------------------------------------------------------
 
-def _scan_corpus(corpus_dir: Path) -> Dict:
-    """模式2：扫描无害语料，统计误脱触发率"""
+def _replaced_fragments(original: str, redacted: str) -> List[str]:
+    """提取「原文被替换掉的片段」（diff 级），用于误伤候选词挖掘。
+
+    逐 opcodes 取 replace/delete 段在原文中的文字。占位符本身（XXX/XXXX/
+    XX银行/MM/DD 等）不计入——它们是脱敏产物而非误伤词。
+    """
+    import difflib
+
+    frags: List[str] = []
+    matcher = difflib.SequenceMatcher(None, original, redacted, autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag not in ("replace", "delete"):
+            continue
+        frag = original[i1:i2]
+        if not frag.strip():
+            continue
+        # 去掉片段里残留的占位符痕迹，只留原文实体
+        frag = _PLACEHOLDER_RE.sub("", frag)
+        if len(frag) < 2:
+            continue
+        frags.append(frag)
+    return frags
+
+
+def _scan_corpus(corpus_dir: Path, min_freq: int = 3) -> Dict:
+    """模式2：扫描无害语料，统计误脱触发率。
+
+    Issue #51 §4.3：除误脱统计外，同时输出
+      ① **保护词命中及频次**（common_word_guards 实际生效情况）；
+      ② **误伤候选清单**（未登记进保护表、但误伤频次 ≥ min_freq 的词）。
+    """
     import common_rules as cr
     cr.reset_patterns()
 
     total_lines = 0
     total_redacted = 0
     fp_lines: List[Tuple[str, str, str]] = []  # (行文本, 脱敏后, 误脱词)
+
+    guard_hits: "Counter[str]" = Counter()   # 保护词命中频次
+    candidate_hits: "Counter[str]" = Counter()  # 未登记保护词的误伤片段频次
+
+    guards = set(cr._get_common_word_guards()) if hasattr(cr, "_get_common_word_guards") else set()
 
     extensions = {".docx", ".xlsx", ".xls", ".pptx", ".ppt", ".txt", ".md"}
 
@@ -258,15 +300,28 @@ def _scan_corpus(corpus_dir: Path) -> Dict:
                 continue
             total_lines += 1
             redacted = cr.apply_redactions(line)
+
+            # ① 保护词命中统计
+            for w in guards:
+                if w and w in line:
+                    guard_hits[w] += 1
+
             if redacted != line:
                 total_redacted += 1
                 # 提取被替换的词
                 orig_words = set(w for w in HARMLESS_WORDS if w in line and w not in redacted)
                 if orig_words:
                     fp_lines.append((line, redacted, ", ".join(orig_words)))
+                # ② 误伤候选词（diff 级片段）
+                for frag in _replaced_fragments(line, redacted):
+                    if frag in guards:
+                        continue
+                    candidate_hits[frag] += 1
 
     fp_rate = (total_redacted / total_lines * 100) if total_lines > 0 else 0
     fp_pct_of_redacted = (len(fp_lines) / total_redacted * 100) if total_redacted > 0 else 0
+
+    candidates = [(w, c) for w, c in candidate_hits.most_common() if c >= min_freq]
 
     return {
         "total_lines": total_lines,
@@ -275,6 +330,9 @@ def _scan_corpus(corpus_dir: Path) -> Dict:
         "false_positives": len(fp_lines),
         "fp_pct_of_redacted": fp_pct_of_redacted,
         "fp_lines": fp_lines[:20],  # 最多显示20例
+        "guard_hits": guard_hits.most_common(),
+        "candidates": candidates,
+        "min_freq": min_freq,
     }
 
 
@@ -351,6 +409,25 @@ def _render_corpus_report(result: Dict) -> str:
         lines.append("")
         lines.append("  ✅ 未发现明显误脱，规则质量良好。")
 
+    # Issue #51 §4.3：保护词命中 + 误伤候选清单
+    guard_hits = result.get("guard_hits") or []
+    if guard_hits:
+        lines.append("")
+        lines.append(f"  🛡️ 保护词命中（common_word_guards）共 {len(guard_hits)} 条：")
+        for w, c in guard_hits[:15]:
+            lines.append(f"    {w}：{c} 次")
+        if len(guard_hits) > 15:
+            lines.append(f"    …… 其余 {len(guard_hits) - 15} 条省略")
+
+    candidates = result.get("candidates") or []
+    lines.append("")
+    if candidates:
+        lines.append(f"  📋 误伤候选清单（未登记保护表，频次 ≥ {result.get('min_freq', 3)}）：")
+        for w, c in candidates:
+            lines.append(f"    {w}：{c} 次  → 建议人工复核后并入 common_word_guards")
+    else:
+        lines.append("  📋 误伤候选清单：无（未发现高频未登记误伤词）")
+
     lines.append("")
     lines.append("=" * 60)
     return "\n".join(lines)
@@ -381,6 +458,8 @@ def main():
                         help="语料目录路径（语料扫描模式）")
     parser.add_argument("--config", type=Path,
                         help="config.json 路径（默认使用脚本同目录的 config.json）")
+    parser.add_argument("--min-freq", type=int, default=3,
+                        help="误伤候选词最小频次（默认 3，Issue #51 §4.3）")
     args = parser.parse_args()
 
     # 若指定了 config，加载它
@@ -406,7 +485,7 @@ def main():
         if not args.corpus.is_dir():
             print(f"错误：目录不存在 → {args.corpus}", file=sys.stderr)
             sys.exit(1)
-        result = _scan_corpus(args.corpus)
+        result = _scan_corpus(args.corpus, min_freq=args.min_freq)
         print(_render_corpus_report(result))
 
     else:
