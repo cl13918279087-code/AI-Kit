@@ -50,7 +50,7 @@ address → english → role → anchor → plain_list → list_continuation）�
 | 真实业务语料误伤（1200 条） | 39 处（27 处真误伤） | **0** |
 | 真名金标脱敏（283 条） | 283/283 | **283/283（零劣化）** |
 | 通用业务语料误伤（FALSE_POSITIVE_CORPUS） | 8/102 | **8/102（零劣化）** |
-| pytest tests/ | 122 passed | **167 passed**（+45） |
+| pytest tests/ | 122 passed | **171 passed**（+49） |
 | 占位名（张三/李四）脱敏 | 漏脱 | **已脱敏** |
 
 ### 新增评测资产与门禁
@@ -77,6 +77,19 @@ address → english → role → anchor → plain_list → list_continuation）�
   ① **保护词命中频次**（`common_word_guards` 实际生效情况，便于发现形同虚设的词条）；
   ② **误伤候选清单**（未登记进保护表、但误伤频次 ≥ `--min-freq`（默认 3）的原文片段），
   由 `_replaced_fragments()` 做 diff 级归因（剔除占位符痕迹），人工复核后并入保护表即可闭环。
+- `scripts/redact_all.py` + `scripts/redact_word.py`（修复 Issue #21 遗留回归，
+  落实 Issue #54 D1「裁决闭环标准化」）：
+  - **`redact_all.py` 对 .docx/.doc 路径必然崩溃**——`8bbf6cc`（Issues #18~#24 合入）
+    把 `auto_gray` 传给各 handler，却**未给 `redact_word()` 加该参数**，
+    导致 `redact_all.py input.docx`（无论是否带 `--auto-gray`）抛
+    `TypeError: redact_word() got an unexpected keyword argument 'auto_gray'`，
+    异常被 try/except 吞掉 → **主入口对 Word 文件零产出**。本轮补齐参数签名；
+  - **`--auto-gray` flag 仍是「接收但不使用」**——本轮赋予其实质语义：
+    灰区实体（置信度 < 0.75）由规则引擎**自动裁决为遮盖**，并把裁决结果落盘为
+    `decisions_pending.json`（含 `auto_adjudicated` 标记），用于**合规留痕**
+    与后续「高频裁决沉淀为规则候选」分析；`detect_gray_entities()` 新增 `quiet`
+    参数避免自动模式下打印误导性的「请交给 Agent 评审」提示；
+  - 留痕**不改变脱敏结果本身**（灰区仍照常遮盖），仅产出旁证文件。
 
 ## [Unreleased] - 2026-10-31（Issue #52 N-C 补漏通道与表格姓名列接线，贡献者：赵辉）
 

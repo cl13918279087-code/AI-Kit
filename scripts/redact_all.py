@@ -30,6 +30,7 @@ import json
 import shutil
 import tempfile
 from pathlib import Path
+from typing import Optional
 
 from common_rules import (
     add_custom_replacement, REDACTION_LABELS,
@@ -104,7 +105,8 @@ def _extract_text_for_detection(file_path: str, ext: str) -> str:
             return ""
 
 
-def detect_gray_entities(input_path: str, output_json: str = None) -> dict:
+def detect_gray_entities(input_path: str, output_json: str = None,
+                         quiet: bool = False) -> dict:
     """
     阶段一：对输入文件执行实体检测，识别灰区实体并写入 JSON。
 
@@ -182,9 +184,10 @@ def detect_gray_entities(input_path: str, output_json: str = None) -> dict:
         }, f, ensure_ascii=False, indent=2)
 
     print(f"[灰区] 已写入: {gray_detail_path}")
-    print(f"\n请将 gray_review.json 交给 Agent 评审，")
-    print(f"评审后将决策写入 decisions.json，然后运行：")
-    print(f"  python3 redact_all.py {input_path} --agent-decisions decisions.json\n")
+    if not quiet:
+        print(f"\n请将 gray_review.json 交给 Agent 评审，")
+        print(f"评审后将决策写入 decisions.json，然后运行：")
+        print(f"  python3 redact_all.py {input_path} --agent-decisions decisions.json\n")
 
     return {
         "file": str(p),
@@ -193,6 +196,62 @@ def detect_gray_entities(input_path: str, output_json: str = None) -> dict:
         "gray": gray,
         "gray_json_path": gray_detail_path,
     }
+
+
+# ---------------------------------------------------------------------------
+# 阶段一（续）：--auto-gray 灰区自动裁决留痕
+# ---------------------------------------------------------------------------
+
+def export_auto_gray_decisions(input_path: str, output_path: str = None) -> Optional[str]:
+    """`--auto-gray` 模式：导出灰区**自动裁决**留痕（Issue #21 / #54 D1）。
+
+    语义：本次运行中所有灰区实体（置信度 < GRAY_CONFIDENCE_THRESHOLD）
+    由规则引擎**自动裁决为遮盖**（不交 Agent 评审）。本函数把这份
+    自动裁决结果落盘为 `decisions_pending.json`，用于合规留痕与后续
+    「高频裁决沉淀为规则候选」分析。
+
+    返回：decisions_pending.json 路径；无法检测时返回 None（不阻断脱敏）。
+    """
+    try:
+        result = detect_gray_entities(input_path, quiet=True)
+    except SystemExit:
+        return None
+    except Exception as e:
+        print(f"[提示] 灰区留痕导出跳过（{e}）", file=sys.stderr)
+        return None
+
+    if output_path:
+        base = Path(output_path)
+        pending_path = str(base.with_name(base.stem + "_decisions_pending.json"))
+    else:
+        pending_path = str(Path(tempfile.gettempdir()) / f"decisions_pending_{os.getpid()}.json")
+
+    pending = []
+    for e in result.get("gray", []):
+        pending.append({
+            "text": e.get("text", ""),
+            "decision": "redact",          # 自动裁决：灰区一律遮盖
+            "confidence": e.get("confidence"),
+            "category": e.get("category"),
+            "source": e.get("source"),
+            "evidence": e.get("evidence"),
+            "auto_adjudicated": True,       # 标记为「非 Agent 人工裁决」
+        })
+
+    try:
+        with open(pending_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "file": str(Path(input_path).resolve()),
+                "threshold": GRAY_CONFIDENCE_THRESHOLD,
+                "mode": "auto-gray",
+                "gray_count": len(pending),
+                "pending": pending,
+            }, f, ensure_ascii=False, indent=2)
+        print(f"[留痕] 灰区自动裁决已写入: {pending_path}")
+        return pending_path
+    except OSError as e:
+        print(f"[提示] 灰区留痕写入失败（{e}）", file=sys.stderr)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -376,6 +435,9 @@ def main():
 
     # 默认：纯自动化（灰区直接遮盖，不交 Agent）
     if len(files) == 1:
+        if auto_gray:
+            # Issue #21 / #54 D1：灰区自动裁决留痕（不阻断脱敏）
+            export_auto_gray_decisions(files[0], output)
         redact_file(files[0], output, method, auto_gray=auto_gray)
     else:
         redact_batch(files, output, method)

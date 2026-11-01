@@ -1616,8 +1616,16 @@ def redact_doc_to_docx(input_path: str, output_docx: str, detector=None) -> dict
 # ---------------------------------------------------------------------------
 
 def redact_word(input_path: str, output_path: str = None,
-               *, manifest_override: str = None) -> dict:
-    """根据扩展名自动分发处理，返回脱敏统计"""
+               *, manifest_override: str = None,
+               auto_gray: bool = False) -> dict:
+    """根据扩展名自动分发处理，返回脱敏统计。
+
+    `auto_gray`（Issue #21 / #54 D1）：灰区自动裁决模式。
+    规则引擎为**确定性**脱敏，灰区（置信度 < GRAY_CONFIDENCE_THRESHOLD）
+    实体在本路径下直接遮盖——本参数的作用是让调用方（`redact_all.py`）
+    知道本次运行处于「灰区自动裁决」模式，从而在输出侧导出
+    `decisions_pending.json` 决策留痕（合规审计用）。
+    """
     detector = build_llm_detector()
     if manifest_override:
         _set_manifest_override(manifest_override)
