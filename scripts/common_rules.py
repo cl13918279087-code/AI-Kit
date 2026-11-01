@@ -741,6 +741,56 @@ _COMMON_BIGRAMS: set = {
 
 
 # ---------------------------------------------------------------------------
+# G6 切词守卫用词表（Issue #51，真实业务语料实测）
+#
+# 【用途】姓名规则把常用词切成两半时，命中片段是「后半截 + 下一词首字」
+#   （「检索目标」← 检索|目标、「任务一」← 任务|一）。这类命中以**边界相邻**
+#   而非重叠的方式暴露，G1（重叠）与 G4（整词重叠）都抓不到，
+#   故用「命中片段的前缀/后缀是常用词」这一判据兜住。
+#
+# 【正确性前提：与真名库互斥】
+#   排除常用词表里混着 7 个**真名后缀**：海洋/创业/恒信/建设/成立/腾飞/黎明
+#   （对应真名 吴海洋/文创业/郭恒信/王建设/吴成立/陈腾飞/丁黎明）。
+#   若对它们做前缀/后缀豁免，会造成真名漏脱——这正是「真名零泄漏」的红线。
+#   故本表 = 排除常用词 − 与 D16 真名库有包含关系的词，在载入期一次算清。
+# ---------------------------------------------------------------------------
+
+_SAFE_CUT_WORDS: set = set()
+
+
+def _build_safe_cut_words(cfg: Optional[Dict] = None) -> set:
+    """构造「可安全用于切词守卫」的常用词集合。
+
+    判据：该词是排除常用词，且与 D16 全名库**无任何包含关系**
+    （既不是某真名的子串，也不包含任何真名）。
+    """
+    if cfg is None:
+        cfg = _load_config()
+    names = {n for n in (cfg.get("full_name_list") or []) if isinstance(n, str)}
+    names.discard("姓名")
+    safe = set()
+    for w in EXCLUDED_COMMON_WORDS:
+        if len(w) < 2:
+            continue
+        conflict = False
+        for n in names:
+            if w in n or n in w:
+                conflict = True
+                break
+        if not conflict:
+            safe.add(w)
+    return safe
+
+
+def _get_safe_cut_words() -> set:
+    """取切词守卫词表（带缓存）。"""
+    global _SAFE_CUT_WORDS
+    if not _SAFE_CUT_WORDS:
+        _SAFE_CUT_WORDS = _build_safe_cut_words()
+    return _SAFE_CUT_WORDS
+
+
+# ---------------------------------------------------------------------------
 # R-㊷（Issue #49 收尾，2026-10-26）：业务词保护守卫（跨词边界误伤收敛）
 #
 # 【问题】尖刀语料实测的 17 处剩余误伤，除「名单块误判」外，绝大多数是
@@ -814,6 +864,215 @@ def _find_biz_word_spans(text: str, window: Optional[Tuple[int, int]] = None) ->
     return spans
 
 
+# ---------------------------------------------------------------------------
+# G4 整词保护表（Issue #51，响应真实业务语料实测）
+#
+# 【问题】前三级守卫（G1 跨界 / G2 整体 / G3 指示词）都依赖 `biz_guard_words`，
+#   而那张表只有 135 条**银行业**词汇。真实业务语料（公司 Agent 规划文档，
+#   178 份）里密集出现另一类高频复合词：
+#       「编排链」「织架构」「范定义」「焦三大」「务名」「程中」「于向」
+#   它们被姓名规则以「姓氏 + 名字用字」形态切出，逐个收录进 `biz_guard_words`
+#   属打地鼠——真实语料的新词会持续冒出来。
+#
+# 【解法】新增 `common_word_guards`（config.json）作为**整词豁免表**：
+#   1. 条目是**完整词**（如「编排链」「任务名称」「关键路径」），不是碎片；
+#   2. 命中片段与表内词**重叠**即豁免（与 G1 同构，但词更长、语义更完整）；
+#   3. 表内词与 D16 全名库**双向互斥**——入库前剔除与任何真名有包含关系的词，
+#      因此本守卫**不可能**造成真名漏脱（与 `biz_guard_words` 同一纪律）。
+#   4. 表由真实语料**自动挖掘**产出（scripts/mine_guard_words.py），
+#      改动规则后重跑即可续挖，不靠人工枚举。
+#
+# 【为什么与 G1/G2 不重复】G1/G2 面向「切碎的碎片」（金子/于可/池业），
+#   G4 面向「本身是完整术语、只是恰好由姓+名用字拼成」的词（编排链/关键路径）。
+# ---------------------------------------------------------------------------
+
+_COMMON_WORD_GUARDS: Optional[set] = None
+_COMMON_WORD_GUARDS_MAXLEN: int = 0
+
+
+def _get_common_word_guards() -> set:
+    """取整词保护表（config.json → common_word_guards），带缓存。"""
+    global _COMMON_WORD_GUARDS, _COMMON_WORD_GUARDS_MAXLEN
+    if _COMMON_WORD_GUARDS is None:
+        cfg = _load_config()
+        words = {w for w in (cfg.get("common_word_guards") or [])
+                 if isinstance(w, str) and w}
+        _COMMON_WORD_GUARDS = words
+        _COMMON_WORD_GUARDS_MAXLEN = max((len(w) for w in words), default=0)
+    return _COMMON_WORD_GUARDS
+
+
+def _is_protected_by_common_word_guard(text: str, start: int, end: int) -> bool:
+    """G4 整词守卫：命中片段**完整落在**整词保护表的某个词内部 → 保留原文。
+
+    【语义：包含而非重叠】命中区间 [start, end) 必须被某个保护词的出现
+    区间 [ws, we) **完全覆盖**（ws <= start 且 end <= we）才豁免。
+
+    为什么不能用「重叠即豁免」：
+      重叠语义下，保护词「张三」（占位人名）会与命中片段「张三丰」相交，
+      从而把**真名**整体豁免 → 真名漏脱（回归 test_d15_extra_names_guard）。
+      包含语义下，「张三丰」不被「张三」覆盖（张三 是 三丰 的前缀），
+      因此真名照常脱敏；而「排链」被「编排链路」完整覆盖 → 仍然豁免。
+
+    【真名优先】D15 注入的额外姓名（表格列预扫）与本表冲突时，
+      以真名为准——注入名不做豁免。
+    """
+    words = _get_common_word_guards()
+    if not words:
+        return False
+    matched = text[start:end]
+    if not matched:
+        return False
+    # G4-0 真名优先：命中片段与已注入姓名（D15 表格列预扫）重叠 → 不豁免
+    for name in _EXTRA_NAMES:
+        if not name:
+            continue
+        lo = max(0, start - len(name))
+        hi = min(len(text), end + len(name))
+        idx = text.find(name, lo)
+        while idx >= 0 and idx < hi:
+            if idx < end and start < idx + len(name):
+                return False
+            idx = text.find(name, idx + 1)
+    # G4-a 整体命中：命中片段本身就是表内整词
+    if matched in words:
+        return True
+    # G4-b 包含命中：窗口内任一表内词**完整覆盖**命中片段
+    #   表内最长词有限，窗口左右各取 maxlen 足以覆盖判定
+    pad = _COMMON_WORD_GUARDS_MAXLEN
+    lo = max(0, start - pad)
+    hi = min(len(text), end + pad)
+    for w in words:
+        if len(w) < 2:
+            continue
+        idx = text.find(w, lo)
+        while idx >= 0 and idx < hi:
+            ws, we = idx, idx + len(w)
+            if ws <= start and end <= we:
+                return True
+            idx = text.find(w, idx + 1)
+    return False
+
+
+def _is_overlapped_by_common_word_guard(text: str, start: int, end: int) -> bool:
+    """G4-c 重叠命中（**仅供地址通道使用**）：命中片段与整词保护表**相交**即豁免。
+
+    【为什么地址通道要放宽到重叠语义】
+    姓名通道的 G4 用「包含」语义，是因为姓名片段若只是保护词的**一部分**
+    （如「张三丰」之于「张三」），豁免就会漏掉真名。
+    但地址通道的命中片段是「前缀 + 行政后缀」构成的**地理单元**：
+        「含编排链路」+「路」 → 地址通道把「链」当地名前缀 → XX路
+    此处保护词「编排链路」并不完整覆盖命中片段（命中片段多了一个「含」），
+    「包含」语义失效；然而二者**相交**，足以判定这段是业务术语而非地名。
+
+    【真名安全】保护表入库时已与 D16 全名库 / 金标**双向互斥**
+    （无任何包含关系），因此相交的保护词不可能是真名本身，
+    不会造成真名漏脱。
+    """
+    words = _get_common_word_guards()
+    if not words:
+        return False
+    # G4-0 真名优先：命中片段与已注入姓名（D15 表格列预扫）重叠 → 不豁免
+    for name in _EXTRA_NAMES:
+        if not name:
+            continue
+        lo = max(0, start - len(name))
+        hi = min(len(text), end + len(name))
+        idx = text.find(name, lo)
+        while idx >= 0 and idx < hi:
+            if idx < end and start < idx + len(name):
+                return False
+            idx = text.find(name, idx + 1)
+    pad = _COMMON_WORD_GUARDS_MAXLEN
+    lo = max(0, start - pad)
+    hi = min(len(text), end + pad)
+    for w in words:
+        if len(w) < 2:
+            continue
+        idx = text.find(w, lo)
+        while idx >= 0 and idx < hi:
+            ws, we = idx, idx + len(w)
+            if ws < end and start < we:
+                return True
+            idx = text.find(w, idx + 1)
+    return False
+
+
+# ---------------------------------------------------------------------------
+# G7 跨词边界守卫（Issue #51，真实业务语料实测）
+#
+# 【问题】姓名规则把一个常用词**切成两半**时，命中片段横跨在两个词的边界上：
+#     「依赖大量」→ 命中「赖大」（依赖|大量）
+#     「指向真实」→ 命中「向真」（指向|真实）
+#     「规范建设」→ 命中「范建」（规范|建设）
+#     「基于静态」→ 命中「于静」（基于|静态）
+# 这类误伤**不与任何完整词重叠**——它既不在「依赖」内部，也不在「大量」内部，
+# 因此 G1（重叠）/ G2（整体）/ G4（整词包含）全都抓不到：
+# 它们出错的正是**词与词之间那条缝**。
+#
+# 【判据】命中片段 [start,end) 若满足下列之一，即判为「跨词边界错切」：
+#     A. 左邻字 + 命中首字 ∈ 边界对表   → 左边界切在了一个词的中间
+#     B. 命中末字 + 右邻字 ∈ 边界对表   → 右边界切在了一个词的中间
+# 之所以可信：判据成立时，被切的那个词**有一半落在命中片段之外**，
+# 所以命中片段必然只是那个被切碎的词的一部分，不可能恰好是独立人名。
+#
+# 【正确性前提：与真名库双向互斥】
+#     边界对表由 scripts/mine_boundary_pairs.py 挖掘，入表前已剔除与任何
+#     真名（D16 全名库 + 评测金标）有包含关系的组合，故本守卫不会
+#     因为「保护了真名的相邻二字」而造成真名漏脱。
+#
+# 【真名优先】命中片段本身若是真名（D16 / D15 注入名），一律不豁免。
+# ---------------------------------------------------------------------------
+
+_BOUNDARY_PAIRS: Optional[set] = None
+
+
+def _get_boundary_pairs() -> set:
+    """取跨词边界对表（config.json → word_boundary_pairs），带缓存。"""
+    global _BOUNDARY_PAIRS
+    if _BOUNDARY_PAIRS is None:
+        cfg = _load_config()
+        _BOUNDARY_PAIRS = {w for w in (cfg.get("word_boundary_pairs") or [])
+                           if isinstance(w, str) and len(w) == 2}
+    return _BOUNDARY_PAIRS
+
+
+def _is_real_name_fragment(text: str, start: int, end: int) -> bool:
+    """命中片段本身是否为真名（D16 全名库 / D15 注入名）。
+
+    真名优先：命中片段本身是真名时，任何守卫都不得豁免它。
+    """
+    matched = text[start:end]
+    if not matched:
+        return False
+    # D15 注入的额外姓名（表格列预扫）
+    for name in _EXTRA_NAMES:
+        if name and name in matched:
+            return True
+    # D16 全名库
+    return matched in get_full_name_set()
+
+
+def _is_boundary_split_misfire(text: str, start: int, end: int) -> bool:
+    """G7 跨词边界守卫：命中片段横跨在两个词的边界上 → 保留原文。"""
+    pairs = _get_boundary_pairs()
+    if not pairs:
+        return False
+    matched = text[start:end]
+    if len(matched) < 2:
+        return False
+    # 真名优先：命中片段本身是真名 → 不豁免
+    if _is_real_name_fragment(text, start, end):
+        return False
+    # A. 左邻字 + 命中首字
+    if start > 0 and (text[start - 1] + matched[0]) in pairs:
+        return True
+    # B. 命中末字 + 右邻字
+    if end < len(text) and (matched[-1] + text[end]) in pairs:
+        return True
+    return False
+
+
 def _get_biz_words_by_first() -> Dict[str, set]:
     """业务词按首字分组的倒排索引（带缓存）。"""
     global _BIZ_WORDS_BY_FIRST
@@ -879,6 +1138,24 @@ def _is_protected_by_common_word(text: str, start: int, end: int) -> bool:
     if (len(matched) == 2 and start > 0
             and text[start - 1] + matched[0] in _COMMON_BIGRAMS):
         return True
+    # G6 切词前缀/后缀守卫（Issue #51，真实业务语料实测）
+    # 姓名规则常把一个常用词切成两半，命中「后半截 + 下一词首字」：
+    #     「检索目标」← 检索|目标     「评估对」← 评估|对
+    #     「任务一」 ← 任务|一       「管理中」← 管理|中
+    # 判定：命中片段的**前缀**（≥2 字）或**后缀**（≥2 字）是排除常用词，
+    #       且该常用词与 D16 真名库无包含关系 → 判定为切词误伤，保留原文。
+    # 【为什么必须做真名互斥】排除常用词里混着 7 个**真名后缀**
+    #     （海洋/创业/恒信/建设/成立/腾飞/黎明 → 吴海洋/文创业/郭恒信/
+    #       王建设/吴成立/陈腾飞/丁黎明）。对这些词做前缀/后缀豁免会漏脱真名，
+    #     故互斥检查是本守卫的正确性前提，不可省略。
+    if len(matched) >= 3:
+        for k in range(2, len(matched)):
+            prefix = matched[:k]
+            suffix = matched[k:]
+            if len(prefix) >= 2 and prefix in _SAFE_CUT_WORDS:
+                return True
+            if len(suffix) >= 2 and suffix in _SAFE_CUT_WORDS:
+                return True
     window_start = max(0, start - 8)
     window_end = min(len(text), end + 8)
     window = text[window_start:window_end]
@@ -1009,6 +1286,23 @@ def _apply_address_pass(text: str, stats: Dict[str, int] = None) -> str:
                 and text[i - 1] == "中" and "\u4e00" <= text[i - 1] <= "\u9fff"):
             i -= 1
             prefix = "中" + prefix
+
+        # G5 地址前缀守卫（Issue #51，真实业务语料实测）：
+        # 「编排链路正确性」被回溯成「XX路正确性」——地址通道把「链」当作
+        # 「XX路」的地名前缀（链+路）。这类误伤与姓名通道同源：前缀是
+        # **业务术语**而非地名成分。
+        # 复用 G4 整词保护表（common_word_guards）：前缀与表内词重叠 → 保留原文。
+        # 同一张表同时服务姓名通道与地址通道，避免维护两份词表。
+        if prefix and _is_protected_by_common_word_guard(text, i, i + len(prefix)):
+            continue
+
+        # G4-c 重叠豁免（Issue #51）：前缀 + 行政后缀构成的完整片段与整词
+        # 保护表**相交**即豁免。
+        # 「含编排链路」+「路」：保护词「编排链路」与命中片段相交 → 业务术语
+        # 「识别灰」+「区」：保护词「灰区」与命中片段相交 → 业务术语
+        # 真名安全：保护表与 D16 全名库 / 金标双向互斥，相交不可能是真名。
+        if prefix and _is_overlapped_by_common_word_guard(text, i, s_end):
+            continue
 
         # R-B（Issue #4）保护：前缀含项目/产品/工程等非地名词时保留原文
         if any(g in prefix for g in _ADDRESS_PREFIX_GUARDS):
@@ -1399,9 +1693,32 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
     ))
     # R2 新增：无年份斜杠短日期"M/D"（如"截止9/1上报"）
     # 边界阻止长数字串/小数/日期已替换场景
+    #
+    # G10 分节编号 / 分数守卫（Issue #51，真实业务语料实测）：
+    #   「项目总体管理（1/2）」「结果：10/10 全部通过 ✅」被当作 M/D 日期脱敏。
+    #   这两类形态有明确标识：
+    #     ① 分子 == 分母          → 分数（10/10）
+    #     ② 被全角括号包裹        → 分节编号（（1/2）、（2/2））
+    #   中文文档的日期几乎不写成裸 M/D（惯例为「8月2日」或「2026年8月2日」），
+    #   故这两种形态判为非日期，保留原文。
+    _short_slash_re = re.compile(
+        r'(?<![0-9/.])(?:0?[1-9]|1[0-2])/(?:0?[1-9]|[12][0-9]|3[01])(?![0-9/])')
+
+    def _short_slash_repl(m: re.Match) -> str:
+        whole = m.group(0)
+        # ① 分子 == 分母 → 分数
+        if whole.split("/")[0].lstrip("0") == whole.split("/")[1].lstrip("0"):
+            return whole
+        # ② 全角括号包裹 → 分节编号
+        lo = max(0, m.start() - 1)
+        hi = min(len(m.string), m.end() + 1)
+        if m.string[lo:m.start()] == "（" and m.string[m.end():hi] == "）":
+            return whole
+        return _date_short_slash
+
     patterns.append((
-        re.compile(r'(?<![0-9/.])(?:0?[1-9]|1[0-2])/(?:0?[1-9]|[12][0-9]|3[01])(?![0-9/])'),
-        _date_short_slash
+        _short_slash_re,
+        _short_slash_repl
     ))
     # D14（赵辉，第3批，2026-10-08）：裸年份独立形态（YYYY年 单独出现）
     # 必须在完整日期规则之后执行；否则"2025年7月5日"先被吃掉成"YYYY年7月5日"
@@ -1516,6 +1833,34 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
             + r")(?=[一-龥a-zA-Z])"
         )
 
+        # ---- G8（Issue #51，真实业务语料实测）：银行名「业务修饰词」守卫
+        #
+        # 问题：贪婪模式 [汉字]{2,6}银行 会把**业务修饰语**当成银行名的一部分：
+        #   "资深银行大型项目管理员" → 脱成 "XX银行大型项目管理员"（"资深"被吞）
+        #   "检索目标银行同业实践"     → "XX银行同业实践"（"检索目标"被吞）
+        #   "须符合银行监管要求"       → "XX银行监管要求"（"须符合"被吞）
+        #   "结合某股份制银行项目"     → "XX银行项目"（"结合某股份制"被吞）
+        # 根因：银行名的合法前缀是**地名/字号**（宁波/郑州/中原/海峡），
+        #   而「资深」「检索目标」「评估对」「须符合」「制定」「凭借在」等是
+        #   业务修饰语，出现在银行名前时说明这个「银行」是**泛称**而非专名。
+        # 「股份制银行」本身即泛称（不是某家具体银行），一并保留。
+        _BANK_MODIFIER_WORDS = {
+            # 业务动作/状态修饰
+            "资深", "检索", "评估", "符合", "制定", "支撑", "凭借",
+            "识别", "移入", "面向", "涉及", "服务", "配套", "实施",
+            "运营", "管理", "监管", "风控", "咨询", "顾问", "专业",
+            # 名词性修饰
+            "目标", "股份制", "综合", "业务", "系统", "核心", "数字",
+            "智慧", "手机", "电子", "网上", "直销", "个人", "远程",
+            "微信", "视频", "电话", "大型", "小型", "中型", "国有",
+            "地方", "民营", "外资", "区域", "跨域", "跨行", "本行",
+            "他行", "全行", "重点", "战略",
+        }
+        _BANK_MODIFIER_RE = re.compile(
+            "(?:" + "|".join(re.escape(w) for w in
+                             sorted(_BANK_MODIFIER_WORDS, key=len, reverse=True)) + ")"
+        )
+
         def _bank_generic_guard(text: str) -> bool:
             """判断文本是否命中银行名防护层，是则不脱"""
             if text in _BANK_GENERIC_KEEP:
@@ -1535,6 +1880,12 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
                 return True
             # 占位符自保护：X{1,10}银行（防字母银行名规则二次击中）
             if re.fullmatch(r"X{1,10}银行", text):
+                return True
+            # G8（Issue #51，真实业务语料实测）：业务修饰词守卫
+            # 银行名的合法前缀是**地名/字号**（宁波/郑州/中原/海峡），
+            # 而「资深」「检索目标」「评估对」「须符合」「制定」「凭借在」等是
+            # 业务修饰语，出现在银行名前说明这个「银行」是**泛称**而非专名。
+            if _BANK_MODIFIER_RE.search(text[:-2]):
                 return True
             return False
 
@@ -2168,6 +2519,22 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
     # D16 精确层（延后到 S2 之后 append，理由见上方 S2 注释）
     # 长名优先（降序），确保复姓等长名不被短名截断
     # 边界：排除 ASCII/数字前后跟随；允许中文跟随（如"邹阳和陈黎"）
+    #
+    # D16-P 占位名层（Issue #51，真实业务语料实测）：
+    #   真实业务文档里存在**占位人名**「张三」「李四」「王五」「赵六」等，
+    #   它们在组织架构图/角色分工表里承担真实人名的语义位
+    #   （「主任：张三（CIO）」「负责人：李四（总经理）」），
+    #   因此**必须脱敏**（否则占位名泄漏即真名位泄漏）。
+    #   但它们不在 D16 全名库（7398 条真实人名）里，通用姓名规则也不覆盖
+    #   （「三」「四」不在名字用字池的可用闸门内），导致整体漏脱。
+    #
+    #   实现要点：**独立的占位名表**（config.json → placeholder_names），
+    #   不混入 full_name_list——混入会让「张三」被 2 字名层优先匹配，
+    #   把真名「张三丰」截断成「XXX丰」（实测降级）。
+    #   占位名层要求**右边界非汉字**（防止截断更长真名），
+    #   左边界宽松（允许「组长张三」这类前置角色词）。
+    _placeholder_names: List[str] = cfg.get("placeholder_names") or []
+
     if _full_name_list:
         _sorted_names = sorted(_full_name_list, key=len, reverse=True)
         # 【边界按名字长度分层（2026-10-26，实测发现）】
@@ -2420,6 +2787,34 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
 
     patterns.append((_anchor_re, _anchor_repl))
 
+    # D16-P 占位名层（Issue #51，真实业务语料实测）——置于姓名规则组**最末**
+    #
+    # 【背景】真实业务文档里存在**占位人名**「张三」「李四」「王五」「赵六」，
+    #   它们在组织架构图/角色分工表里承担真实人名的语义位：
+    #     「主任：张三（CIO）」「负责人：李四（总经理）」
+    #   属于**必须脱敏**的语义位（占位名不脱 = 人名位泄漏）。
+    #   但它们不在 D16 全名库（7398 条真实人名）里，
+    #   通用姓名规则也不覆盖（「三」「四」不在名字用字池的可用闸门内）→ 整体漏脱。
+    #
+    # 【为什么放在最末而不是混入 D16 库】
+    #   混入 full_name_list 会让「张三」被 **2 字名层**优先匹配，
+    #   把真名「张三丰」截断成「XXX丰」（实测降级，已验证）。
+    #   放在所有通用规则之后：通用规则先把「张三丰」整体脱敏为 XXX，
+    #   残留的裸「张三」才由本层兜底 —— 两者互不干扰。
+    #
+    # 【右边界】允许紧跟汉字：「张三负责建设」中的「张三」是姓名位，须脱敏。
+    #   为何不怕截断更长真名「张三丰」？因为本层置于**所有通用规则之后**——
+    #   通用规则若能识别「张三丰」，已先把它整体替换为 XXX，本层根本遇不到；
+    #   若通用规则识别不了，本层脱敏「张三」也仍是脱敏（不产生泄漏），
+    #   只是粒度上由「张三丰」降级为「张三」+ 残留一字。
+    #   仅排除 ASCII 字母/数字相邻（避免吃掉 IDATA-张三 这类编码拼接）。
+    if _placeholder_names:
+        _ph_alt = "|".join(re.escape(n) for n in sorted(_placeholder_names, key=len, reverse=True))
+        patterns.append((
+            re.compile(rf'(?<![A-Za-z0-9])(?:{_ph_alt})(?![A-Za-z0-9])'),
+            rep.get("NAME", "XXX")
+        ))
+
 
     # 拆分：姓名规则单独归组，供 apply_redactions 在地址通道之后执行
     _PATTERNS_PRE = patterns[:_pre_pattern_count]
@@ -2657,17 +3052,41 @@ _ADJUST_RECORDS_RE = re.compile(
 )
 _ENGLISH_NAME_RE = re.compile(r"(?<![A-Za-z])[A-Z][a-z]{2,}(?![A-Za-z])")
 
+_ENGLISH_TERM_WHITELIST: Optional[set] = None
+
+
+def _get_english_term_whitelist() -> set:
+    """取英文业务术语白名单（config.json → english_term_whitelist），带缓存。
+
+    【为什么需要】Issue #51 真实业务语料实测：「Agent 协同工作的中枢」
+    「Agent Skill 验收测试报告」中的 Agent/Skill 是**产品术语**而非英文人名，
+    但 `_ENGLISH_NAME_RE`（首字母大写 + ≥3 个小写字母）会一刀切脱敏。
+    白名单由真实语料频次挖掘（≥2 次）产出，并剔除常见英文人名
+    （Lisa/David/Wang/Lee 等）——**真名优先**，宁可漏脱也不误伤真名。
+    """
+    global _ENGLISH_TERM_WHITELIST
+    if _ENGLISH_TERM_WHITELIST is None:
+        cfg = _load_config()
+        _ENGLISH_TERM_WHITELIST = {w for w in (cfg.get("english_term_whitelist") or [])
+                                  if isinstance(w, str) and w}
+    return _ENGLISH_TERM_WHITELIST
+
 
 def _apply_english_name_pass(text: str, counts: Dict[str, int]) -> str:
     """段落含角色词时，遮蔽段内英文人名（Lisa/David 等）。
     全大写术语（UAT/POS）与句首普通词不受影响——仅匹配首字母大写
-    且非全大写的独立词，且限定角色上下文。"""
+    且非全大写的独立词，且限定角色上下文。
+    G9 英文术语白名单（Issue #51）：Agent/Skill/Excel 等产品术语豁免。"""
     if not text or not isinstance(text, str):
         return text
+    whitelist = _get_english_term_whitelist()
     out_lines = []
     for line in text.split("\n"):
         if any(k in line for k in _ROLE_KEYWORDS):
             def _repl(m: re.Match) -> str:
+                # G9 英文术语白名单：产品/业务术语不是人名 → 保留原文
+                if m.group(0) in whitelist:
+                    return m.group(0)
                 counts["姓名"] = counts.get("姓名", 0) + 1
                 return "XXX"
             line = _ENGLISH_NAME_RE.sub(_repl, line)
@@ -2707,6 +3126,14 @@ def _apply_role_context_pass(text: str, counts: Dict[str, int]) -> str:
                     or name_candidate[:2] in EXCLUDED_COMMON_WORDS
                     or name_candidate[:3] in EXCLUDED_COMMON_WORDS):
                 return m.group(0)  # 保护，跳过替换
+            # G4/G7（Issue #51）：整词保护表 / 跨词边界守卫
+            # "规划文档生成与管理"曾被切成 "文档生成|与管理" 而误伤
+            g_start = m.start(1)
+            g_end = m.end(1)
+            if _is_protected_by_common_word_guard(m.string, g_start, g_end):
+                return m.group(0)
+            if _is_boundary_split_misfire(m.string, g_start, g_end):
+                return m.group(0)
             counts["姓名"] = counts.get("姓名", 0) + 1
             return m.group(0)[:0 - len(m.group(1))] + "XXX"
         new_line = _ROLE_NAME_RE.sub(_role_repl, line)
@@ -2730,6 +3157,13 @@ def _apply_role_context_pass(text: str, counts: Dict[str, int]) -> str:
         new_line = _ADJUST_RECORDS_RE.sub(_adjust_repl, new_line)
         # D8（赵辉）：连词守卫——"王力和张明"中"和"两侧姓名均脱敏
         def _conj_repl(m: re.Match) -> str:
+            # G4/G7（Issue #51）：连词两侧若为业务术语，不脱敏
+            # "规划文档生成与管理"曾被切成 "生成|与|管理" → "生XXX与XXX理"
+            for gi in (1, 3):
+                if _is_protected_by_common_word_guard(m.string, m.start(gi), m.end(gi)):
+                    return m.group(0)
+                if _is_boundary_split_misfire(m.string, m.start(gi), m.end(gi)):
+                    return m.group(0)
             counts["姓名"] = counts.get("姓名", 0) + 2
             return "XXX" + m.group(2) + "XXX"
         new_line = _get_role_conjunction_re().sub(_conj_repl, new_line)
@@ -2771,13 +3205,21 @@ def _list_name_repl(m: re.Match) -> str:
     text = m.group(0)
     parts = re.split(r'([、，])', text)
     result = []
+    offset = 0  # 各块在原文中的起始偏移（供 G4/G7 定位）
     for p in parts:
+        seg_start = offset
+        offset += len(p)
         if re.match(r'^[\u4e00-\u9fa5]{2,4}$', p):
             # 检查残字：若替换后前一块末字+当前块=残字组合则跳过
             if result and len(p) >= 2 and p[0] in _RESIDUE_STOP:
                 result.append(p)
             # R-㊷：列表项本身命中业务词（活期/定期/票据池/商票保贴…）→ 保留原项
             elif _is_protected_by_biz_word(p, 0, len(p)):
+                result.append(p)
+            # G4/G7（Issue #51）：整词保护表 / 跨词边界守卫
+            #   「报告生成、会议纪要」是并列业务术语，不是人名名单
+            elif (_is_protected_by_common_word_guard(text, seg_start, seg_start + len(p))
+                  or _is_boundary_split_misfire(text, seg_start, seg_start + len(p))):
                 result.append(p)
             else:
                 result.append("XX" * (len(p) // 2))
@@ -2935,6 +3377,15 @@ def _apply_anchor_expand_pass(text: str, counts: Dict[str, int]) -> str:
                 digit_ratio = sum(c.isdigit() for c in word) / len(word)
                 if digit_ratio >= 0.4:
                     continue
+                # G4/G7（Issue #51）：整词保护表 / 跨词边界守卫
+                #   「负责人：李四（总经理）」中「总经理」是职位而非姓名
+                #   「成员：业务/财务/IT」中「财务」是职能而非姓名
+                abs_start = m.start(2) + block_m.start()
+                abs_end = m.start(2) + block_m.end()
+                if _is_protected_by_common_word_guard(m.string, abs_start, abs_end):
+                    continue
+                if _is_boundary_split_misfire(m.string, abs_start, abs_end):
+                    continue
                 # 替换
                 counts["姓名"] = counts.get("姓名", 0) + 1
                 result_parts.append(rest[last_end:block_m.start()])
@@ -2983,6 +3434,12 @@ def _name_guard_sub_counted(pattern: re.Pattern, text: str, replacement: str,
             return m.group(0)
         # R-㊷：业务词保护守卫（G1 跨界 / G2 整体 / G3 指示词）
         if _is_protected_by_biz_word(m.string, m.start(), m.end()):
+            return m.group(0)
+        # G4 整词保护表（Issue #51）：与真实业务术语重叠 → 保留原文
+        if _is_protected_by_common_word_guard(m.string, m.start(), m.end()):
+            return m.group(0)
+        # G7 跨词边界守卫（Issue #51）：命中横跨在两个词的边界上 → 保留原文
+        if _is_boundary_split_misfire(m.string, m.start(), m.end()):
             return m.group(0)
         # Agent 评审决策跳过：若本轮匹配文本在 skip 集合中，不遮盖
         if _get_skip_texts() and m.group(0) in _get_skip_texts():
