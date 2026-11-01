@@ -34,8 +34,19 @@ from typing import Optional
 
 from common_rules import (
     add_custom_replacement, REDACTION_LABELS,
-    GRAY_CONFIDENCE_THRESHOLD, is_gray_entity, load_agent_decisions
+    GRAY_CONFIDENCE_THRESHOLD, is_gray_entity, load_agent_decisions,
+    classify_hit_channel, find_entity_span, CHANNEL_UNKNOWN
 )
+
+
+def _find_span(text: str, snippet: str, start_hint=None, end_hint=None):
+    """定位实体字符区间（Issue #54 D1 候选清单 span 字段）。
+
+    优先采用实体自带偏移（LLM 层会给 start/end），否则回退到文本查找。
+    """
+    if start_hint is not None and end_hint is not None:
+        return start_hint, end_hint
+    return find_entity_span(text, snippet)
 
 
 # ---------------------------------------------------------------------------
@@ -158,6 +169,14 @@ def detect_gray_entities(input_path: str, output_json: str = None,
             "source": e.source,
             "evidence": e.evidence,
         }
+        # Issue #54 D1：候选清单须带 span + 命中通道（否则裁决方无法定位责任规则）
+        span_start, span_end = _find_span(text, e.text,
+                                          getattr(e, "start", None),
+                                          getattr(e, "end", None))
+        info["span"] = {"start": span_start, "end": span_end}
+        info["channel"] = classify_hit_channel(text, span_start, span_end,
+                                               source=e.source) if span_start is not None \
+            else CHANNEL_UNKNOWN
         if is_gray_entity(e.confidence):
             gray.append(info)
         else:
@@ -235,6 +254,9 @@ def export_auto_gray_decisions(input_path: str, output_path: str = None) -> Opti
             "category": e.get("category"),
             "source": e.get("source"),
             "evidence": e.get("evidence"),
+            # Issue #54 D1：候选清单须带 span + 命中通道
+            "span": e.get("span"),
+            "channel": e.get("channel"),
             "auto_adjudicated": True,       # 标记为「非 Agent 人工裁决」
         })
 
@@ -284,8 +306,87 @@ def apply_agent_decisions(input_path: str, decisions_path: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 裁决记录归档（Issue #54 D1）
+# ---------------------------------------------------------------------------
+
+def read_decision_records(path: str) -> list:
+    """读取裁决文件（decisions.json / decisions_pending.json）为记录列表。
+
+    两种格式均支持：
+      · 列表格式：[{"text": ..., "decision": "skip|redact", ...}, ...]
+      · 字典格式：{"pending": [...]}（自动裁决留痕文件）
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return []
+    if isinstance(data, dict):
+        for key in ("pending", "decisions", "items"):
+            if isinstance(data.get(key), list):
+                return [d for d in data[key] if isinstance(d, dict)]
+        return []
+    if isinstance(data, list):
+        return [d for d in data if isinstance(d, dict)]
+    return []
+
+
+def write_redaction_manifest(output_path: str, counts: dict = None,
+                             decisions: list = None,
+                             source_path: str = "",
+                             mode: str = "manual") -> str:
+    """写 manifest.json（+ manifest.md），把裁决记录一并归档。
+
+    Issue #54 D1 要点：「裁决记录随 manifest.json 归档，满足合规留痕」。
+    产出路径：`<输出文件>_manifest.json` / `<输出文件>_manifest.md`
+    （与 pipeline.py 的 manifest_path 口径一致）。
+
+    返回：manifest.json 路径（失败返回空串）。
+    """
+    try:
+        from manifest import RedactionManifest
+    except Exception as e:      # pragma: no cover
+        print(f"[提示] manifest 归档跳过（{e}）", file=sys.stderr)
+        return ""
+    try:
+        out = Path(output_path)
+        m = RedactionManifest(filename=out.name)
+        stats = {k: v for k, v in (counts or {}).items()
+                 if isinstance(v, (int, float)) and not isinstance(v, bool)}
+        m.set_stats(**stats)
+        m.stats["decisions_count"] = len(decisions or [])
+        m.stats["mode"] = mode
+        m.stats["source_file"] = str(source_path)
+        m.add_decisions(decisions or [])
+        json_path = str(out) + "_manifest.json"
+        m.save_json(json_path)
+        m.save_markdown(str(out) + "_manifest.md")
+        print(f"[归档] 裁决记录已随 manifest 归档: {json_path}")
+        return json_path
+    except Exception as e:
+        print(f"[提示] manifest 归档失败（{e}）", file=sys.stderr)
+        return ""
+
+
+# ---------------------------------------------------------------------------
 # 批量脱敏（支持 glob 模式）
 # ---------------------------------------------------------------------------
+
+def _resolve_output_path(input_path: str, output_path: str = None) -> str:
+    """推导最终输出路径（与 redact_file 的默认命名口径一致）。"""
+    if output_path:
+        return str(Path(output_path).resolve())
+    p = Path(input_path).resolve()
+    ext = p.suffix.lower()
+    suffix_map = {
+        ".docx": "_脱敏.docx", ".doc": "_脱敏.doc",
+        ".xlsx": "_脱敏.xlsx", ".xls": "_脱敏.xls",
+        ".pptx": "_脱敏.pptx", ".ppt": "_脱敏.ppt",
+        ".pdf": "_脱敏.pdf",
+    }
+    default_suffix = suffix_map.get(ext, "_脱敏" + ext)
+    return str(p.with_name(f"{p.stem}{default_suffix}"))
+
 
 def redact_file(input_path: str, output_path: str = None,
                 method: str = "mosaic",
@@ -295,17 +396,7 @@ def redact_file(input_path: str, output_path: str = None,
     input_path = Path(input_path).resolve()
     ext = input_path.suffix.lower()
 
-    if output_path:
-        output_path = Path(output_path).resolve()
-    else:
-        suffix_map = {
-            ".docx": "_脱敏.docx", ".doc": "_脱敏.doc",
-            ".xlsx": "_脱敏.xlsx", ".xls": "_脱敏.xls",
-            ".pptx": "_脱敏.pptx", ".ppt": "_脱敏.ppt",
-            ".pdf": "_脱敏.pdf",
-        }
-        default_suffix = suffix_map.get(ext, "_脱敏" + ext)
-        output_path = input_path.with_name(f"{input_path.stem}{default_suffix}")
+    output_path = Path(_resolve_output_path(input_path, output_path))
 
     handler = _load_handler(ext)
     if handler is None:
@@ -430,15 +521,32 @@ def main():
             sys.exit(1)
         override_path = apply_agent_decisions(files[0], agent_decisions)
         # 正常执行，handlers 会读取 override_path
-        redact_file(files[0], output, method, manifest_override=override_path)
+        counts = redact_file(files[0], output, method, manifest_override=override_path)
+        # Issue #54 D1：裁决记录随 manifest.json 归档（合规留痕）
+        write_redaction_manifest(
+            _resolve_output_path(files[0], output),
+            counts=counts,
+            decisions=read_decision_records(agent_decisions),
+            source_path=files[0],
+            mode="agent-decisions",
+        )
         sys.exit(0)
 
     # 默认：纯自动化（灰区直接遮盖，不交 Agent）
     if len(files) == 1:
+        pending_path = None
         if auto_gray:
             # Issue #21 / #54 D1：灰区自动裁决留痕（不阻断脱敏）
-            export_auto_gray_decisions(files[0], output)
-        redact_file(files[0], output, method, auto_gray=auto_gray)
+            pending_path = export_auto_gray_decisions(files[0], output)
+        counts = redact_file(files[0], output, method, auto_gray=auto_gray)
+        # Issue #54 D1：裁决记录随 manifest.json 归档（合规留痕）
+        write_redaction_manifest(
+            _resolve_output_path(files[0], output),
+            counts=counts,
+            decisions=read_decision_records(pending_path) if pending_path else [],
+            source_path=files[0],
+            mode="auto-gray" if auto_gray else "manual",
+        )
     else:
         redact_batch(files, output, method)
 

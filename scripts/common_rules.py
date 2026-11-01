@@ -3292,6 +3292,384 @@ def _apply_role_context_pass(text: str, counts: Dict[str, int]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Issue #52（赵辉，2026-10）：职务与称谓式人名识别通道
+#
+# 背景：#52 §二 归纳出四类失败形态，其中「姓氏 + 职务后缀」「昵称形态」
+#   「单字姓 + 动词边界」三类是 Skill 侧完全缺失的（P0）。
+#
+# 【为什么不能全局粗筛】—— Issue #49 的直接教训
+#   在真实业务语料（biz_corpus 1200 条 + 误伤语料 102 条）上枚举
+#   「实证姓 × 职务后缀」组合，实际出现 11 种，**全部是业务词**
+#   （项工/务总/别总/单总/加工/和工/段工/项总/户经理），
+#   无一真实称谓。若做全局「姓 + 后缀 → XXX」的粗筛，会把这批
+#   业务词全部吃掉（"专项工作推进"→"专项XXX推进"），等价于制造
+#   #49 同等级别的回归。因此本通道采用 **#52 §3.4 的区域化口径**：
+#   称谓形态**只在角色锚点附近生效**（组织/小组后缀、请求动词、
+#   职责动词邻近），区域外一律不启用。
+#
+# 【三类形态】
+#   ① 姓 + 职务后缀：刘主任 / 王总 / 陈总 / 李工 / 张经理
+#   ② 昵称形态：小李 / 老李
+#   ③ 单字姓 + 动词边界：会议由刘主持
+#
+# 【保护词优先级】#52 §3.1 要求「保护词命中应作用于独立出现的职务词，
+#   不得覆盖姓 + 职务后缀的组合形态」——本实现落在两层：
+#   · 独立职务词（"经理"/"主任"）由 EXCLUDED_COMMON_WORDS 保护，不在本通道匹配范围
+#     （本通道要求姓氏字 + 后缀的**组合**形态）；
+#   · 组合形态若整体被更长业务词覆盖（"业务经理" ⊃ "务经理"），
+#     则按**包含语义**豁免，避免把职务词连同人名一起放过。
+# ---------------------------------------------------------------------------
+
+_TITLE_NAME_CACHE: Optional[Dict[str, Any]] = None
+_TITLE_SUFFIX_RE_CACHE: Optional[re.Pattern] = None
+_TITLE_NICK_RE_CACHE: Optional[re.Pattern] = None
+_TITLE_SINGLE_RE_CACHE: Optional[re.Pattern] = None
+
+
+def _get_title_name_cfg() -> Dict[str, Any]:
+    """读取职务/称谓形态配置（config.json → title_suffix_names），带缓存。"""
+    global _TITLE_NAME_CACHE
+    if _TITLE_NAME_CACHE is not None:
+        return _TITLE_NAME_CACHE
+    raw = _load_config().get("title_suffix_names") or {}
+    if not isinstance(raw, dict):
+        raw = {}
+
+    def _sl(key: str) -> List[str]:
+        val = raw.get(key) or []
+        return [x for x in val if isinstance(x, str) and x]
+
+    def _cs(key: str, default: str = "") -> set:
+        val = raw.get(key)
+        if isinstance(val, str):
+            return set(val)
+        if isinstance(val, list):
+            return set(x for x in val if isinstance(x, str))
+        return set(default)
+
+    _TITLE_NAME_CACHE = {
+        "enable": bool(raw.get("enable", True)),
+        "suffixes": sorted(set(_sl("suffixes")), key=len, reverse=True),
+        "nickname_prefixes": sorted(set(_sl("nickname_prefixes")), key=len, reverse=True),
+        "org_anchor_chars": _cs("org_anchor_chars", "部组处室科队班所司厂园院"),
+        "left_anchor_words": _sl("left_anchor_words"),
+        "role_verbs_near": _sl("role_verbs_near"),
+        "role_verbs_far": _sl("role_verbs_far"),
+        "nickname_block_followers": _cs("nickname_block_followers"),
+        "title_modifier_chars": _cs("title_modifier_chars"),
+        "single_char_exclusions": _cs("single_char_exclusions"),
+        "skip_phrases": _sl("skip_phrases"),
+    }
+    return _TITLE_NAME_CACHE
+
+
+def _title_surname_class() -> str:
+    """姓氏字符类（正则用）。"""
+    return "".join(sorted(SURNAME_SET))
+
+
+_ATTESTED_SURNAMES_CACHE: Optional[set] = None
+
+
+def _get_attested_surnames() -> set:
+    """D16 精确全名表实证姓氏首字集合（393 字）。
+
+    【为什么昵称/单字姓通道要用「实证姓」而不是姓氏池】
+    姓氏池（415 字）是**字面候选集**，含大量只作姓氏、不作人名首字的字
+    （如"经"——"老经理"里的"老经"会被昵称通道误匹配）。
+    D16 全名表（7398 条）的首字是**真实出现过的人名首字**，
+    用它做昵称/单字姓通道的准入，可从源头砍掉这类伪姓氏。
+    """
+    global _ATTESTED_SURNAMES_CACHE
+    if _ATTESTED_SURNAMES_CACHE is not None:
+        return _ATTESTED_SURNAMES_CACHE
+    try:
+        names = _load_config().get("full_name_list") or []
+        attested = set(n[0] for n in names
+                       if isinstance(n, str) and len(n) >= 2)
+    except Exception:
+        attested = set()
+    _ATTESTED_SURNAMES_CACHE = attested or set(SURNAME_SET)
+    return _ATTESTED_SURNAMES_CACHE
+
+
+def _get_title_suffix_re() -> Optional[re.Pattern]:
+    """「姓 + 职务后缀」正则。"""
+    global _TITLE_SUFFIX_RE_CACHE
+    if _TITLE_SUFFIX_RE_CACHE is not None:
+        return _TITLE_SUFFIX_RE_CACHE
+    tc = _get_title_name_cfg()
+    if not tc["enable"] or not tc["suffixes"]:
+        _TITLE_SUFFIX_RE_CACHE = None
+        return None
+    alt = "|".join(re.escape(s) for s in tc["suffixes"])
+    _TITLE_SUFFIX_RE_CACHE = re.compile(
+        rf"([{_title_surname_class()}])(?:{alt})"
+    )
+    return _TITLE_SUFFIX_RE_CACHE
+
+
+def _get_title_nick_re() -> Optional[re.Pattern]:
+    """「昵称前缀 + 姓」正则。"""
+    global _TITLE_NICK_RE_CACHE
+    if _TITLE_NICK_RE_CACHE is not None:
+        return _TITLE_NICK_RE_CACHE
+    tc = _get_title_name_cfg()
+    if not tc["enable"] or not tc["nickname_prefixes"]:
+        _TITLE_NICK_RE_CACHE = None
+        return None
+    alt = "|".join(re.escape(p) for p in tc["nickname_prefixes"])
+    attested = "".join(sorted(_get_attested_surnames()))
+    _TITLE_NICK_RE_CACHE = re.compile(
+        rf"(?:{alt})([{attested}])"
+    )
+    return _TITLE_NICK_RE_CACHE
+
+
+def _get_title_single_re() -> Optional[re.Pattern]:
+    """「动词 + 单字姓 + 职责动词」正则（#52 §3.2）。"""
+    global _TITLE_SINGLE_RE_CACHE
+    if _TITLE_SINGLE_RE_CACHE is not None:
+        return _TITLE_SINGLE_RE_CACHE
+    tc = _get_title_name_cfg()
+    if not tc["enable"] or not tc["role_verbs_near"]:
+        _TITLE_SINGLE_RE_CACHE = None
+        return None
+    verbs = "|".join(re.escape(v) for v in tc["role_verbs_near"])
+    lefts = "|".join(re.escape(v) for v in tc["left_anchor_words"]) or r"由请派"
+    attested = "".join(sorted(_get_attested_surnames()))
+    _TITLE_SINGLE_RE_CACHE = re.compile(
+        rf"(?:{lefts})([{attested}])(?=(?:{verbs}))"
+    )
+    return _TITLE_SINGLE_RE_CACHE
+
+
+def _title_span_blocked(line: str, start: int, end: int) -> bool:
+    """职务形态片段是否被业务词覆盖（按包含语义豁免）。
+
+    两类覆盖源：
+      ① 整词保护表 / 排除词表（EXCLUDED_COMMON_WORDS + common_word_guards）
+         —— 只在「保护词**完整覆盖**命中片段」时豁免（span ⊆ phrase）。
+         反向（phrase ⊆ span）**不适用**：保护表里就有"主任/经理/组长"
+         这些独立职务词，若反向豁免会把"刘主任/张经理"整体放过，
+         恰好违背 #52 §3.1「保护不得覆盖姓 + 职务后缀组合形态」的要求。
+      ② 职务形态专属 skip_phrases（config）—— 显式配置的"姓 + 后缀"业务词
+         （施工/加工/支行长…），双向包含即豁免。
+    """
+    tc = _get_title_name_cfg()
+    span = line[start:end]
+    if not span:
+        return True
+    # ① 保护表 / 排除词表：命中片段**本身就是**受保护词 → 豁免
+    #    （独立出现的职务词，如"经理"/"组长"，不属称谓形态）
+    if span in EXCLUDED_COMMON_WORDS or span in _get_common_word_guards():
+        return True
+    # ① 保护表 / 排除词表：span ⊆ phrase → 豁免
+    for w in EXCLUDED_COMMON_WORDS:
+        if len(w) > len(span) and span in w:
+            return True
+    for w in _get_common_word_guards():
+        if len(w) > len(span) and span in w:
+            return True
+    # ② skip_phrases：双向包含即豁免
+    for p in tc["skip_phrases"]:
+        if p == span or (len(p) >= 2 and p in span):
+            return True
+    return False
+
+
+def _title_left_anchor(line: str, start: int) -> bool:
+    """左侧锚点：组织/小组后缀字符，或请求/指派类动词。"""
+    tc = _get_title_name_cfg()
+    if start > 0 and line[start - 1] in tc["org_anchor_chars"]:
+        return True
+    prefix = line[:start]
+    for w in tc["left_anchor_words"]:
+        if prefix.endswith(w):
+            return True
+    return False
+
+
+def _title_right_anchor(line: str, end: int) -> bool:
+    """右侧锚点：紧邻职责动词（near）或窗口内到会类动词（far）。"""
+    tc = _get_title_name_cfg()
+    tail = line[end:]
+    for v in tc["role_verbs_near"]:
+        if tail.startswith(v):
+            return True
+    window = line[end:end + 8]
+    for v in tc["role_verbs_far"]:
+        idx = window.find(v)
+        if idx != -1 and idx <= 6:
+            return True
+    return False
+
+
+def _apply_title_name_pass(text: str, counts: Dict[str, int]) -> str:
+    """职务与称谓式人名识别通道（Issue #52）。
+
+    仅在角色锚点附近生效（#52 §3.4 区域化口径），三类形态：
+      ① 姓 + 职务后缀   ② 昵称形态   ③ 单字姓 + 动词边界
+    """
+    tc = _get_title_name_cfg()
+    if not tc["enable"] or not text or not isinstance(text, str):
+        return text
+    suffix_re = _get_title_suffix_re()
+    nick_re = _get_title_nick_re()
+    single_re = _get_title_single_re()
+    if not suffix_re and not nick_re and not single_re:
+        return text
+    skip_texts = _get_skip_texts()
+
+    out_lines = []
+    for line in text.split("\n"):
+        hits: List[Tuple[int, int]] = []
+
+        # ① 姓 + 职务后缀
+        if suffix_re:
+            for m in suffix_re.finditer(line):
+                s, e = m.start(), m.end()
+                if line[s] in tc["title_modifier_chars"]:
+                    continue
+                if _title_span_blocked(line, s, e):
+                    continue
+                if line[s:e] in skip_texts:
+                    continue
+                if not (_title_left_anchor(line, s) or _title_right_anchor(line, e)):
+                    continue
+                hits.append((s, e))
+
+        # ② 昵称形态（小X / 老X）
+        if nick_re:
+            for m in nick_re.finditer(line):
+                s, e = m.start(), m.end()
+                if line[m.start(1)] in tc["nickname_block_followers"]:
+                    continue
+                if e < len(line) and line[e] in tc["nickname_block_followers"]:
+                    continue
+                if _title_span_blocked(line, s, e):
+                    continue
+                if line[s:e] in skip_texts:
+                    continue
+                if not (_title_left_anchor(line, s) or _title_right_anchor(line, e)):
+                    continue
+                hits.append((s, e))
+
+        # ③ 单字姓 + 动词边界（会议由刘主持）
+        if single_re:
+            for m in single_re.finditer(line):
+                s, e = m.start(1), m.end(1)
+                if line[s] in tc["single_char_exclusions"]:
+                    continue
+                if _title_span_blocked(line, s, e):
+                    continue
+                if line[s:e] in skip_texts:
+                    continue
+                hits.append((s, e))
+
+        if not hits:
+            out_lines.append(line)
+            continue
+        # 去重叠（优先保留靠前 / 靠长的命中）
+        hits.sort(key=lambda x: (x[0], -(x[1] - x[0])))
+        merged: List[Tuple[int, int]] = []
+        last_end = -1
+        for s, e in hits:
+            if s >= last_end:
+                merged.append((s, e))
+                last_end = e
+        # 从后往前替换，避免位移
+        new_line = line
+        for s, e in reversed(merged):
+            counts["姓名"] = counts.get("姓名", 0) + 1
+            new_line = new_line[:s] + "XXX" + new_line[e:]
+        out_lines.append(new_line)
+    return "\n".join(out_lines)
+
+
+# ---------------------------------------------------------------------------
+# Issue #54 D1：命中通道分类（供灰区候选清单标注"命中通道"）
+# ---------------------------------------------------------------------------
+
+# 通道标签口径（与规则链一一对应，便于灰区裁决时定位责任通道）
+CHANNEL_TITLE = "职务称谓"          # Issue #52 姓 + 职务后缀
+CHANNEL_NICKNAME = "昵称形态"       # Issue #52 小X / 老X
+CHANNEL_SINGLE = "单字姓锚点"       # Issue #52 会议由刘主持
+CHANNEL_ROLE = "角色槽位"           # _ROLE_NAME_RE 角色前缀 + 姓名
+CHANNEL_NAME = "姓名规则"           # 通用姓名通道
+CHANNEL_ADDRESS = "地址通道"
+CHANNEL_DATE = "日期规则"
+CHANNEL_ENGLISH = "英文名"
+CHANNEL_LLM = "LLM"
+CHANNEL_REGEX = "正则兜底"
+CHANNEL_UNKNOWN = "未知"
+
+
+def classify_hit_channel(text: str, start: int, end: int,
+                          source: str = "") -> str:
+    """判定一个命中片段来自哪条规则通道（Issue #54 D1 候选清单字段）。
+
+    参数：
+      text   —— 命中所在的完整文本
+      start/end —— 命中片段的字符区间 [start, end)
+      source —— 实体来源标记（regex / llm / role_word）
+
+    返回：通道标签（如"职务称谓"/"角色槽位"/"姓名规则"）。
+    判定顺序：按**特异性从高到低**——先看是否命中形态最明确的通道
+    （职务称谓 / 昵称 / 单字姓锚点），再看角色槽位，最后回落到来源标记。
+    """
+    if not text or start is None or end is None or not (0 <= start < end <= len(text)):
+        return CHANNEL_UNKNOWN
+    span = text[start:end]
+    if not span:
+        return CHANNEL_UNKNOWN
+
+    tc = _get_title_name_cfg()
+    suffix_re = _get_title_suffix_re()
+    if suffix_re and suffix_re.fullmatch(span):
+        return CHANNEL_TITLE
+    nick_re = _get_title_nick_re()
+    if nick_re and nick_re.fullmatch(span):
+        return CHANNEL_NICKNAME
+    single_re = _get_title_single_re()
+    if single_re and len(span) == 1:
+        m = single_re.search(text, max(0, start - 4), min(len(text), end + 12))
+        if m and m.start(1) == start and m.end(1) == end:
+            return CHANNEL_SINGLE
+    if _ROLE_NAME_RE.fullmatch(span) or _ROLE_NAME_RE.search(span):
+        return CHANNEL_ROLE
+    if source == "role_word":
+        return CHANNEL_ROLE
+    if source == "llm":
+        return CHANNEL_LLM
+    if source == "regex":
+        return CHANNEL_REGEX
+    # 日期 / 地址 / 英文的粗判（仅用于通道标注，不参与脱敏决策）
+    if re.match(r"^\d{4}[-/年]", span):
+        return CHANNEL_DATE
+    if span and span[-1] in "市县区镇乡村街路巷弄号楼室":
+        return CHANNEL_ADDRESS
+    if re.match(r"^[A-Z][a-z]{2,}$", span):
+        return CHANNEL_ENGLISH
+    if tc["enable"]:
+        return CHANNEL_NAME
+    return CHANNEL_NAME
+
+
+def find_entity_span(text: str, snippet: str, offset: int = 0) -> Tuple[Optional[int], Optional[int]]:
+    """在文本中定位实体的字符区间（Issue #54 D1 候选清单 span 字段）。
+
+    从 `offset` 起向后查找首个完整出现的位置；找不到返回 (None, None)。
+    """
+    if not text or not snippet:
+        return (None, None)
+    idx = text.find(snippet, offset)
+    if idx < 0:
+        return (None, None)
+    return (idx, idx + len(snippet))
+
+
+# ---------------------------------------------------------------------------
 # N-B 层（Issue #16 REQ-NAME-001）：段落角色锚点扩散
 #
 # 触发条件：段落含角色关键词 + 冒号（`：/：/： `）
@@ -3557,6 +3935,13 @@ def _name_guard_sub_counted(pattern: re.Pattern, text: str, replacement: str,
     def _repl(m: re.Match) -> str:
         if locked_spans and _is_in_locked_span(locked_spans, m.start(), m.end()):
             return m.group(0)
+        # 姓名形态须**全为汉字**（Issue #49 M9 遗留约束 / Issue #54 幂等性）。
+        # 命中片段含 ASCII 字母 → 说明规则把**占位符**（XXX / YYYY）当成
+        # 名字用字吞掉了（"演XXX和XXX线" → "演XXXXXX线"），
+        # 这既会误伤已脱敏文本，也是二次脱敏不幂等的根因。
+        # 英文人名由独立的英文通道处理，不走本通道。
+        if re.search(r"[A-Za-z]", m.group(0)):
+            return m.group(0)
         if _is_protected_by_common_word(m.string, m.start(), m.end()):
             return m.group(0)
         # R-㊷：业务词保护守卫（G1 跨界 / G2 整体 / G3 指示词）
@@ -3604,6 +3989,11 @@ def apply_redactions_counted(text: str) -> Tuple[str, Dict[str, int]]:
     # 第二阶段：回溯式地址脱敏通道（省/市/县/区/街道/路/楼盘/大厦/支行/门牌）
     # 必须在姓名规则之前执行，防止"金水/花园"等地址成分被姓名规则误吞
     result = _apply_address_pass(result, stats=counts)
+
+    # 第三阶段（0）：职务与称谓式人名通道（Issue #52）
+    # 须在通用姓名规则**之前**执行——"李工/陈总/张经理"等组合形态若先被
+    # 通用姓名规则切开，会同时产生漏脱与误伤（#52 §一 案例 #20）。
+    result = _apply_title_name_pass(result, counts)
 
     # 第三阶段：姓名规则（R1：带常用词覆盖保护，"说明书→说XXX"类误伤在应用层过滤）
     _name_repl = get_replacement("NAME", "XXX")
@@ -3671,6 +4061,17 @@ def apply_redactions_counted(text: str) -> Tuple[str, Dict[str, int]]:
         _idx = result.find('XX', _pos)
         if _idx < 0:
             break
+        # 【幂等性守卫（Issue #54）】XX 若属于更长的占位符连写（XXX / XXXX），
+        #   说明它**本身就是已脱敏姓名**的占位符，而不是地址通道截断姓名后
+        #   留下的两字占位符——此时不得再合并，否则二次脱敏会把
+        #   "地XXX和XXX持" 合并成 "地XXXXXX持"（越脱越少，且不可逆）。
+        _in_long_placeholder = (
+            (_idx > 0 and result[_idx - 1] == 'X')
+            or (_idx + 2 < len(result) and result[_idx + 2] == 'X')
+        )
+        if _in_long_placeholder:
+            _pos = _idx + 2
+            continue
         # 检查 XX 前一个字符是否是姓氏
         if _idx > 0:
             _ch_before = result[_idx - 1]

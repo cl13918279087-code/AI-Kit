@@ -37,6 +37,7 @@ for p in (SCRIPTS, TESTS):
 
 import common_rules  # noqa: E402
 from test_name_false_positive import FALSE_POSITIVE_CORPUS  # noqa: E402
+import bench_metrics  # noqa: E402  （Issue #54：门禁与质检指标同源）
 
 BENCH = os.path.join(REPO, "tests", "benchmark")
 DOCS_PATH = os.path.join(BENCH, "docs.json")
@@ -44,12 +45,15 @@ GOLD_PATH = os.path.join(BENCH, "gold_names.json")
 BIZ_CORPUS_PATH = os.path.join(BENCH, "biz_corpus.json")
 
 # ---- 门禁阈值（改动本实现时应同步复核这些数字）----
+# 阈值**统一取自 scripts/bench_metrics.py**——Issue #54 §三 验收标准第 4 条
+# 要求「quality_validator.py 输出的指标 JSON 与门禁口径一致」，
+# 单一常量源是防止两边口径漂移的最小代价做法。
 # 真名金标保留率下限：低于此值说明整改过度收紧、真名漏脱
-MIN_GOLD_RECALL = 0.85
+MIN_GOLD_RECALL = bench_metrics.MIN_GOLD_RECALL
 # 通用业务语料误伤上限：高于此值说明规则扩张引入了业务词误伤
-MAX_BIZ_MISFIRE = 12
+MAX_BIZ_MISFIRE = bench_metrics.MAX_BIZ_MISFIRE
 # 真实业务语料误伤上限：Issue #51 整改后应达 0
-MAX_REAL_BIZ_MISFIRE = 0
+MAX_REAL_BIZ_MISFIRE = bench_metrics.MAX_REAL_BIZ_MISFIRE
 
 # ---- 真实业务语料「设计意图」豁免口径 ----
 #
@@ -196,3 +200,16 @@ def test_real_biz_corpus_zero_misfire():
         f"真实业务语料误伤 {len(misfires)} 处，超过上限 {MAX_REAL_BIZ_MISFIRE}；"
         f"样例：{misfires[:15]}"
     )
+
+
+def test_bench_metrics_gates_pass():
+    """Issue #54 §2.2 全量门禁（精度/召回/歧义/确定性/幂等性）必须全绿。
+
+    本用例直接调用 `scripts/bench_metrics.py`——CI 门禁与
+    `scripts/quality_validator.py --json` 共用同一套指标与阈值，
+    两边不可能出现口径漂移（Issue #54 §三 验收标准第 4 条）。
+    """
+    metrics = bench_metrics.compute_metrics(REPO)
+    failed = {k: v for k, v in metrics["gates"].items() if not v}
+    assert not failed, f"Issue #54 门禁未通过：{failed}"
+    assert metrics["passed"], metrics["gates"]

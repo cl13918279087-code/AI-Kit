@@ -1374,7 +1374,12 @@ def _redact_ole_zip_inplace(ole_file: Path, pkg_data: bytes) -> None:
 
 
 def _repack_docx(tmp_dir: Path, output_path: str) -> None:
-    """将解压后的目录重新打包为 .docx"""
+    """将解压后的目录重新打包为 .docx
+
+    原子替换（os.replace）失败时降级为「直接复制内容」：某些受限环境
+    （只读挂载 / 安全策略拦截 unlink 或跨设备 rename）会拒绝原子替换，
+    但内容本身已打包完毕，不应因此丢失整个脱敏产物。
+    """
     work_path = output_path + ".tmp"
     try:
         with zipfile.ZipFile(work_path, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -1382,12 +1387,23 @@ def _repack_docx(tmp_dir: Path, output_path: str) -> None:
                 if fp.is_file():
                     arcname = str(fp.relative_to(tmp_dir))
                     zf.write(fp, arcname)
-        # 原子替换（避免读到不完整文件）
-        os.replace(work_path, output_path)
     except Exception:
         if Path(work_path).exists():
-            Path(work_path).unlink()
+            try:
+                Path(work_path).unlink()
+            except Exception:
+                pass
         raise
+    # 原子替换（避免读到不完整文件）
+    try:
+        os.replace(work_path, output_path)
+    except Exception:
+        # 降级：直接复制内容（不依赖删除/重命名原语）
+        shutil.copyfile(work_path, output_path)
+        try:
+            Path(work_path).unlink()
+        except Exception:
+            pass
 
 
 def _merge_counts(base: dict, new: dict) -> None:

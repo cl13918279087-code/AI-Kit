@@ -36,3 +36,7 @@ output/
 工作目录/
 共建项目/
 !工作目录/*.md
+
+# Sandbox probe residue (environment-generated, not project files)
+/[0-9a-z_][0-9a-z_][0-9a-z_][0-9a-z_][0-9a-z_][0-9a-z_][0-9a-z_][0-9a-z_]
+wtest_probe.txt

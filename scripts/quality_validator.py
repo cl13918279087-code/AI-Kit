@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import sys
 from typing import Optional, Dict, Any, List
 from dataclasses import dataclass, field
 
@@ -326,3 +328,54 @@ def build_quality_validator(config_path: Optional[str] = None) -> QualityValidat
     except Exception as e:
         logger.warning("QualityValidator 初始化失败，降级为纯规则验证: %s", e)
         return QualityValidator(None)
+
+
+# ---------------------------------------------------------------------------
+# Issue #54 §三 验收标准第 4 条：输出机器可读的门禁指标 JSON
+#
+# 【口径一致性】指标全部由 `scripts/bench_metrics.py` 计算——它同时也是
+#   CI 门禁（tests/benchmark/test_benchmark_gate.py）的计算入口，
+#   因此「质检报告」与「CI 门禁」不可能出现口径漂移。
+# ---------------------------------------------------------------------------
+
+def compute_bench_metrics(repo_root: Optional[str] = None) -> Dict[str, Any]:
+    """计算 Issue #54 门禁指标（与 CI 门禁同源同口径）。"""
+    try:
+        import bench_metrics
+    except ImportError:
+        import importlib.util
+        _here = os.path.dirname(os.path.abspath(__file__))
+        spec = importlib.util.spec_from_file_location(
+            "bench_metrics", os.path.join(_here, "bench_metrics.py"))
+        bench_metrics = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(bench_metrics)
+    return bench_metrics.compute_metrics(repo_root)
+
+
+def _main(argv: Optional[List[str]] = None) -> int:
+    """CLI：输出质量指标 JSON（Issue #54 验收标准第 4 条）。"""
+    import argparse
+
+    ap = argparse.ArgumentParser(
+        description="脱敏质量验证器（输出门禁指标 JSON）")
+    ap.add_argument("--json", action="store_true",
+                    help="输出机器可读 JSON（默认输出人类可读报告）")
+    ap.add_argument("--root", default=None, help="仓库根目录")
+    args = ap.parse_args(argv)
+
+    metrics = compute_bench_metrics(args.root)
+    if args.json:
+        print(json.dumps(metrics, ensure_ascii=False, indent=2))
+    else:
+        try:
+            import bench_metrics
+            print(bench_metrics.render_report(metrics))
+        except Exception:
+            print(json.dumps(metrics, ensure_ascii=False, indent=2))
+    return 0 if metrics.get("passed") else 1
+
+
+if __name__ == "__main__":
+    import os
+    import sys
+    sys.exit(_main())

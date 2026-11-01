@@ -73,8 +73,12 @@ def test_docx_output_actually_redacted(docx_file):
         assert "李强" not in joined, f"真名未脱敏：{texts}"
         assert "张三" not in joined, f"真名未脱敏：{texts}"
         assert "13800138000" not in joined, f"手机号未脱敏：{texts}"
-        # 业务短语不得被误伤（#51 零误伤口径）
-        assert "需求组张经理汇报进展" in joined, f"业务短语被误伤：{texts}"
+        # 业务短语不得被误伤（#51 零误伤口径）：
+        #   纯业务短语保持原文；「需求组张经理汇报进展」按 #52 §3.2 口径
+        #   （姓 + 职务后缀 = 称谓形态人名）脱敏为「需求组XXX汇报进展」，
+        #   这是上游 #51 §4.1 明确要求的回归用例。
+        assert "需求组XXX汇报进展" in joined, f"称谓形态未脱敏：{texts}"
+        assert "张经理" not in joined, f"称谓形态未脱敏：{texts}"
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

@@ -79,6 +79,10 @@ class RedactionManifest:
         self.image_items: List[ImageSensitiveItem] = []
         self.unresolved: List[UnresolvedItem] = []
         self.rejected: List[RejectedItem] = []
+        # Issue #54 D1：裁决记录随 manifest.json 归档（合规留痕）
+        # 每条形如 {"text": ..., "decision": "skip|redact", "reason": ...,
+        #           "confidence": ..., "category": ..., "source": ..., "channel": ...}
+        self.decisions: List[Dict[str, Any]] = []
         self.stats: Dict[str, int] = {}
         self.total_characters = 0
         self.redacted_characters = 0
@@ -96,6 +100,18 @@ class RedactionManifest:
 
     def add_rejected(self, item: RejectedItem) -> None:
         self.rejected.append(item)
+
+    def add_decision(self, decision: Dict[str, Any]) -> None:
+        """登记一条裁决记录（Issue #54 D1）。
+
+        裁决记录用于合规留痕：谁（自动/Agent）、对哪个实体、判了什么。
+        """
+        self.decisions.append(dict(decision))
+
+    def add_decisions(self, decisions) -> None:
+        for d in decisions or []:
+            if isinstance(d, dict):
+                self.add_decision(d)
 
     def set_stats(self, **kwargs) -> None:
         self.stats.update(kwargs)
@@ -121,6 +137,7 @@ class RedactionManifest:
             "image_items": [asdict(i) for i in self.image_items],
             "unresolved": [asdict(u) for u in self.unresolved],
             "rejected": [asdict(r) for r in self.rejected],
+            "decisions": list(self.decisions),
             "stats": self.stats,
             "total_characters": self.total_characters,
             "redacted_characters": self.redacted_characters,
@@ -199,6 +216,21 @@ class RedactionManifest:
             ])
             for r in self.rejected:
                 lines.append(f"- ~~`{r.text[:20]}`~~ — {r.reject_reason}")
+            lines.append("")
+
+        if self.decisions:
+            lines.extend([
+                f"## ⚖️ 裁决记录",
+                f"",
+                f"| 实体 | 裁决 | 置信度 | 通道 | 来源 |",
+                f"|------|------|--------|------|------|",
+            ])
+            for d in self.decisions:
+                lines.append(
+                    f"| `{d.get('text', '')}` | {d.get('decision', '')} "
+                    f"| {d.get('confidence', '-')} | {d.get('channel', '-')} "
+                    f"| {d.get('source', '-')} |"
+                )
             lines.append("")
 
         lines.extend([
