@@ -1166,6 +1166,110 @@ def _get_biz_words_by_first() -> Dict[str, set]:
     return _BIZ_WORDS_BY_FIRST
 
 
+_STANDALONE_EXEMPT_WORDS: Optional[set] = None
+_STANDALONE_NAME_CANDIDATES: Optional[set] = None
+
+
+def _get_standalone_exempt_words() -> set:
+    """取「通用词豁免表」（config.json → standalone_exempt_words），带缓存。
+
+    【为什么需要这张表（Issue #49 第三轮复评处置口径）】
+    通用词「叶子」被姓名规则命中（叶 ∈ 姓池 + 子 ∈ 名字位），但**不能**
+    直接放进整词保护表 `common_word_guards`——那会让「叶子涵」也一并豁免，
+    而复评裁决是「叶子」不做姓名脱敏、「叶子涵」作为姓名**必须**脱敏。
+    故这里引入**真名优先**语义：豁免词默认不脱敏，只有当该命中片段落在
+    某个**已知全名**（D16 真名库 / 注入名）之内时才照常脱敏。
+        「叶子」        → 非任何已知全名的一部分 → 豁免
+        「叶子涵」      → 命中片段落在全名「叶子涵」内 → 不豁免 → 整体脱敏
+        「采购的叶子」  → 非任何已知全名的一部分 → 豁免
+    """
+    global _STANDALONE_EXEMPT_WORDS
+    if _STANDALONE_EXEMPT_WORDS is None:
+        cfg = _load_config()
+        _STANDALONE_EXEMPT_WORDS = {
+            w for w in (cfg.get("standalone_exempt_words") or [])
+            if isinstance(w, str) and w
+        }
+    return _STANDALONE_EXEMPT_WORDS
+
+
+def _get_standalone_name_candidates() -> set:
+    """取「以豁免词开头」的已知全名候选集（真名优先判定用），带缓存。
+
+    只有「叶子涵」这类**确认为姓名**、且**包含**豁免词的全名才会进入本集，
+    因此集合很小（当前仅 1 条），判定开销可忽略。
+    """
+    global _STANDALONE_NAME_CANDIDATES
+    if _STANDALONE_NAME_CANDIDATES is None:
+        words = _get_standalone_exempt_words()
+        cfg = _load_config()
+        names = {n for n in (cfg.get("full_name_list") or []) if isinstance(n, str)}
+        _STANDALONE_NAME_CANDIDATES = {
+            n for n in names if any(n.startswith(w) for w in words)
+        }
+    return _STANDALONE_NAME_CANDIDATES
+
+
+def _span_covered_by_known_name(text: str, start: int, end: int) -> bool:
+    """命中片段是否落在某个已知全名（D16 真名库 / 注入名）的出现区间内。
+
+    与 G4-0「真名优先」同源思路：豁免词不得让已知真名漏脱。
+    """
+    candidates = _get_standalone_name_candidates()
+    if not candidates:
+        return False
+    pad = max(len(n) for n in candidates)
+    lo = max(0, start - pad)
+    hi = min(len(text), end + pad)
+    for name in candidates:
+        idx = text.find(name, lo)
+        while idx >= 0 and idx < hi:
+            if idx < end and start < idx + len(name):
+                return True
+            idx = text.find(name, idx + 1)
+    for name in _EXTRA_NAMES:
+        if not name:
+            continue
+        lo2 = max(0, start - len(name))
+        hi2 = min(len(text), end + len(name))
+        idx = text.find(name, lo2)
+        while idx >= 0 and idx < hi2:
+            if idx < end and start < idx + len(name):
+                return True
+            idx = text.find(name, idx + 1)
+    return False
+
+
+def _is_protected_by_standalone_exempt(text: str, start: int, end: int) -> bool:
+    """通用词豁免（Issue #49 复评处置口径，真名优先）。
+
+    判定：命中片段与任一通用词豁免项在原文中的出现区间**相交**，
+    且该通用词的出现区间**不被**任何已知全名覆盖 → 保留原文。
+
+        「叶子」          → 与豁免词「叶子」相交，且无全名覆盖 → 豁免
+        「叶子涵」        → 豁免词区间被全名「叶子涵」覆盖 → 不豁免 → 整体脱敏
+        「小叶子」        → 昵称形态命中「小叶」，与「叶子」相交 → 豁免
+        「采购的叶子」    → 与「叶子」相交，无全名覆盖 → 豁免
+
+    【为什么用相交而不是"整词等于"】
+    昵称形态（小X/老X）命中的是「小叶」而非「叶子」，若按整词判定会漏过；
+    相交语义可同时覆盖「叶子」「小叶子」「老叶子」，而「叶子涵」由**真名优先**
+    规则挡下（豁免词区间被全名覆盖即不豁免）。
+    """
+    words = _get_standalone_exempt_words()
+    if not words:
+        return False
+    for w in words:
+        idx = text.find(w)
+        while idx >= 0:
+            ws, we = idx, idx + len(w)
+            if ws < end and start < we:          # 命中片段与豁免词区间相交
+                if not _span_covered_by_known_name(text, ws, we):
+                    return True
+            idx = text.find(w, idx + 1)
+    return False
+
+
 def _is_protected_by_biz_word(text: str, start: int, end: int,
                               biz_spans: Optional[List[Tuple[int, int]]] = None) -> bool:
     """判断姓名命中片段 text[start:end] 是否属于业务词误伤。
@@ -3533,6 +3637,10 @@ def _apply_title_name_pass(text: str, counts: Dict[str, int]) -> str:
                     continue
                 if _title_span_blocked(line, s, e):
                     continue
+                # 通用词豁免（Issue #49 复评处置口径，真名优先）：「刘主任」等
+                # 称谓形态若落在通用词（如「叶子」）之内 → 豁免。
+                if _is_protected_by_standalone_exempt(line, s, e):
+                    continue
                 if line[s:e] in skip_texts:
                     continue
                 if not (_title_left_anchor(line, s) or _title_right_anchor(line, e)):
@@ -3549,6 +3657,9 @@ def _apply_title_name_pass(text: str, counts: Dict[str, int]) -> str:
                     continue
                 if _title_span_blocked(line, s, e):
                     continue
+                # 通用词豁免：「小叶子」「老叶子」等昵称形态不脱敏
+                if _is_protected_by_standalone_exempt(line, s, e):
+                    continue
                 if line[s:e] in skip_texts:
                     continue
                 if not (_title_left_anchor(line, s) or _title_right_anchor(line, e)):
@@ -3562,6 +3673,8 @@ def _apply_title_name_pass(text: str, counts: Dict[str, int]) -> str:
                 if line[s] in tc["single_char_exclusions"]:
                     continue
                 if _title_span_blocked(line, s, e):
+                    continue
+                if _is_protected_by_standalone_exempt(line, s, e):
                     continue
                 if line[s:e] in skip_texts:
                     continue
@@ -3943,6 +4056,11 @@ def _name_guard_sub_counted(pattern: re.Pattern, text: str, replacement: str,
         if re.search(r"[A-Za-z]", m.group(0)):
             return m.group(0)
         if _is_protected_by_common_word(m.string, m.start(), m.end()):
+            return m.group(0)
+        # 独立成词豁免（Issue #49 复评处置口径：「叶子」独立成词不做姓名脱敏，
+        # 但「叶子涵」作为姓名仍须脱敏）——须排在整词保护表**之前**，
+        # 否则「叶子」若被加入整词保护表，「叶子涵」会被连带放过。
+        if _is_protected_by_standalone_exempt(m.string, m.start(), m.end()):
             return m.group(0)
         # R-㊷：业务词保护守卫（G1 跨界 / G2 整体 / G3 指示词）
         if _is_protected_by_biz_word(m.string, m.start(), m.end()):

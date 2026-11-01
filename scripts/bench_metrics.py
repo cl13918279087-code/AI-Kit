@@ -19,7 +19,8 @@ Issue #54 §2.2 要求 CI 门禁在「精确率 / 召回率 / 歧义正确率回
 | 指标 | 定义 | 门槛 |
 |---|---|---|
 | gold_recall      | 真名金标被脱敏比例（越高越好，防过度收紧） | ≥ 0.85 |
-| biz_misfire      | 通用业务语料（102 条）被误伤条数 | ≤ 12 |
+| biz_misfire      | 通用业务语料（102 条）被改动条数（全部类别） | ≤ 12（披露） |
+| biz_misfire_name_class | 通用语料中**姓名类**误伤条数（#49 关闭口径） | ≤ 5（≤5%） |
 | real_biz_misfire | 真实业务语料（1200 条）被误伤处数 | ≤ 0 |
 | ambiguity_acc    | 语义歧义集正确率 | ≥ 0.60（阶段一） |
 | precision        | 1 − 阴性语料误伤率（负样本保持原文的比例） | ≥ 0.95 |
@@ -48,7 +49,8 @@ import common_rules  # noqa: E402
 # 门禁阈值（与 tests/benchmark/test_benchmark_gate.py 同源）
 # ---------------------------------------------------------------------------
 MIN_GOLD_RECALL = 0.85          # 真名金标保留率下限
-MAX_BIZ_MISFIRE = 12            # 通用业务语料误伤上限
+MAX_BIZ_MISFIRE = 12            # 通用业务语料改动条数上限（全类别，披露用）
+MAX_BIZ_MISFIRE_NAME_CLASS = 5  # 通用业务语料「姓名类」误伤上限（#49 ≤5% 关闭口径）
 MAX_REAL_BIZ_MISFIRE = 0        # 真实业务语料误伤上限（#51 起为 0）
 MIN_AMBIG_ACCURACY = 0.60       # 语义歧义集正确率（#54 §2.2 阶段一）
 MIN_PRECISION = 0.95            # 精确率下限（按阴性误伤率折算）
@@ -183,10 +185,31 @@ def _compute_metrics_uncached(root: Optional[str] = None,
                 leaked.append((doc, w))
     gold_recall = (kept / total) if total else 0.0
 
-    # ---- 通用业务语料误伤 ----
+    # ---- 通用业务语料误伤（按类别拆分）----
+    #
+    # 【#49 第三轮复评口径定稿：分母恒定，分子按类别拆分】
+    #  · **分母恒为 102**：绝不因「这条没脱敏好」把样本剔出分母——否则可以通过
+    #    删除样本把误伤率做成 0，指标失去意义（自证式达标）。
+    #  · **分子按类别拆分**：
+    #      - 姓名类误伤：姓名识别通道造成的错脱/过遮盖 → **#49 的关闭口径**
+    #        （≤5 条即 ≤5%），因为 #49 的诉求是「姓名池扩张误伤」。
+    #      - 非姓名类改动：机构名/银行名等**保护通道的设计意图**
+    #        （如「宁波银行→XX银行」，属 #53 机构名整体保护）→ 单列披露，
+    #        不计入姓名误伤率。
+    #  · 两个口径同时对外披露，任何一方都无法单方面"美化"。
     fp_corpus = _false_positive_corpus()
-    biz_misfire = [c for c in fp_corpus
-                   if common_rules.apply_redactions(c) != c]
+    biz_misfire: List[str] = []
+    biz_misfire_name: List[str] = []
+    biz_misfire_other: List[str] = []
+    for c in fp_corpus:
+        out, cnt = common_rules.apply_redactions_counted(c)
+        if out == c:
+            continue
+        biz_misfire.append(c)
+        if cnt.get("姓名"):
+            biz_misfire_name.append(c)
+        else:
+            biz_misfire_other.append(c)
 
     # ---- 真实业务语料误伤 ----
     real_misfires = []
@@ -261,6 +284,14 @@ def _compute_metrics_uncached(root: Optional[str] = None,
             "value": len(biz_misfire), "total": len(fp_corpus),
             "samples": biz_misfire[:10],
         },
+        "biz_misfire_name_class": {
+            "value": len(biz_misfire_name), "total": len(fp_corpus),
+            "samples": biz_misfire_name[:10],
+        },
+        "biz_misfire_other_class": {
+            "value": len(biz_misfire_other), "total": len(fp_corpus),
+            "samples": biz_misfire_other[:10],
+        },
         "real_biz_misfire": {
             "value": len(real_misfires), "total": len(biz_corpus),
             "samples": real_misfires[:10],
@@ -290,6 +321,7 @@ def evaluate_gates(metrics: Dict[str, Any]) -> Dict[str, bool]:
     return {
         "gold_recall": _v("gold_recall") >= MIN_GOLD_RECALL,
         "biz_misfire": _v("biz_misfire") <= MAX_BIZ_MISFIRE,
+        "biz_misfire_name_class": _v("biz_misfire_name_class") <= MAX_BIZ_MISFIRE_NAME_CLASS,
         "real_biz_misfire": _v("real_biz_misfire") <= MAX_REAL_BIZ_MISFIRE,
         "ambiguity_accuracy": _v("ambiguity") >= MIN_AMBIG_ACCURACY,
         "precision": _v("precision") >= MIN_PRECISION,
@@ -309,8 +341,12 @@ def render_report(metrics: Dict[str, Any]) -> str:
         f"({metrics['gold_recall']['kept']}/{metrics['gold_recall']['total']})",
         f"精确率 precision      : {metrics['precision']['value']:.1%}",
         f"F1                    : {metrics['f1']['value']:.1%}",
-        f"通用语料误伤          : {metrics['biz_misfire']['value']}/"
+        f"通用语料改动(全部)     : {metrics['biz_misfire']['value']}/"
         f"{metrics['biz_misfire']['total']}",
+        f"  ├ 姓名类(关闭口径)   : {metrics['biz_misfire_name_class']['value']}/"
+        f"{metrics['biz_misfire_name_class']['total']}",
+        f"  └ 非姓名类(设计意图) : {metrics['biz_misfire_other_class']['value']}/"
+        f"{metrics['biz_misfire_other_class']['total']}",
         f"真实语料误伤          : {metrics['real_biz_misfire']['value']}/"
         f"{metrics['real_biz_misfire']['total']}",
         f"歧义集正确率          : {metrics['ambiguity']['value']:.1%} "

@@ -52,6 +52,8 @@ BIZ_CORPUS_PATH = os.path.join(BENCH, "biz_corpus.json")
 MIN_GOLD_RECALL = bench_metrics.MIN_GOLD_RECALL
 # 通用业务语料误伤上限：高于此值说明规则扩张引入了业务词误伤
 MAX_BIZ_MISFIRE = bench_metrics.MAX_BIZ_MISFIRE
+# 通用业务语料「姓名类」误伤上限（Issue #49 关闭口径，≤5 条即 ≤5%）
+MAX_BIZ_MISFIRE_NAME_CLASS = bench_metrics.MAX_BIZ_MISFIRE_NAME_CLASS
 # 真实业务语料误伤上限：Issue #51 整改后应达 0
 MAX_REAL_BIZ_MISFIRE = bench_metrics.MAX_REAL_BIZ_MISFIRE
 
@@ -156,6 +158,25 @@ def test_no_business_word_misfire():
     assert len(mis) <= MAX_BIZ_MISFIRE, (
         f"通用业务语料误伤 {len(mis)}/{len(FALSE_POSITIVE_CORPUS)} 超过上限 {MAX_BIZ_MISFIRE}；"
         f"样例：{mis[:15]}"
+    )
+
+
+def test_no_name_class_misfire():
+    """通用业务语料**姓名类**误伤上限（Issue #49 关闭口径，≤5%）。
+
+    口径（#49 第三轮复评定稿）：
+      · 分母恒为 102 条通用语料，不随结果变动；
+      · 分子只计**姓名识别通道**造成的错脱/过遮盖；
+      · 机构名保护的设计意图（如「宁波银行→XX银行」）不算姓名误伤。
+    """
+    name_mis = []
+    for c in FALSE_POSITIVE_CORPUS:
+        out, counts = common_rules.apply_redactions_counted(c)
+        if out != c and counts.get("姓名"):
+            name_mis.append(c)
+    assert len(name_mis) <= MAX_BIZ_MISFIRE_NAME_CLASS, (
+        f"通用语料姓名类误伤 {len(name_mis)}/{len(FALSE_POSITIVE_CORPUS)} "
+        f"超过上限 {MAX_BIZ_MISFIRE_NAME_CLASS}；样例：{name_mis[:15]}"
     )
 
 
