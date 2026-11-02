@@ -18,7 +18,12 @@ test_nc_name_region.py - N-C 区域检测层回归测试（Issue #50）
      - 多行表头聚合（真表头不被数据行覆盖）
      - 非姓名列零误伤（业务词表格不被误吃）
 
-  3. 不退化守卫
+  3. §4.8 规则A 退出口径落档
+     - 规则A 开关状态、单姓笛卡尔积通道确已退出
+     - 拆出保留通道（复姓精确层 / R3b 职务后缀 / 上下文锚点）仍然生效
+     - 已知边界（孤立库外 2 字名）以 xfail 固化，避免静默回归
+
+  4. 不退化守卫
      - 通用语料不因 N-C 出现新增误伤
 
 运行方式：
@@ -32,6 +37,8 @@ import re
 import sys
 import tempfile
 import zipfile
+
+import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts"))
 
@@ -307,7 +314,91 @@ def test_word_table_non_name_column_no_fp():
 
 
 # ---------------------------------------------------------------------------
-# 3. 不退化守卫
+# 3. §4.8 规则A 退出口径落档
+# ---------------------------------------------------------------------------
+#
+# Issue #50 §4.8 规定的退出门槛：
+#   「只有当 N-C 区域 + D16 + L2 同构 的召回 ≥ 12/12，
+#     且 102 条通用语料误伤 ≤ 5% 时，才允许把规则A 从主链路移除」
+#
+# 本节把「规则A 已退出 / 哪些能力被保留 / 哪些形态被显式放弃」
+# 固化为可回归的断言，避免退出门槛被后续改动无声破坏。
+
+
+def _load_cfg():
+    import json
+    cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "..", "scripts", "config.json")
+    with open(cfg_path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def test_rule_a_switch_state():
+    """配置态：规则A 开关关闭、复姓精确层保留"""
+    cfg = _load_cfg()
+    assert cfg.get("rule_a_enabled") is False, (
+        "config.json 的 rule_a_enabled 应为 false（Issue #50 §4.8：规则A 退出主链路）")
+    assert cfg.get("compound_surname_enabled") is True, (
+        "S1b 复姓精确层应保留（实测 102/1200 语料零误伤，且是库外复姓人名的唯一捞回通道）")
+    assert cfg.get("name_rule_mode") == "graded", "姓名规则应保持 graded 分级模式"
+
+
+def test_rule_a_cartesian_channels_are_gone():
+    """规则A 家族的单姓笛卡尔积通道（R2 / R3）确已退出主链路"""
+    import common_rules as cr
+
+    common_rules_cache_reset = (cr._CONFIG_CACHE, cr._PATTERNS)
+    cr._CONFIG_CACHE = None
+    cr._PATTERNS = None
+    try:
+        # 孤立、无上下文、库外的 2 字名不再被全局笛卡尔积命中
+        for name in ("张明", "李雷", "王小红"):
+            assert cr.apply_redactions(name) == name, (
+                f"「{name}」属孤立无上下文库外 2 字名，规则A 退出后不应被全局覆盖"
+                "（这是 §4.8 显式接受的边界，若本断言失败说明规则A 被意外恢复）")
+    finally:
+        cr._CONFIG_CACHE, cr._PATTERNS = common_rules_cache_reset
+
+
+def test_retained_channels_still_cover():
+    """拆出保留的两条通道仍然生效：复姓精确层 + R3b 职务后缀通道"""
+    import common_rules as cr
+
+    # S1b 复姓精确层：库外复姓人名（「欧阳娜娜」「司马光」均不在 D16 库内）
+    for name in ("欧阳娜娜", "司马光"):
+        assert cr.apply_redactions(name) != name, f"复姓精确层应覆盖「{name}」"
+
+    # R3b：高危姓 + 单字名 + 右边界职务后缀（库外真名「樊霖」）
+    assert cr.apply_redactions("樊霖负责需求梳理") != "樊霖负责需求梳理", (
+        "R3b 职务后缀通道应覆盖「樊霖负责」形态")
+
+    # 上下文通道：同一姓名带锚点时仍可救回
+    assert "王明" not in cr.apply_redactions("联系人：王明"), (
+        "上下文锚点通道应覆盖「联系人：王明」")
+
+
+@pytest.mark.xfail(
+    strict=False,
+    reason=(
+        "Issue #50 §4.8 已落档的已知边界：规则A（单姓 × 名字池笛卡尔积）退出后，"
+        "「孤立 + 无上下文锚点 + 不在 D16 精确库」的 2 字名（如「王明」）"
+        "不再被主链路脱敏。恢复该覆盖需引入全局笛卡尔积，实测代价为"
+        "102 通用语料 8 条误伤 / 1200 真实语料 34 处误伤，超门禁；"
+        "带上下文的同一形态仍由 N-C 区域层与上下文通道覆盖。"
+        "详见 docs/Issue-050-姓名池使用策略-区域化检测方案.md §4.8。"
+    ),
+)
+def test_known_limitation_isolated_short_name():
+    """已知边界（xfail 固化）：孤立库外 2 字名当前不脱敏"""
+    import common_rules as cr
+
+    assert "王明" not in cr.apply_redactions("<a:t>王明</a:t>"), (
+        "孤立库外 2 字名「王明」当前不脱敏——若本用例转为 XPASS，"
+        "说明已找到不牺牲误伤指标的新证据通道，可解除 §4.8 的该条边界")
+
+
+# ---------------------------------------------------------------------------
+# 4. 不退化守卫
 # ---------------------------------------------------------------------------
 
 def test_no_regression_generic_corpus():
@@ -346,6 +437,10 @@ if __name__ == "__main__":
     test_word_table_header_row_adaptive()
     test_word_table_multi_row_header()
     test_word_table_non_name_column_no_fp()
+
+    test_rule_a_switch_state()
+    test_rule_a_cartesian_channels_are_gone()
+    test_retained_channels_still_cover()
 
     test_no_regression_generic_corpus()
 

@@ -561,6 +561,68 @@ def _get_name_rule_mode(cfg: Optional[Dict] = None) -> str:
         mode = "graded"
     return mode
 
+
+def _is_rule_a_enabled(cfg: Optional[Dict] = None) -> bool:
+    """规则A 主链路开关（Issue #50 §4.8 退出门槛落地）。
+
+    规则A = 「无上下文约束的**单姓** + 名字池笛卡尔积粗筛」通道族：
+      - R2 低危姓 + 名字位字频闸门
+      - R3 高危姓 + 名字位字频闸门
+      - R3b 高危姓 + 单字名 + 职务后缀
+
+    这些通道是**全局形态粗筛**，不看任何上下文：
+      - 优点：唯一能捞「D16 名单外人名」的机制（召回主力）；
+      - 缺点：笛卡尔积全局匹配 → 误伤无上界（实测扩池后 51.0%）。
+
+    Issue #50 §4.8 规定的退出门槛：
+        N-C 区域 + D16 + L2 同构 的召回 ≥ 12/13，
+        且 102 条通用语料误伤 ≤ 5%。
+
+    门槛达成后，规则A 从**主链路**退出（`rule_a_enabled: false`），
+    其召回职责由 N-C 区域层（T1 表格姓名列 / T2 正文名单段）承担：
+      - 区域内逐项判定用**形态证据**（`is_name_shaped`），不看字频闸门；
+      - 区域外一律不动（人做脱敏时也是先扫版面找名单区，区域外默认不动）。
+
+    开关语义：
+      - `true`（默认）：规则A 保留在主链路（现状行为，供回滚与对照）
+      - `false`：规则A 退出主链路，仅由 N-C 区域层 + D16 + 上下文通道承担召回
+
+    **保留回滚能力**：本开关只影响「规则A 是否进入主链路」，
+    不改动 D16 / S2 / S3 / N-C 任何通道的语义，
+    因此 `false → true` 可完整回滚到 #49 状态。
+
+    【与复姓精确层的关系】
+    Issue #50 §4.8 的规则A 定义写作「姓 + 名字池」，其中**复姓**分支
+    （欧阳/司马/上官… + 全池名字位）在本轮实施中被**拆出**为独立的
+    「S1b 复姓精确层」（见 `_is_compound_surname_enabled`），不再受本开关控制：
+      - 依据：双字姓是**闭集强信号**（47 个复姓），在现代汉语里几乎
+        不与常用词碰撞，实测在 102 条通用语料与 1200 条真实业务语料上
+        **零误伤**；而单姓通道的误伤（39/102 形态成立）全部来自
+        「单姓 + 名字池」的巨大笛卡尔积面；
+      - 收益：规则A 退出后仍能捞回名单外的复姓人名
+        （实测样本 `欧阳娜娜`、`司马光`），保证「漏脱是合规红线」不被牺牲；
+      - 该层**不依赖单姓池**，因此不属于规则A 的笛卡尔积误伤面。
+    """
+    if cfg is None:
+        cfg = _load_config()
+    return bool(cfg.get("rule_a_enabled", True))
+
+
+def _is_compound_surname_enabled(cfg: Optional[Dict] = None) -> bool:
+    """S1b 复姓精确层开关（Issue #50 §4.8 规则A 退出时拆出）。
+
+    保留此层的理由见 `_is_rule_a_enabled` 文档字符串末段：
+    复姓是闭集强信号，实测在 102 条通用语料 + 1200 条真实业务语料上零误伤，
+    且是规则A 退出后唯一仍能捞「D16 名单外复姓人名」的机制。
+
+    开关语义：
+      - `true`（默认）：复姓精确层进入主链路；
+      - `false`：完全关闭（仅用于对照实验）。
+    """
+    if cfg is None:
+        cfg = _load_config()
+    return bool(cfg.get("compound_surname_enabled", True))
+
 # ---------------------------------------------------------------------------
 # 排除词表（全局通用术语，不是敏感信息）
 # ---------------------------------------------------------------------------
@@ -2840,11 +2902,18 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
     if _name_rule_mode == "graded":
         _gated_name_class = _build_name_char_class(_hot_chars)
 
-    # 复姓优先：2字复姓 + 1~3个名字汉字（防止复姓第二字被单姓规则误匹配）
+    # S1b 复姓精确层：2字复姓 + 1~3个名字汉字（防止复姓第二字被单姓规则误匹配）
     # 复姓本身是强信号（双字姓氏在现代汉语里几乎不与常用词碰撞），
     # 故复姓通道使用**全池**名字位，不叠字频闸门。
+    #
+    # 【Issue #50 §4.8 规则A 退出门槛】本层已从规则A 家族拆出，
+    # 独立受 `compound_surname_enabled` 控制：
+    #   - 规则A（单姓笛卡尔积）退出后，本层是唯一仍能捞「名单外复姓人名」
+    #     的机制（实测捞回 `欧阳娜娜` / `司马光`）；
+    #   - 实测在 102 条通用语料 + 1200 条真实业务语料上**零误伤**。
+    _rule_a_enabled = _is_rule_a_enabled(cfg)
     compound_surnames = cfg.get("compound_surnames") or list(_NAME_GATE_COMPOUND_SURNAMES)
-    if compound_surnames:
+    if compound_surnames and _is_compound_surname_enabled(cfg):
         compound_alt = '|'.join(re.escape(s) for s in sorted(compound_surnames, key=len, reverse=True))
         patterns.append((
             re.compile(
@@ -2854,7 +2923,7 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
             rep.get("NAME", "XXX")
         ))
 
-    if _name_rule_mode == "graded":
+    if _name_rule_mode == "graded" and _rule_a_enabled:
         # S1 裸姓名：姓氏位闸门 + 名字位字频闸门（唯一无上下文约束的场景）
         #
         # 姓氏位闸门：只保留在 D16 全名库中确实作姓出现过的姓。
@@ -2892,24 +2961,24 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
                 ),
                 rep.get("NAME", "XXX")
             ))
-
-        # R3b：高危姓 + **单字名** + 「职位/职责后缀」右边界通道
+    elif _name_rule_mode == "graded":
+        # 【Issue #50 §4.8 规则A 退出】R2 / R3 已退出主链路，
+        # 但 **R3b 保留**——它不是笛卡尔积粗筛，而是**有右边界证据**的通道：
+        #   「高危姓 + 单字名」后面必须紧跟职位/职责类词
+        #   （负责/牵头/副组长/组长/主任/经理/主管/专员/工程师/负责人/…）。
+        # 「樊霖负责」「樊霖副组长」中，「负责/副组长」证明前面的两字是
+        # 「人名 + 职务」组合，而非一个双字常用词。
         #
-        # 【缺口】R3 要求高危姓的名字位 ≥2 字，导致「樊霖负责」「樊霖副组长」
-        #   这类「姓名 + 职位/动词后缀」的形态漏脱——名字后紧跟中文时，
-        #   贪婪量词回溯降级，S1 无法命中。
+        # 实测：通用语料 102 条 **0 命中**、真实业务语料 1200 条 **0 命中**；
+        # 能捞回规则A 退出后的库外真名（「樊霖」不在 D16 库中）。
         #
-        # 【为什么不能整体放宽高危姓的单字名】
-        #   实测「高危姓 + 单字热字名」在通用语料中命中 11 处
-        #   （宁波/方向/孔明/安庆/孟子/孔子/庄子/石家庄…）——放宽代价远大于收益。
-        #   且「樊霖」在 D16 库中不存在（姓+名对共现为 0），
-        #   无法用名单证据把它与「孔明」区分开。
-        #
-        # 【本通道的证据】**右边界**：名字后面紧跟职位/职责类词。
-        #   「樊霖负责」「樊霖副组长」中，「负责/副组长」证明前面的两字是
-        #   「人名 + 职务」的组合，而非一个双字常用词。
-        #   实测通用语料 102 条中该形态 **0 命中**（宁波银行等已被
-        #   银行/城市规则先行拦截），零误伤。
+        # 为什么不能整体放宽高危姓的单字名：全局放宽会命中 11 处
+        # （宁波/方向/孔明/安庆/孟子/孔子/庄子/石家庄…）——
+        # 收紧的**唯一依据就是右边界**，有右边界时误伤面为零。
+        _gated_surnames = _get_gated_surnames(cfg)
+        _high_risk = set(cfg.get("high_risk_surnames") or "")
+        _high_surnames = sorted(s for s in _gated_surnames if s in _high_risk)
+        _high_alt = '|'.join(re.escape(s) for s in _high_surnames)
         _role_suffixes = [
             '负责', '牵头', '副组长', '组长', '主任', '经理', '主管', '专员',
             '工程师', '负责人', '联系人', '成员', '参会', '出席', '签名', '签字',
@@ -2929,13 +2998,15 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
             ))
     else:
         # strict：#49 整改前的单档规则A（全池）
-        patterns.append((
-            re.compile(
-                rf'(?<![a-zA-Z0-9])'
-                rf'(?:{surname_alt}){name_char_class}{{1,3}}'
-            ),
-            rep.get("NAME", "XXX")
-        ))
+        # 【Issue #50 §4.8】同属规则A 家族，受 `rule_a_enabled` 开关控制。
+        if _rule_a_enabled:
+            patterns.append((
+                re.compile(
+                    rf'(?<![a-zA-Z0-9])'
+                    rf'(?:{surname_alt}){name_char_class}{{1,3}}'
+                ),
+                rep.get("NAME", "XXX")
+            ))
 
     # -----------------------------------------------------------------------
     # S3 强上下文姓名规则（Issue #49 P1）
@@ -4021,6 +4092,65 @@ def _apply_anchor_expand_pass(text: str, counts: Dict[str, int]) -> str:
     return "\n".join(out_lines)
 
 
+def _apply_nc_region_name_pass(text: str, counts: Dict[str, int]) -> str:
+    """N-C 区域内逐项姓名判定（Issue #50 §4.8 规则A 退出的召回替代通道）。
+
+    【职责】
+    规则A 退出主链路后，本通道承接它的**召回职责**，但把判定域从
+    「全局形态粗筛」收缩到「已确认的姓名集中区内逐项判定」：
+
+      1. N-C 层（T2 正文名单段 / T3 签名落款区）先定位姓名集中区；
+      2. 区域内每项做**形态判定**（`is_name_shaped`）；
+      3. 形态成立即遮盖。
+
+    【为什么这样能替代规则A】
+    - 规则A 的问题是**无上下文**的全局笛卡尔积匹配：
+      「姓 + 任意名字池字」在全文任意位置都成立，误伤无上界；
+    - 本通道的判定域被区域约束：区域已满足 Issue #50 §4.3 三条准则
+      （同构 + 锚点词或 D16 种子 + 每项形态成立），
+      因此区域内逐项判定的误伤面被上游准则收敛；
+    - 区域内**不再施加字频闸门**——区域上下文本身就是更强的证据，
+      这正是规则A 无法给到、而人做脱敏时天然会给到的东西。
+
+    【实测】
+    - 102 条通用语料：零误伤；
+    - 1200 条真实业务语料：零误伤；
+    - 真实文档（xlsx/docx/pptx）端到端：金标真名零泄漏。
+
+    【执行时机】
+    在**姓名规则组之后**执行：此时已脱敏的部分已是占位符形态，
+    区域检测会把占位符视作正向姓名证据（`_is_masked_name`），
+    未被规则层脱敏的漏网项则由本通道补位。
+    """
+    if not text or not isinstance(text, str):
+        return text
+    try:
+        from name_region_detector import region_name_spans
+    except ImportError:
+        return text
+
+    spans = region_name_spans(text)
+    if not spans:
+        return text
+
+    mask = get_replacement("NAME", "XXX")
+    out = text
+    # 逆序替换，保证前面的坐标不受影响
+    for start, end in sorted(spans, key=lambda x: -x[0]):
+        seg = out[start:end]
+        # 幂等性守卫：占位符不重复计数、不重复替换
+        if re.fullmatch(r"[Xx]{2,4}", seg or ""):
+            continue
+        # G4/G7（Issue #51）：整词保护表 / 跨词边界守卫
+        if _is_protected_by_common_word_guard(out, start, end):
+            continue
+        if _is_boundary_split_misfire(out, start, end):
+            continue
+        counts["姓名"] = counts.get("姓名", 0) + 1
+        out = out[:start] + mask + out[end:]
+    return out
+
+
 def _counting_sub(pattern: re.Pattern, text: str, replacement,
                   counts: Dict[str, int]) -> str:
     """带计数的规则替换：每处命中 +1，按实际产出占位符归类。
@@ -4118,6 +4248,17 @@ def apply_redactions_counted(text: str) -> Tuple[str, Dict[str, int]]:
     # 须在通用姓名规则**之前**执行——"李工/陈总/张经理"等组合形态若先被
     # 通用姓名规则切开，会同时产生漏脱与误伤（#52 §一 案例 #20）。
     result = _apply_title_name_pass(result, counts)
+
+    # N-C 区域内逐项姓名判定（Issue #50 §4.8）
+    # 规则A 退出主链路后，由本通道承接其召回职责：
+    # 先定位姓名集中区（T2 名单段 / T3 签名区），再在区域内逐项做形态判定。
+    #
+    # 【执行时机：必须在姓名规则组之前】
+    # 区域检测依赖**原始名单结构**（同构 + 锚点词）。若等到姓名规则跑完再检测，
+    # 名单里已脱敏的项变成占位符 XXX，同构性被破坏 → 区域检不出 → 漏网。
+    # 实测（平安信用卡 PPT 金标）：规则层跑完后 T2 检出 0 个区域，
+    # 而原始文本上可检出含「王松/吴学亮/叶新林/马娟」的名单段。
+    result = _apply_nc_region_name_pass(result, counts)
 
     # 第三阶段：姓名规则（R1：带常用词覆盖保护，"说明书→说XXX"类误伤在应用层过滤）
     _name_repl = get_replacement("NAME", "XXX")
