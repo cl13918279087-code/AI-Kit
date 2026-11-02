@@ -719,6 +719,75 @@ _ADDRESS_SUFFIX_RE = re.compile(
 
 
 # ---------------------------------------------------------------------------
+# 通道互斥（Issue #53 §3.3/§3.4）
+#
+# §3.3「机构 + 地名链整体脱敏」：当一个地名（银行品牌词表里的城市名）处在
+#   「地名 + 机构后缀」的机构链中时（如「深圳高新北支行网点」），该地名
+#   **不得被银行品牌规则抢先改写**——否则机构链被从中间切开
+#   （「深圳XX高新北支行网点」）。正确做法是让位给地址通道整体收拢
+#   → 「XX支行网点」（保留机构类型后缀）。
+#
+# §3.4「通道互斥断言」：银行名判定链命中后（脱敏为「XX银行」），
+#   其后紧跟的机构链（分行/支行/营业部/网点/分理处）区间**锁定**——
+#   姓名通道与地址通道不得再对该区间内部做任何替换，
+#   「工商银行北京分行」→ 「XX银行北京分行」（保留分行层级，不被拆开）。
+# ---------------------------------------------------------------------------
+
+# 机构链后缀（与地址通道的「可跨后缀」集合对齐，另加「网点」）
+_INSTITUTION_CHAIN_SUFFIXES = ("分行", "支行", "营业部", "网点", "分理处")
+_INSTITUTION_CHAIN_RE = re.compile("|".join(_INSTITUTION_CHAIN_SUFFIXES))
+# 机构链前最多允许多少字的地名/修饰成分（如「高新北」「人民路」）
+_INSTITUTION_CHAIN_MAX_PREFIX = 12
+# 已脱敏银行名 + 机构链 → 锁定区间（地址/姓名通道不得再切内部）
+_BANK_CHAIN_LOCK_RE = re.compile(
+    r"X{1,4}银行[一-龥]{0,6}?(?:分行|支行|营业部|网点|分理处)"
+)
+# 已脱敏银行名占位符（紧邻前文时，机构链归银行判定链所有）
+_MASKED_BANK_TAIL_RE = re.compile(r"X{1,4}银行$")
+
+
+def _masked_bank_before(text: str, pos: int) -> bool:
+    """pos 之前是否紧邻已脱敏的银行名占位符（「XX银行」）。
+
+    §3.4 通道互斥：银行判定链命中后，其后的机构链归银行链所有，
+    其它通道不得抢先切分。
+    """
+    return bool(_MASKED_BANK_TAIL_RE.search(text[:pos]))
+
+
+def _in_institution_chain(text: str, pos: int) -> bool:
+    """判断 text[pos:] 是否紧跟「机构链后缀」（中间只允许汉字）。
+
+    用于 §3.3：银行品牌规则在「地名 + 机构后缀」的机构链中必须让位，
+    避免机构链被从中间切开（「深圳高新北支行网点」不被改成
+    「深圳XX高新北支行网点」）。
+    """
+    window = text[pos:pos + _INSTITUTION_CHAIN_MAX_PREFIX]
+    m = _INSTITUTION_CHAIN_RE.search(window)
+    if not m:
+        return False
+    # 机构链后缀与地名之间只允许汉字（不允许标点/空格断开实体）
+    return all("一" <= c <= "龥" for c in window[:m.start()])
+
+
+def _bank_chain_locked_spans(text: str) -> List[Tuple[int, int]]:
+    """返回被银行判定链锁定的区间列表（§3.4 通道互斥）。
+
+    锁定区间 = 「XX银行」+ 其后紧跟的机构链（如「XX银行北京分行」）。
+    区间内的地名/机构层级不得再被地址通道或姓名通道改写。
+    """
+    return [m.span() for m in _BANK_CHAIN_LOCK_RE.finditer(text)]
+
+
+def _is_in_locked_span(spans: List[Tuple[int, int]], start: int, end: int) -> bool:
+    """命中区间是否落在某个锁定区间内。"""
+    for ws, we in spans:
+        if ws <= start and end <= we:
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
 # R1 常用词覆盖保护（2026-09-06）：姓名规则命中片段若被排除词包含，则保留原文
 # 背景：闭集"姓氏字+名字池字"正则对"说明书→说XXX"类高频词误伤率达 90%
 # （见《redact_docx_v2改进项清单》改进1），本函数在姓名规则应用层做过滤。
@@ -902,8 +971,16 @@ def _get_common_word_guards() -> set:
     return _COMMON_WORD_GUARDS
 
 
-def _is_protected_by_common_word_guard(text: str, start: int, end: int) -> bool:
+def _is_protected_by_common_word_guard(text: str, start: int, end: int,
+                                       strict_longer: bool = False) -> bool:
     """G4 整词守卫：命中片段**完整落在**整词保护表的某个词内部 → 保留原文。
+
+    【strict_longer=True（G4-S，Issue #53 §3.2「前缀成词整体保留」）】
+    只在「表内词**严格长于**命中片段」时才算豁免——即命中片段只是某个
+    完整组织实体的**一部分**（前缀成词），此时整词保留原文。
+    与之相对，命中片段与表内词**完全相同**时不算豁免
+    （否则「科技部」这类独立组织词将永不被脱敏，与既有脱敏设计冲突）。
+
 
     【语义：包含而非重叠】命中区间 [start, end) 必须被某个保护词的出现
     区间 [ws, we) **完全覆盖**（ws <= start 且 end <= we）才豁免。
@@ -935,15 +1012,20 @@ def _is_protected_by_common_word_guard(text: str, start: int, end: int) -> bool:
                 return False
             idx = text.find(name, idx + 1)
     # G4-a 整体命中：命中片段本身就是表内整词
-    if matched in words:
+    #   strict_longer（G4-S）：仅「表内词严格长于命中片段」才算豁免，
+    #   等长命中（片段 == 表内词）不算——否则独立组织词永不被脱敏。
+    if matched in words and not strict_longer:
         return True
     # G4-b 包含命中：窗口内任一表内词**完整覆盖**命中片段
     #   表内最长词有限，窗口左右各取 maxlen 足以覆盖判定
+    hit_len = end - start
     pad = _COMMON_WORD_GUARDS_MAXLEN
     lo = max(0, start - pad)
     hi = min(len(text), end + pad)
     for w in words:
         if len(w) < 2:
+            continue
+        if strict_longer and len(w) <= hit_len:
             continue
         idx = text.find(w, lo)
         while idx >= 0 and idx < hi:
@@ -1194,12 +1276,20 @@ def _apply_address_pass(text: str, stats: Dict[str, int] = None) -> str:
     last = 0
     replaced = False
     consumed_until = -1  # 已替换区间右端（替换按从左到右进行，无重叠）
+    # §3.4（Issue #53）通道互斥：银行名判定链命中的机构链区间锁定，
+    #   地址通道不得再对其内部收拢（工商银行北京分行 → XX银行北京分行）。
+    locked_spans = _bank_chain_locked_spans(text)
 
     for m in _ADDRESS_SUFFIX_RE.finditer(text):
         s_start, s_end = m.span()
         if s_start < consumed_until:
             continue  # 落在已替换区间内（如"XX省"中的字），跳过
         suf = m.group(0)
+
+        # §3.4（Issue #53）通道互斥断言：银行名判定链命中的机构链
+        #   （「XX银行北京分行」）已锁定 → 地址通道不得再切其内部。
+        if locked_spans and _is_in_locked_span(locked_spans, s_start, s_end):
+            continue
 
         # R-⑯（v1.3.7，Issue #13-④）：单字行政后缀后紧跟网点后缀时跳过该行政后缀
         # （"锦艺新时代社区支行"的"区"先于"支行"被匹配，会把"锦艺新时代社"吞并成
@@ -1779,6 +1869,11 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
         )
         def _bank_brand_repl(m):
             brand = m.group(0)
+            # §3.3（Issue #53）：品牌地名处在「机构链」中时必须让位给地址通道，
+            #   否则机构链被从中间切开（深圳高新北支行网点 → 深圳XX高新北支行网点）。
+            #   让位后由地址通道整体收拢 → XX支行网点（保留机构类型后缀）。
+            if _in_institution_chain(m.string, m.end()):
+                return m.group(0)
             return brand[:2] + "XX"
         patterns.append((_BANK_BRAND_RE, _bank_brand_repl))
         _BANK_GENERIC_KEEP = {
@@ -2266,6 +2361,11 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
     )
     def _city_bank_repl(m):
         full = m.group(0)
+        # §3.4（Issue #53）通道互斥断言：机构链若锚定在**已脱敏的银行名**之后
+        #   （「XX银行深圳分行」），不得再被「城市 + 机构后缀」规则单独收拢——
+        #   否则银行链被拆成两段（上游期望「XX银行深圳分行」保留分行层级）。
+        if full.endswith(("分行", "支行", "营业部")) and _masked_bank_before(m.string, m.start()):
+            return m.group(0)
         if full.endswith(("分行", "支行", "营业部")):
             return "XX" + full[-2:]
         return "XX"
@@ -2291,14 +2391,34 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
     #   standalone suffix 含 D10 保护（(?!(?:分行银行|分行支行))），不吞银行名
     if org_suffixes:
         suffix_alt = '|'.join(re.escape(s) for s in org_suffixes)
-        patterns.append((
-            re.compile(
-                rf'(?:营业部|科技部|运营部|管理部|董事会|监事会|管委会|事业部)|'
-                rf'(?<![一-龥])(?:{suffix_alt})(?![一-龥])|'
-                rf'(?<![一-龥])[一-龥]{{2}}(?:部|科|中心|管委会|办公室)(?![一-龥])'
-            ),
-            rep.get("ORG", "XXXX")
-        ))
+        _ORG_NAME_RE = re.compile(
+            rf'(?:营业部|科技部|运营部|管理部|董事会|监事会|管委会|事业部)|'
+            rf'(?<![一-龥])(?:{suffix_alt})(?![一-龥])|'
+            rf'(?<![一-龥])[一-龥]{{2}}(?:部|科|中心|管委会|办公室)(?![一-龥])'
+        )
+
+        def _org_name_repl(m):
+            """组织名替换 + G4-S 前缀成词整体保留（Issue #53 §3.2）。
+
+            【§3.2 规则】命中片段若只是某个「名词 + 组织后缀」复合实体的
+            **一部分**（前缀成词），则整词豁免——保留原文，不进入脱敏。
+
+            例：「信息科技部与运维中心联合」
+              · 组织名正则命中的是「科技部」（第一分支硬编码，无左右边界）
+              · 「科技部」严格落在保护词「信息科技部」的出现区间内
+              · → G4-S 判为前缀成词 → 整词保留 → 输出「信息科技部与运维中心联合」
+
+            【与既有脱敏设计的边界】
+              片段与保护词**完全相同**时不豁免（如独立的「科技部」仍脱敏为
+              XXXX）——否则组织名脱敏能力整体失效，且与门禁的「设计意图」
+              豁免口径冲突。
+            """
+            if _is_protected_by_common_word_guard(m.string, m.start(), m.end(),
+                                                  strict_longer=True):
+                return m.group(0)
+            return rep.get("ORG", "XXXX")
+
+        patterns.append((_ORG_NAME_RE, _org_name_repl))
 
 
 # ---------- 13. 人员姓名（2-3个汉字，粗筛） ----------
@@ -3429,7 +3549,14 @@ def _name_guard_sub_counted(pattern: re.Pattern, text: str, replacement: str,
                             counts: Dict[str, int]) -> str:
     """带计数的姓名规则替换：仅统计实际替换（排除常用词保护/Agent skip 保留的命中）。"""
 
+    # §3.4（Issue #53）通道互斥断言：银行名/机构名判定链命中的区间锁定，
+    #   姓名通道不得再对其内部做任何替换（「XX银行北京分行」不被拆成
+    #   「XX银行北XXX行」）。
+    locked_spans = _bank_chain_locked_spans(text)
+
     def _repl(m: re.Match) -> str:
+        if locked_spans and _is_in_locked_span(locked_spans, m.start(), m.end()):
+            return m.group(0)
         if _is_protected_by_common_word(m.string, m.start(), m.end()):
             return m.group(0)
         # R-㊷：业务词保护守卫（G1 跨界 / G2 整体 / G3 指示词）
