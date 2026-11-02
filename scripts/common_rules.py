@@ -2879,8 +2879,11 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
                 ),
                 rep.get("NAME", "XXX")
             ))
+        # 高危姓为空时（如未配置 high_risk_surnames，或闸门后无交集），
+        # _high_alt 必须有兜底值——否则后续 R3b 通道引用它会抛
+        # UnboundLocalError，整条规则链崩溃（历史缺陷，基线提交同样存在）。
+        _high_alt = '|'.join(re.escape(s) for s in _high_surnames)
         if _high_surnames:
-            _high_alt = '|'.join(re.escape(s) for s in _high_surnames)
             _high_pos = _build_name_pos_class(_hot_chars, _warm_chars, _hi_min, _hi_max)
             patterns.append((
                 re.compile(
@@ -2913,14 +2916,17 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
         ]
         _role_suffix_alt = '|'.join(re.escape(s) for s in _role_suffixes)
         _single_pos = _build_name_pos_class(_hot_chars, _warm_chars, 1, 1)
-        patterns.append((
-            re.compile(
-                rf'(?<![a-zA-Z0-9])'
-                rf'(?:{_high_alt}){_single_pos}'
-                rf'(?=(?:{_role_suffix_alt}))'
-            ),
-            rep.get("NAME", "XXX")
-        ))
+        # 无高危姓时不追加本通道——否则空姓氏组会退化成「任意单字 + 职务后缀」，
+        # 造成大面积误伤（守卫：必须有姓氏可选）。
+        if _high_surnames:
+            patterns.append((
+                re.compile(
+                    rf'(?<![a-zA-Z0-9])'
+                    rf'(?:{_high_alt}){_single_pos}'
+                    rf'(?=(?:{_role_suffix_alt}))'
+                ),
+                rep.get("NAME", "XXX")
+            ))
     else:
         # strict：#49 整改前的单档规则A（全池）
         patterns.append((
@@ -4336,9 +4342,51 @@ def add_custom_replacement(old: str, new: str, position: int = -1) -> None:
 
 
 def reset_patterns() -> None:
-    """重置规则缓存（config.json 变更后需调用）"""
+    """重置规则缓存（config.json 变更后需调用）。
+
+    【历史缺陷修复】此前本函数只清 `_PATTERNS`，而十余个**配置派生缓存**
+    （保护词表、业务词表、全名集、名字池、称谓通道正则等）在配置切换后
+    仍保留旧值——导致「切到假配置再切回真配置」后，真配置里的保护词
+    （如「白名单」）再也加载不到，业务词被整段误伤。
+    本函数现统一清空全部配置派生缓存，使配置切换真正生效。
+    """
     global _PATTERNS
+    global _FULL_NAME_SET_CACHE
+    global _BIZ_GUARD_WORDS
+    global _BIZ_GUARD_MAXLEN
+    global _BIZ_WORDS_BY_FIRST
+    global _COMMON_WORD_GUARDS
+    global _COMMON_WORD_GUARDS_MAXLEN
+    global _BOUNDARY_PAIRS
+    global _STANDALONE_EXEMPT_WORDS
+    global _STANDALONE_NAME_CANDIDATES
+    global _ENGLISH_TERM_WHITELIST
+    global _TITLE_NAME_CACHE
+    global _TITLE_SUFFIX_RE_CACHE
+    global _TITLE_NICK_RE_CACHE
+    global _TITLE_SINGLE_RE_CACHE
+    global _ATTESTED_SURNAMES_CACHE
+    global _SAFE_CUT_WORDS
+
     _PATTERNS = None
+    _FULL_NAME_SET_CACHE = None
+    _BIZ_GUARD_WORDS = None
+    _BIZ_GUARD_MAXLEN = 0
+    _BIZ_WORDS_BY_FIRST = None
+    _COMMON_WORD_GUARDS = None
+    _COMMON_WORD_GUARDS_MAXLEN = 0
+    _BOUNDARY_PAIRS = None
+    _STANDALONE_EXEMPT_WORDS = None
+    _STANDALONE_NAME_CANDIDATES = None
+    _ENGLISH_TERM_WHITELIST = None
+    _TITLE_NAME_CACHE = None
+    _TITLE_SUFFIX_RE_CACHE = None
+    _TITLE_NICK_RE_CACHE = None
+    _TITLE_SINGLE_RE_CACHE = None
+    _ATTESTED_SURNAMES_CACHE = None
+    _SAFE_CUT_WORDS = set()
+    _NAME_POOL_CACHE.clear()
+    _NAME_CHAR_FREQ_CACHE.clear()
 
 
 # ---------------------------------------------------------------------------

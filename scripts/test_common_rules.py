@@ -17,6 +17,8 @@ import tempfile
 import re
 from pathlib import Path
 
+import pytest
+
 # ---------------------------------------------------------------------------
 # 测试夹具（fixtures）
 # ---------------------------------------------------------------------------
@@ -31,6 +33,33 @@ common_rules._PATTERNS = None
 common_rules._PATTERNS_PRE = []
 common_rules._PATTERNS_NAME = []
 common_rules._AGENT_DECISIONS_OVERRIDE = None
+
+# 本模块创建的临时配置文件路径（由 _isolate_config_env 统一清理）
+_TEMP_CONFIG_PATHS = []
+
+
+@pytest.fixture(autouse=True)
+def _isolate_config_env():
+    """每个用例结束后复原配置环境，避免污染同批次的其他测试文件。
+
+    背景（历史缺陷）：`_fake_config()` 通过 `AIKIT_CONFIG_PATH` 指向临时配置，
+    而 `_cleanup_config()` 此前从未被调用——环境变量会永久泄漏到后续测试文件，
+    使其读到残缺的假配置并大面积失败（本文件单独跑全绿、与 tests/ 合跑全崩）。
+    本 fixture 保证：退出用例时清掉环境变量并重建规则缓存。
+    """
+    yield
+    os.environ.pop("AIKIT_CONFIG_PATH", None)
+    while _TEMP_CONFIG_PATHS:
+        try:
+            os.unlink(_TEMP_CONFIG_PATHS.pop())
+        except OSError:
+            pass
+    # 走公共重置入口：确保配置派生缓存（保护词表/全名集/名字池/称谓通道等）
+    # 一并清空——手工只清 _PATTERNS 会留下脏缓存（历史缺陷）。
+    common_rules._CONFIG_CACHE = None
+    common_rules.reset_patterns()
+    common_rules._PATTERNS_PRE = []
+    common_rules._PATTERNS_NAME = []
 
 
 def _fake_config(overrides: dict = None):
@@ -77,6 +106,7 @@ def _fake_config(overrides: dict = None):
     fd, path = tempfile.mkstemp(suffix=".json", prefix="test_config_")
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(defaults, f, ensure_ascii=False)
+    _TEMP_CONFIG_PATHS.append(path)
 
     # Issue #49：不再覆写/删除仓库内真实 config.json（会破坏 full_name_list 等资产）。
     # 改为通过 AIKIT_CONFIG_PATH 环境变量指向临时配置文件，实现测试隔离。
