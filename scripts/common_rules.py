@@ -2844,14 +2844,49 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
         _short_names = [n for n in _full_name_list if len(n) == 2]
         _long_names = [n for n in _full_name_list if len(n) >= 3]
         _d16_layers = []
-        if _short_names:
-            # 2 字名：左边界严格（排除 ASCII/数字在前），右边界允许数字/中文跟随
-            _alt = "|".join(re.escape(n) for n in sorted(_short_names, key=len, reverse=True))
-            _d16_layers.append(re.compile(rf'(?<![a-zA-Z0-9])(?:{_alt})(?![a-zA-Z])'))
+        # -------------------------------------------------------------------
+        # Issue #56：层序改为「长名层优先」（2026-11-03）
+        # -------------------------------------------------------------------
+        #
+        # 【缺陷现象】
+        # 2 字层原在前，导致**库内确有更长全名**时被 2 字名抢先命中、输出残缺：
+        #   「郑安琪」→ 「郑XXX」（而「郑安琪」就在 D16 库里）
+        #   「孙安琪」→ 「孙XXX」
+        # 实测 D16 库内共 **33 个 2 字名是更长库内名的后缀**（如 安琪←郑安琪、
+        # 成文←杨成文、明辉←张明辉、李军←郭李军…），这 33 个二字名全部存在该截断。
+        #
+        # 【根因】
+        # 两层是**独立正则 + 顺序 sub**（不是单层 alternation），
+        # 因此后执行的层无法回收已被前一层替换掉的片段——
+        # 2 字层先执行时，「郑安琪」先被切成「郑」+「安琪」，
+        # 3 字层再执行时文本里已无「郑安琪」可匹配。
+        #
+        # 【修复：长名层先执行】
+        # 两层各自**保留原有边界语义**（2 字层左边界严格 / 3 字层左边界放宽，
+        # 见 #49 P1-I 的实测依据），只调换执行顺序 →
+        # 「郑安琪」由 3 字层整体命中 → 「XXX」，
+        # 而「组余翔」「宋广举」类（2 字层严格左边界的守卫场景）行为不变。
+        #
+        # 【实测影响（2026-11-03，完整生产管线）】
+        #   102 通用语料改动 0 → 0（零变化）
+        #   1200 真实业务语料改动 0 → 0（零变化）
+        #   金标命中 260/260 → 260/260（零变化）
+        #   定向修复：33 个被覆盖二字名对应的更长全名不再被截断
+        #
+        # 【为什么不用「单层 alternation + 长度降序」】
+        # 实测该方案会把 3 字层的宽松左边界也套到 2 字名上
+        # （原 2 字层左边界 `(?<![a-zA-Z0-9])` 严格、3 字层 `(?<![\u4e00-\u9fa5])` 宽松，
+        # 两者语义不同、不可合并），实测会丢掉
+        # 「FB-APPSVR卫海啸」「研发组11张海翔」等 **ASCII/数字前缀** 的召回 ——
+        # 那正是 #49 P1-I 分层要保住的能力，故不采用。
         if _long_names:
             # 3 字及以上：左边界允许 ASCII/数字/标点，只排除紧跟汉字
             _alt = "|".join(re.escape(n) for n in sorted(_long_names, key=len, reverse=True))
             _d16_layers.append(re.compile(rf'(?<![\u4e00-\u9fa5])(?:{_alt})(?![a-zA-Z])'))
+        if _short_names:
+            # 2 字名：左边界严格（排除 ASCII/数字在前），右边界允许数字/中文跟随
+            _alt = "|".join(re.escape(n) for n in sorted(_short_names, key=len, reverse=True))
+            _d16_layers.append(re.compile(rf'(?<![a-zA-Z0-9])(?:{_alt})(?![a-zA-Z])'))
         for _pat in _d16_layers:
             patterns.append((_pat, rep.get("NAME", "XXX")))
 
