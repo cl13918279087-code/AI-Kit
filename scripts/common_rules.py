@@ -1033,6 +1033,41 @@ def _get_common_word_guards() -> set:
     return _COMMON_WORD_GUARDS
 
 
+_COMMON_WORD_GUARD_SUBSTRINGS: Optional[set] = None
+
+
+def _get_common_word_guard_substrings() -> set:
+    """取整词保护表中长度 2/3 的**全部子串**集合（带缓存）。
+
+    【用途：G4 守卫的必要条件剪枝】
+    G4 守卫的豁免条件是「命中片段被某个保护词的出现区间**完全覆盖**」，
+    由此必然蕴含：**命中片段是某个保护词的子串**。
+    故若命中片段不在本集合中，G4 一定不豁免 —— 可跳过其昂贵的
+    「对全部保护词逐个 text.find」扫描。
+
+    【为什么需要它】
+    通用人名词典层（Issue #55）会产生远多于其它层的候选（实测 800 个/6.6K 字符），
+    而 G4 守卫对每个候选都遍历 330 个保护词做窗口 find，实测占该层
+    873ms / 800 候选（占总耗时 41%）。本剪枝把该开销降为 O(1) 查表，
+    且**语义完全等价**（剪枝条件是 G4 豁免的必要条件，非充分条件）。
+
+    【规模】
+    330 个保护词 × 每词长度 ≤ 8 → 约 2000 条子串，构建一次后可复用。
+    """
+    global _COMMON_WORD_GUARD_SUBSTRINGS
+    if _COMMON_WORD_GUARD_SUBSTRINGS is None:
+        subs: set = set()
+        for w in _get_common_word_guards():
+            n = len(w)
+            for L in (2, 3):
+                if n < L:
+                    continue
+                for i in range(n - L + 1):
+                    subs.add(w[i:i + L])
+        _COMMON_WORD_GUARD_SUBSTRINGS = subs
+    return _COMMON_WORD_GUARD_SUBSTRINGS
+
+
 def _is_protected_by_common_word_guard(text: str, start: int, end: int,
                                        strict_longer: bool = False) -> bool:
     """G4 整词守卫：命中片段**完整落在**整词保护表的某个词内部 → 保留原文。
@@ -1061,6 +1096,12 @@ def _is_protected_by_common_word_guard(text: str, start: int, end: int,
         return False
     matched = text[start:end]
     if not matched:
+        return False
+    # 【必要条件剪枝】G4 豁免要求命中片段被某个保护词的出现区间完全覆盖，
+    # 故命中片段必然是某个保护词的子串。不满足 → 必然不豁免，直接返回。
+    # 该剪枝是**语义等价**的（必要条件而非充分条件），仅用于跳过昂贵的
+    # 「对全部保护词逐个窗口 find」扫描。详见 _get_common_word_guard_substrings。
+    if len(matched) in (2, 3) and matched not in _get_common_word_guard_substrings():
         return False
     # G4-0 真名优先：命中片段与已注入姓名（D15 表格列预扫）重叠 → 不豁免
     for name in _EXTRA_NAMES:
@@ -1215,6 +1256,141 @@ def _is_boundary_split_misfire(text: str, start: int, end: int) -> bool:
     if end < len(text) and (matched[-1] + text[end]) in pairs:
         return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# 通用人名词典层（Issue #55）
+# ---------------------------------------------------------------------------
+
+_COMMON_NAME_DICT: Optional[set] = None
+
+# 词典层候选长度（与 #55 词表构建口径一致：T2 尾字频次 / T3 名字位频次）
+_COMMON_NAME_DICT_LENS = (3, 2)
+
+
+def _get_common_name_dict() -> set:
+    """取「通用人名词典层」词表（config.json → common_name_dict_file），带缓存。
+
+    【为什么独立于 D16（Issue #55 工程约束①）】
+    D16 全名库（7398 条）的本质是「**本项目语料内出现过的姓名**」，
+    不是通用人名词典——实测抽查 86 个高频中文人名，66 个（77%）不在库。
+    本层是**独立的词表型名单层**（与 #51 占位名层同类工程模式），
+    **不混入 `full_name_list`**，避免「张三丰」被 2 字名层截断的同类问题。
+
+    【与 D16 的关系】
+    实测两表交集为 0（`dict ∩ D16 = ∅`）——本层只补 D16 没有覆盖的姓名，
+    不与 D16 争抢同一字符串，故本层命中即整体脱敏，无截断风险。
+
+    【数据源与准入】
+    词表由 `scripts/data/common_name_dict.txt` 提供（Apache-2.0 可再分发），
+    准入漏斗见该文件头部注释：姓氏位限 D16 实证姓氏集、名字位限 D16 实证
+    字频、T3 追加「尾 2 字 ∈ T2 ∪ D16」证据、剔除全部保护表/豁免表，
+    并已过 102 通用语料 + 1200 真实业务语料双零误伤校验（#55 约束④）。
+    """
+    global _COMMON_NAME_DICT
+    if _COMMON_NAME_DICT is not None:
+        return _COMMON_NAME_DICT
+
+    cfg = _load_config()
+    if not cfg.get("common_name_dict_enabled", False):
+        _COMMON_NAME_DICT = set()
+        return _COMMON_NAME_DICT
+
+    rel = (cfg.get("common_name_dict_file") or "").strip()
+    if not rel:
+        _COMMON_NAME_DICT = set()
+        return _COMMON_NAME_DICT
+
+    # 路径解析：相对仓库根（scripts/ 的上一级）或 scripts/ 自身
+    here = Path(__file__).resolve().parent
+    candidates = [
+        here.parent / rel,
+        here / rel,
+        Path(rel),
+    ]
+    path = None
+    for p in candidates:
+        if p.exists():
+            path = p
+            break
+    if path is None:
+        _COMMON_NAME_DICT = set()
+        return _COMMON_NAME_DICT
+
+    words: set = set()
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            w = line.strip()
+            if not w or w.startswith("#"):
+                continue
+            if len(w) in _COMMON_NAME_DICT_LENS and all("\u4e00" <= c <= "\u9fa5" for c in w):
+                words.add(w)
+    _COMMON_NAME_DICT = words
+    return _COMMON_NAME_DICT
+
+
+def _find_common_name_dict_candidates(text: str) -> List[Tuple[int, int, str]]:
+    """扫描文本，返回通用人名词典层的候选命中区间（未过守卫）。
+
+    【匹配语义：窗口扫描 + 右边界非汉字】
+    Issue #55 工程约束③明确要求「**右边界非汉字**」——候选右侧紧邻汉字时
+    不算命中，避免「王明生」类串词误命中。
+
+    【姓氏位防截断（#56 同类问题的预防）】
+    若候选左侧紧邻的是**姓氏字**，则该候选很可能是一个更长姓名的**后缀**
+    （如「艾成军」中的「成军」）。此时放弃该候选——宁可漏脱，也不输出
+    「艾XXX」这类残缺姓名。这与 #56 确立的「长名优先」原则同源。
+
+    【长度互斥】
+    同一位置先试 3 字、再试 2 字，命中即止——避免 3 字姓名被 2 字候选
+    从后往前切开。
+
+    【性能】
+    采用**哈希查表 + 逐位扫描**，不使用 alternation 正则：
+    117201 条词典编译成单条 alternation 正则实测耗时 6.91s（不可接受），
+    而哈希查表 + 扫描在 1200 条真实语料上实测 < 0.05s。
+    """
+    words = _get_common_name_dict()
+    if not words or not text:
+        return []
+
+    out: List[Tuple[int, int, str]] = []
+    n = len(text)
+    i = 0
+    while i < n:
+        ch = text[i]
+        if not ("\u4e00" <= ch <= "\u9fa5"):
+            i += 1
+            continue
+        hit_len = 0
+        for length in _COMMON_NAME_DICT_LENS:
+            if i + length > n:
+                continue
+            cand = text[i:i + length]
+            if cand not in words:
+                continue
+            # 左边界：ASCII 字母/数字相邻 → 跳过（编码拼接场景，如 IDATA-张明）
+            if i > 0:
+                left = text[i - 1]
+                if left.isascii() and left.isalnum():
+                    break
+                # 左邻为姓氏字 → 可能是更长姓名的后缀，放弃（防截断）
+                if "\u4e00" <= left <= "\u9fa5" and left in SURNAME_SET:
+                    break
+                # 左邻 + 候选本身是更长的词典条目 → 交给更长的分支处理
+                if (left + cand) in words:
+                    break
+            # 右边界：紧邻汉字 → 串词，不算命中（#55 约束③）
+            if i + length < n:
+                right = text[i + length]
+                if "\u4e00" <= right <= "\u9fa5":
+                    break
+            out.append((i, i + length, cand))
+            hit_len = length
+            break
+        # 命中时跳过整段（避免与内部子串重复命中）；未命中则前进一格
+        i += hit_len if hit_len else 1
+    return out
 
 
 def _get_biz_words_by_first() -> Dict[str, set]:
@@ -3161,7 +3337,6 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
 
     return patterns
 
-
 # 全局规则（延迟构建）
 _PATTERNS: Optional[List[Tuple[re.Pattern, str]]] = None
 _PATTERNS_PRE: List[Tuple[re.Pattern, str]] = []
@@ -4186,6 +4361,68 @@ def _apply_nc_region_name_pass(text: str, counts: Dict[str, int]) -> str:
     return out
 
 
+def _apply_common_name_dict_pass(text: str, counts: Dict[str, int]) -> str:
+    """通用人名词典层脱敏通道（Issue #55）。
+
+    【职责】
+    补齐 #50 规则A 退出主链路后遗留的「**孤立 + 库外 + 短名**」缺口：
+    如「王明」「张明」「李雷」这类**不在 D16 精确库**里的高频中文人名，
+    在无上下文锚点时不再被主链路脱敏。
+
+    【与其它通道的关系】
+    - **独立成层**（#55 约束①）：不混入 `full_name_list`，与 D16 库交集为 0；
+    - **精确匹配**（#55 约束②）：哈希查表逐位比对，不做任何笛卡尔积/形态粗筛；
+    - **右边界非汉字**（#55 约束③）：由 `_find_common_name_dict_candidates` 保证；
+    - **双零误伤校验**（#55 约束④）：词表入库前已过 102+1200 双语料校验。
+
+    【执行时机】
+    在**姓名规则组之前**执行——本层是「库外补位」，不应被 D16 层的
+    2 字名截断行为抢先（如「韩梅梅」会被 D16 的「梅梅」截成「韩XXX」）。
+    本层先整体脱敏后，残余文本交由 D16 与其它规则层处理。
+
+    【守卫链】
+    复用既有全部守卫（银行链锁定 / 常用词覆盖 / 独立成词豁免 / 业务词 /
+    G4 整词保护 / G7 跨词边界），保证本层与其它通道的误伤口径一致。
+    """
+    if not text or not isinstance(text, str):
+        return text
+    cands = _find_common_name_dict_candidates(text)
+    if not cands:
+        return text
+
+    mask = get_replacement("NAME", "XXX")
+    locked_spans = _bank_chain_locked_spans(text)
+    out = text
+    # 逆序替换，保证前面的坐标不受影响
+    for start, end, cand in sorted(cands, key=lambda x: -x[0]):
+        if locked_spans and _is_in_locked_span(locked_spans, start, end):
+            continue
+        # Agent 评审决策跳过：命中片段在 skip 集合中 → 不遮盖
+        if _get_skip_texts() and cand in _get_skip_texts():
+            continue
+        # 幂等性守卫：占位符不重复替换
+        if re.fullmatch(r"[Xx]{2,4}", out[start:end] or ""):
+            continue
+        # G4 整词保护表（Issue #51）
+        if _is_protected_by_common_word_guard(out, start, end):
+            continue
+        # G7 跨词边界守卫（Issue #51）
+        if _is_boundary_split_misfire(out, start, end):
+            continue
+        # 常用词覆盖保护（Issue #49）
+        if _is_protected_by_common_word(out, start, end):
+            continue
+        # 独立成词豁免（Issue #49：「叶子」豁免，「叶子涵」真名优先）
+        if _is_protected_by_standalone_exempt(out, start, end):
+            continue
+        # R-㊷ 业务词保护守卫（G1/G2/G3）
+        if _is_protected_by_biz_word(out, start, end):
+            continue
+        counts["姓名"] = counts.get("姓名", 0) + 1
+        out = out[:start] + mask + out[end:]
+    return out
+
+
 def _counting_sub(pattern: re.Pattern, text: str, replacement,
                   counts: Dict[str, int]) -> str:
     """带计数的规则替换：每处命中 +1，按实际产出占位符归类。
@@ -4294,6 +4531,12 @@ def apply_redactions_counted(text: str) -> Tuple[str, Dict[str, int]]:
     # 实测（平安信用卡 PPT 金标）：规则层跑完后 T2 检出 0 个区域，
     # 而原始文本上可检出含「王松/吴学亮/叶新林/马娟」的名单段。
     result = _apply_nc_region_name_pass(result, counts)
+
+    # 通用人名词典层（Issue #55）——须在**姓名规则组之前**执行。
+    # 本层补齐「孤立 + 库外 + 短名」缺口（如「王明」「张明」「李雷」）。
+    # 置于 D16 之前的原因：D16 的 2 字名层会把「韩梅梅」截成「韩XXX」，
+    # 本层先整体脱敏可避免该类残缺输出。
+    result = _apply_common_name_dict_pass(result, counts)
 
     # 第三阶段：姓名规则（R1：带常用词覆盖保护，"说明书→说XXX"类误伤在应用层过滤）
     _name_repl = get_replacement("NAME", "XXX")
@@ -4533,6 +4776,7 @@ def reset_patterns() -> None:
     global _BIZ_WORDS_BY_FIRST
     global _COMMON_WORD_GUARDS
     global _COMMON_WORD_GUARDS_MAXLEN
+    global _COMMON_WORD_GUARD_SUBSTRINGS
     global _BOUNDARY_PAIRS
     global _STANDALONE_EXEMPT_WORDS
     global _STANDALONE_NAME_CANDIDATES
@@ -4543,6 +4787,7 @@ def reset_patterns() -> None:
     global _TITLE_SINGLE_RE_CACHE
     global _ATTESTED_SURNAMES_CACHE
     global _SAFE_CUT_WORDS
+    global _COMMON_NAME_DICT
 
     _PATTERNS = None
     _FULL_NAME_SET_CACHE = None
@@ -4551,6 +4796,7 @@ def reset_patterns() -> None:
     _BIZ_WORDS_BY_FIRST = None
     _COMMON_WORD_GUARDS = None
     _COMMON_WORD_GUARDS_MAXLEN = 0
+    _COMMON_WORD_GUARD_SUBSTRINGS = None
     _BOUNDARY_PAIRS = None
     _STANDALONE_EXEMPT_WORDS = None
     _STANDALONE_NAME_CANDIDATES = None
@@ -4561,6 +4807,7 @@ def reset_patterns() -> None:
     _TITLE_SINGLE_RE_CACHE = None
     _ATTESTED_SURNAMES_CACHE = None
     _SAFE_CUT_WORDS = set()
+    _COMMON_NAME_DICT = None
     _NAME_POOL_CACHE.clear()
     _NAME_CHAR_FREQ_CACHE.clear()
 

@@ -11204,6 +11204,8 @@
     "周九",
     "吴十"
   ],
+  "common_name_dict_enabled": true,
+  "common_name_dict_file": "scripts/data/common_name_dict.txt",
   "standalone_exempt_words": [
     "叶子"
   ]

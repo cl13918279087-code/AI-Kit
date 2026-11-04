@@ -128,8 +128,17 @@ def test_library_two_char_name_still_matched():
 
 
 def test_unknown_isolated_name_not_redacted():
-    """库外孤立 2 字名仍不脱敏（#50 §4.8 已知边界，本次修复不得改变该口径）。"""
-    assert apply_redactions("王明") == "王明"
+    """库外孤立 2 字名的脱敏口径。
+
+    【历史】本用例原断言「王明」不脱敏（#50 §4.8 已知边界）。
+    【现状】Issue #55 通用人名词典层上线后，「王明」在词典层词表内
+    → 已被精确匹配脱敏。本用例口径随之更新为 #55 的新基准。
+
+    注：#56 修复本身**不改变**该行为——层序调整只影响 D16 内部两层，
+    「王明」从来不在 D16 库中，其脱敏与否取决于是否接入词典层。
+    """
+    assert apply_redactions("王明") == "XXX", (
+        "「王明」在通用人名词典层内，应脱敏（Issue #55 口径）")
 
 
 # ---------------------------------------------------------------------------
@@ -211,13 +220,16 @@ def test_dictionary_gap_is_separate_from_truncation():
 
     本 issue 的修复口径只覆盖「库内有更长全名却被 2 字名截断」；
     「整体不在库」的姓名不在此列，其修复路径是 #55 通用人名词典层。
+
+    【#55 上线后的现状】「韩梅梅」在通用人名词典层词表内 → 已整体脱敏。
+    词典层置于 D16 **之前**执行，故不会再出现「韩XXX」这类残缺输出。
     """
     names = set(_load_config()["full_name_list"])
     assert "韩梅梅" not in names, "前提失效：「韩梅梅」已在 D16 库中，本用例需重估"
-    # 当前行为：2 字名「梅梅」命中 → 残留首字
-    assert apply_redactions("韩梅梅") == "韩XXX"
-    # 但带上下文时整体可救回（#50 §10.4 已记录的能力）
-    assert apply_redactions("联系人：韩梅梅") == "联系人：韩XXX"
+    # 通用人名词典层覆盖 → 整体脱敏，不残留首字
+    assert apply_redactions("韩梅梅") == "XXX"
+    # 带上下文时同样整体脱敏
+    assert apply_redactions("联系人：韩梅梅") == "联系人：XXX"
 
 
 if __name__ == "__main__":
