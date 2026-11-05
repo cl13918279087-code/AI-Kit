@@ -81,6 +81,60 @@ class ResumeState:
 
 
 # ---------------------------------------------------------------------------
+# 状态口径（Issue P0-1：产出方与消费方状态值不一致）
+#
+# 历史缺陷：process_single_file 产出终态 "complete"，而全部消费方
+# （断点续传 mark_done / mark_failed、进度条统计、Markdown 报告统计）
+# 一律判定 "success"。导致成功文件**既不计成功、也不算失败**——
+# 批量报告输出「处理 1 / 成功 0 / 失败 0 / 跳过 0」，审计台账三项恒零；
+# 断点续传 mark_done 永不触发，--resume 形同虚设。
+#
+# 口径决策：
+#   1. 终态成功统一取 "complete"，与 redaction_engine.RedactionStatus.COMPLETE
+#      以及本文件 RedactResult 的既有文档注释保持一致，不引入第二套词汇；
+#   2. 消费方一律经 is_success_status / is_failed_status / is_skipped_status
+#      判定，不再散落字符串字面量比较；
+#   3. "success" 作为**历史别名**保留兼容——外部调用方自行构造
+#      RedactResult(status="success") 时仍按成功处理，避免破坏既有集成。
+# ---------------------------------------------------------------------------
+
+STATUS_PENDING = "pending"
+STATUS_DETECTING = "detecting"
+STATUS_APPLYING = "applying"
+STATUS_WRITING = "writing"
+STATUS_COMPLETE = "complete"      # 终态：成功
+STATUS_FAILED = "failed"          # 终态：失败
+STATUS_SKIPPED = "skipped"        # 终态：跳过（输出已存在且未 --overwrite）
+
+#: 终态成功的历史别名（兼容旧调用方构造的 status 值）
+_SUCCESS_ALIASES = frozenset({STATUS_COMPLETE, "success"})
+
+#: 全部终态
+TERMINAL_STATUSES = frozenset({STATUS_COMPLETE, STATUS_FAILED, STATUS_SKIPPED, "success"})
+
+
+def _status_value(status: Any) -> str:
+    """把状态（字符串 / RedactionStatus 枚举 / 任意带 .value 的对象）统一为小写字符串。"""
+    value = getattr(status, "value", status)
+    return str(value).strip().lower()
+
+
+def is_success_status(status: Any) -> bool:
+    """是否成功终态（"complete"，兼容历史别名 "success"）。"""
+    return _status_value(status) in _SUCCESS_ALIASES
+
+
+def is_failed_status(status: Any) -> bool:
+    """是否失败终态。"""
+    return _status_value(status) == STATUS_FAILED
+
+
+def is_skipped_status(status: Any) -> bool:
+    """是否跳过终态。"""
+    return _status_value(status) == STATUS_SKIPPED
+
+
+# ---------------------------------------------------------------------------
 # 任务结果
 # ---------------------------------------------------------------------------
 
@@ -96,6 +150,20 @@ class RedactResult:
     manifest_path: str = ""
     # 分层阶段明细（从 redaction_engine.py 的 StageResult 复用）
     stages: List[Dict[str, Any]] = field(default_factory=list)   # [(stage, status, duration_ms, ...), ...]
+
+    # -- 终态判定（统一口径，勿再直接比较字符串字面量）--------------------
+
+    @property
+    def is_success(self) -> bool:
+        return is_success_status(self.status)
+
+    @property
+    def is_failed(self) -> bool:
+        return is_failed_status(self.status)
+
+    @property
+    def is_skipped(self) -> bool:
+        return is_skipped_status(self.status)
 
 
 # ---------------------------------------------------------------------------
@@ -161,7 +229,7 @@ def process_single_file(args: Tuple[str, str, str, bool]) -> RedactResult:
             return RedactResult(
                 input_path=input_path,
                 output_path=str(output_path),
-                status="skipped",
+                status=STATUS_SKIPPED,
                 error="输出文件已存在（使用 --overwrite 覆盖）",
                 duration_ms=int((time.time() - start) * 1000),
                 file_size=file_size,
@@ -170,7 +238,6 @@ def process_single_file(args: Tuple[str, str, str, bool]) -> RedactResult:
 
         # Stage 1: DETECTING（文本提取 + 实体检测）
         stage_detect_start = time.time()
-        stage_detect_status = "detecting"
         if file_type == "word":
             result = _process_word(input_path, str(output_path))
         elif file_type == "excel":
@@ -185,7 +252,7 @@ def process_single_file(args: Tuple[str, str, str, bool]) -> RedactResult:
             return RedactResult(
                 input_path=input_path,
                 output_path=str(output_path),
-                status="failed",
+                status=STATUS_FAILED,
                 error=f"不支持的文件类型: {file_type}",
                 duration_ms=int((time.time() - start) * 1000),
                 file_size=file_size,
@@ -195,7 +262,7 @@ def process_single_file(args: Tuple[str, str, str, bool]) -> RedactResult:
         entities_count = result.get("entities_count", 0)
         stages.append({
             "stage": "detecting",
-            "status": "complete",
+            "status": STATUS_COMPLETE,
             "duration_ms": int((time.time() - stage_detect_start) * 1000),
             "entities_count": entities_count,
         })
@@ -203,7 +270,7 @@ def process_single_file(args: Tuple[str, str, str, bool]) -> RedactResult:
         # Stage 2: APPLYING（脱敏应用 — 已由各 _process_* 函数内部完成）
         stages.append({
             "stage": "applying",
-            "status": "complete",
+            "status": STATUS_COMPLETE,
             "duration_ms": 0,
             "entities_count": entities_count,
         })
@@ -213,14 +280,14 @@ def process_single_file(args: Tuple[str, str, str, bool]) -> RedactResult:
         manifest_path = str(output_path) + "_manifest.json"
         stages.append({
             "stage": "writing",
-            "status": "complete",
+            "status": STATUS_COMPLETE,
             "duration_ms": int((time.time() - stage_write_start) * 1000),
         })
 
         return RedactResult(
             input_path=input_path,
             output_path=str(output_path),
-            status="complete",
+            status=STATUS_COMPLETE,
             duration_ms=int((time.time() - start) * 1000),
             entities_count=entities_count,
             file_size=file_size,
@@ -231,14 +298,14 @@ def process_single_file(args: Tuple[str, str, str, bool]) -> RedactResult:
     except Exception as e:
         stages.append({
             "stage": "failed",
-            "status": "failed",
+            "status": STATUS_FAILED,
             "error": f"{type(e).__name__}: {str(e)}",
             "duration_ms": int((time.time() - start) * 1000),
         })
         return RedactResult(
             input_path=input_path,
             output_path="",
-            status="failed",
+            status=STATUS_FAILED,
             error=f"{type(e).__name__}: {str(e)}",
             duration_ms=int((time.time() - start) * 1000),
             file_size=input_p.stat().st_size if input_p.exists() else 0,
@@ -290,27 +357,69 @@ def batch_process(
 ) -> List[RedactResult]:
     """
     批量并行处理文件
+
+    终态口径
+        返回的每条 RedactResult.status ∈ {complete, failed, skipped}，
+        判定一律用 pipeline.is_success_status / is_failed_status / is_skipped_status，
+        勿直接比较字符串字面量（"success" 仅作历史别名兼容）。
+
+    台账完整性
+        返回列表长度 == 输入文件数：类型不支持 / 不在 --types 范围 /
+        断点续传已完成的文件也各占一条（分别为 failed / skipped），
+        保证「处理文件数 == 成功 + 失败 + 跳过」恒等式成立。
+
+    调用注意
+        子进程以 ProcessPoolExecutor 启动（macOS/Windows 为 spawn，Linux 为 fork），
+        **调用方须以 `if __name__ == "__main__":` 保护入口**，否则 spawn 重新导入
+        主模块时会递归启动子进程。
     """
+    # 输出目录兜底创建（Issue P0-2：CLI 层 main() 已建目录，但 API 层直接调用
+    # batch_process 时不建，导致每个文件都 FileNotFoundError）
+    try:
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        logger.error(f"创建输出目录失败: {output_dir} — {e}")
+
     # 过滤文件类型
     tasks: List[Tuple[str, str, str, bool]] = []
+    # 台账完整性：被过滤掉的文件（类型不支持 / 不在 --types 范围 / 断点续传已完成）
+    # 也必须进结果列表，否则报告中「处理文件数」小于实际输入，审计对不上账
+    results: List[RedactResult] = []
     for p in input_paths:
         ftype = detect_file_type(p)
         if ftype is None:
             logger.debug(f"跳过不支持的文件: {p}")
+            results.append(RedactResult(
+                input_path=p,
+                output_path="",
+                status=STATUS_FAILED,
+                error=f"不支持的文件类型: {Path(p).suffix or '(无扩展名)'}",
+            ))
             continue
         if file_types and ftype not in file_types:
+            results.append(RedactResult(
+                input_path=p,
+                output_path="",
+                status=STATUS_SKIPPED,
+                error=f"不在指定类型范围内（--types {','.join(file_types)}），已跳过",
+            ))
             continue
         if resume_state and resume_state.is_done(p):
             logger.info(f"[跳过-已完成] {Path(p).name}")
+            results.append(RedactResult(
+                input_path=p,
+                output_path="",
+                status=STATUS_SKIPPED,
+                error="断点续传：此前已完成，跳过",
+            ))
             continue
         tasks.append((p, output_dir, ftype, overwrite))
 
     if not tasks:
-        logger.warning("没有找到需要处理的文件")
-        return []
+        logger.warning("没有需要处理的文件（全部为跳过或失败）")
+        return results
 
     logger.info(f"共 {len(tasks)} 个文件待处理，并行度: {max_workers}")
-    results: List[RedactResult] = []
 
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(process_single_file, t): t[0] for t in tasks}
@@ -325,21 +434,21 @@ def batch_process(
                     result = RedactResult(
                         input_path=input_path,
                         output_path="",
-                        status="failed",
+                        status=STATUS_FAILED,
                         error=f"子进程异常: {str(e)}",
                     )
 
                 results.append(result)
 
                 if resume_state:
-                    if result.status == "success":
+                    if is_success_status(result.status):
                         resume_state.mark_done(input_path, asdict(result))
-                    elif result.status == "failed":
+                    elif is_failed_status(result.status):
                         resume_state.mark_failed(input_path, result.error)
 
                 # 更新进度条描述
-                done = sum(1 for r in results if r.status == "success")
-                fail = sum(1 for r in results if r.status == "failed")
+                done = sum(1 for r in results if is_success_status(r.status))
+                fail = sum(1 for r in results if is_failed_status(r.status))
                 pbar.set_postfix_str(f"✅{done} ❌{fail}", refresh=True)
                 pbar.update(1)
 
@@ -356,9 +465,9 @@ def generate_markdown_report(
     total_input_chars: int = 0,
 ) -> str:
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    success = [r for r in results if r.status == "success"]
-    failed = [r for r in results if r.status == "failed"]
-    skipped = [r for r in results if r.status == "skipped"]
+    success = [r for r in results if is_success_status(r.status)]
+    failed = [r for r in results if is_failed_status(r.status)]
+    skipped = [r for r in results if is_skipped_status(r.status)]
 
     total_duration = sum(r.duration_ms for r in results)
     total_entities = sum(r.entities_count for r in success)
@@ -552,12 +661,13 @@ def main():
     report_path = generate_markdown_report(results, str(output_dir))
 
     # 打印摘要
-    success = [r for r in results if r.status == "success"]
-    failed = [r for r in results if r.status == "failed"]
+    success = [r for r in results if is_success_status(r.status)]
+    failed = [r for r in results if is_failed_status(r.status)]
+    skipped = [r for r in results if is_skipped_status(r.status)]
     total_time = time.time() - start_time
 
     print("\n" + "=" * 60)
-    print(f"  脱敏完成  —  ✅{len(success)}  ❌{len(failed)}  ⏱️{total_time:.1f}s")
+    print(f"  脱敏完成  —  ✅{len(success)}  ❌{len(failed)}  ⏭️{len(skipped)}  ⏱️{total_time:.1f}s")
     print(f"  报告: {report_path}")
     print("=" * 60)
 

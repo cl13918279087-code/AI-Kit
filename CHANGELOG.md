@@ -1,5 +1,41 @@
 # Changelog
 
+## [Unreleased] - 2026-11-06（架构评审整改第一批：P0-1 状态值统一 + P0-2 输出目录兜底）
+
+### 变更
+
+- **P0-1 批量主链路状态值不一致 → 审计报表统计归零（已修复）**：
+  - **根因**：`process_single_file()` 产出终态 `"complete"`，而**全部消费方**
+    （断点续传 `mark_done`/`mark_failed`、进度条计数、Markdown 报告三分类与敏感项总数、
+    CLI 摘要）一律判定 `"success"`。后果：批量报告输出「处理 1 / 成功 0 / 失败 0 / 跳过 0」，
+    **审计台账三项恒零**；断点续传 `mark_done` 永不触发，`--resume` 形同虚设。
+  - **修复口径**：终态成功统一取 `"complete"`（与 `redaction_engine.RedactionStatus.COMPLETE`
+    及 `RedactResult` 既有注释一致，不引入第二套词汇）；新增终态常量与判定函数
+    `is_success_status()` / `is_failed_status()` / `is_skipped_status()`，消费方一律经判定函数
+    判定，**不再散落字符串字面量比较**；`"success"` 作为**历史别名**保留兼容，外部调用方
+    构造 `RedactResult(status="success")` 仍按成功处理。
+  - **台账完整性补强**：此前被静默丢弃的文件（类型不支持 / 不在 `--types` 范围 /
+    断点续传已完成）各占一条记录（分别为 `failed` / `skipped`），保证恒等式
+    **处理文件数 == 成功 + 失败 + 跳过** 成立。
+- **P0-2 批量处理不创建输出目录 → 首次运行必然全量失败（已修复）**：
+  `batch_process()` 入口处 `Path(output_dir).mkdir(parents=True, exist_ok=True)` 兜底。
+  CLI 层 `main()` 原本已建目录，缺口仅在 API 层调用。
+
+### 验证
+
+- 新增 `tests/test_pipeline_status_consistency.py`：**15 项全 PASS**（覆盖状态常量、
+  判定函数、产出方终态、报告三分类、断点续传 mark_done、输出目录兜底、台账完整性）。
+- 全量回归：**291 passed / 1 skipped / 1 xfailed / 1 xpassed**，零失败（283s）。
+- 门禁八项 `bench_metrics.py`：**全 PASS**（recall 283/283、precision 99.9%、
+  真实语料误伤 0/1200、确定性/幂等 100%）。
+- CLI 端到端：报告「处理文件数 1 / 成功 1 / 失败 0 / 跳过 0」，摘要 `✅1 ❌0 ⏭️0`，退出码 0。
+- **未改动任何脱敏规则**，金标与真实语料基线零劣化。
+
+### 归档
+
+整改记录见 `docs/架构评审-2026-11-05.md` §五之二「修复记录」。
+**P0-3（降级标记未进审计链）、P0-4（无 CI 流水线）仍待整改。**
+
 ## [Unreleased] - 2026-11-04（#55 通用人名词典层 + #56 D16 长名层优先）
 
 ### 变更
