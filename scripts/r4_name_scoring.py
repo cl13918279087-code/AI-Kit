@@ -379,13 +379,20 @@ _llm_client = None
 
 
 def _get_llm_client():
-    """延迟加载 LLM 客户端"""
+    """延迟加载 LLM 客户端
+
+    【合规】仅当客户端通过出网守卫（enabled + 端点合规 + api_key）时返回实例，
+    否则返回 None——调用方据此走保守降级，不发起任何外发。
+    """
     global _llm_client
     if _llm_client is not None:
         return _llm_client
     try:
         from llm_client import LLMClient
-        _llm_client = LLMClient()
+        client = LLMClient()
+        if not getattr(client, "available", False):
+            return None
+        _llm_client = client
         return _llm_client
     except ImportError:
         return None

@@ -31,6 +31,7 @@ from common_rules import redistribute_paragraph, redact_filename_stem
 from common_rules import set_agent_decisions_override, _get_skip_texts
 from table_role_detector import process_ppt_slide_xml, collect_table_names
 from common_rules import inject_extra_names, clear_extra_names
+from workdir import work_dir
 from html import unescape as _html_unescape
 from xml.sax.saxutils import escape as _xml_escape
 
@@ -405,7 +406,9 @@ def redact_ppt(input_path: str, output_path: str = None,
         counts = redact_pptx(input_path, output_path)
     elif ext == ".ppt":
         # .ppt 转换为 .pptx 再处理
-        tmp_pptx = str(Path(tempfile.gettempdir()) / f"_tmp_{Path(input_path).stem}.pptx")
+        # 【合规】转换中间产物落受控工作目录（0700/0600）
+        tmp_pptx = str(work_dir(str(Path(output_path).resolve().parent))
+                       / f"_tmp_{Path(input_path).stem}.pptx")
         redact_ppt_to_pptx(input_path, tmp_pptx)
         counts = redact_pptx(tmp_pptx, output_path)
         Path(tmp_pptx).unlink(missing_ok=True)

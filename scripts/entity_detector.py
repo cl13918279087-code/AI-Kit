@@ -14,12 +14,108 @@ from __future__ import annotations
 import json
 import re
 import logging
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 
 from llm_client import LLMClient
 from manifest import RedactionManifest, SensitiveEntity
 
 logger = logging.getLogger("entity_detector")
+
+
+# ---------------------------------------------------------------------------
+# 送 LLM 前的最小化预脱敏（合规收窄：LLM 只看到必要信息）
+# ---------------------------------------------------------------------------
+#
+# 【为什么要做】
+#   LLM 层在脱敏完成前收到的是**原文**。即便 LLM 部署在企业内网，
+#   「把与本次识别任务无关的个人标识一并送出去」仍属最小权限上不必要的
+#   明文扩散。本模块在送 LLM 前先把**确定性可判定的个人唯一标识**
+#   （身份证 / 银行卡 / 手机 / 固话 / 邮箱）做等长掩码。
+#
+# 【为什么等长掩码】
+#   LLM 返回的 start/end 是**字符偏移**。若替换串长度与原串不等，
+#   偏移即失效，实体无法回写原文。等长掩码保证偏移语义完全不变。
+#
+# 【不遮蔽什么】
+#   银行名称 / 日期 / 金额 / 地址**不遮蔽**：它们是机构与业务上下文，
+#   LLM 判「角色词+姓名」需要这些线索；且它们由规则层确定性脱敏，
+#   不构成自然人唯一标识。若遮蔽会显著削弱人名识别准确率。
+#
+# 【边界】
+#   掩码仅用于**送往 LLM 的副本**；原文与最终脱敏结果不受影响。
+
+_PREMASK_PATTERNS: List[Tuple[str, "re.Pattern"]] = [
+    # 身份证（18 位，含 X 结尾）——须先于银行卡处理，否则被 16-19 位数字规则吞掉
+    ("ID_CARD", re.compile(
+        r"[1-9]\d{5}(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx]"
+    )),
+    # 邮箱
+    ("EMAIL", re.compile(
+        r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}"
+    )),
+    # 银行卡（16-19 位）
+    ("BANK_CARD", re.compile(r"(?<!\d)\d{16,19}(?!\d)")),
+    # 固话
+    ("PHONE", re.compile(r"(?<![\d\-])\d{2,4}-\d{7,8}(?![\d\-])")),
+    # 手机
+    ("MOBILE", re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")),
+]
+
+# 掩码字符（全角 X，避免与原文中的 ASCII X 混淆）
+_MASK_CHAR = "Ｘ"
+
+
+def _overlaps(covered: List[Tuple[int, int]], start: int, end: int) -> bool:
+    """判断区间是否与已覆盖区间重叠。"""
+    for s, e in covered:
+        if start < e and s < end:
+            return True
+    return False
+
+
+def pre_redact_for_llm(text: str) -> Tuple[str, Dict[str, Any]]:
+    """对送 LLM 的文本做最小化预脱敏（等长掩码）。
+
+    返回 (掩码后文本, 统计信息)。统计信息只含类别与字符数，
+    **不含任何被遮蔽的原文**，可直接写入 manifest 审计留痕。
+    """
+    stats: Dict[str, Any] = {
+        "pre_redacted": False,
+        "masked_chars": 0,
+        "masked_spans": 0,
+        "categories": {},
+    }
+    if not text or not isinstance(text, str):
+        return text, stats
+
+    covered: List[Tuple[int, int]] = []
+    out = list(text)
+    counts: Dict[str, int] = {}
+
+    for category, pattern in _PREMASK_PATTERNS:
+        for m in pattern.finditer(text):
+            s, e = m.start(), m.end()
+            if e <= s or _overlaps(covered, s, e):
+                continue
+            covered.append((s, e))
+            for i in range(s, e):
+                out[i] = _MASK_CHAR
+            counts[category] = counts.get(category, 0) + (e - s)
+
+    if covered:
+        stats["pre_redacted"] = True
+        stats["masked_spans"] = len(covered)
+        stats["masked_chars"] = sum(e - s for s, e in covered)
+        stats["categories"] = counts
+
+    return "".join(out), stats
+
+
+def _is_masked_only(text: str) -> bool:
+    """判断实体文本是否完全由掩码字符组成（LLM 对掩码段的误识别，须丢弃）。"""
+    if not text:
+        return True
+    return all(c == _MASK_CHAR for c in text)
 
 
 # ---------------------------------------------------------------------------
@@ -128,9 +224,12 @@ class EntityDetector:
         self.llm = llm_client
         self.config = config or {}
         self.redaction_cfg = self.config.get("redaction", {})
+        llm_cfg = self.config.get("llm", {}) or {}
         self.llm_enabled = self.redaction_cfg.get("llm_enabled", True)
         self.chunk_size = self.redaction_cfg.get("llm_chunk_size", 6000)
         self.overlap_chars = self.redaction_cfg.get("llm_overlap_chars", 200)
+        # 【合规】送 LLM 前是否做最小化预脱敏（默认开）
+        self.pre_redact_before_llm = bool(llm_cfg.get("pre_redact_before_llm", True))
 
     def detect(self, text: str) -> RedactionManifest:
         """
@@ -145,8 +244,28 @@ class EntityDetector:
 
         # Layer 1: LLM 检测
         if self.llm and self.llm_enabled:
-            llm_entities = self._llm_detect(text)
+            manifest.llm_enabled = True
+            # 出网策略指纹（仅策略描述，不含端点密钥、不含原文）
+            manifest.llm_egress_policy = getattr(self.llm, "egress_reason", "") or ""
+            # 【合规】送 LLM 前最小化：先遮蔽个人唯一标识，只送必要信息。
+            # 等长掩码保证 LLM 返回的字符偏移仍然对得上原文。
+            llm_input = text
+            if self.pre_redact_before_llm:
+                llm_input, pre_stats = pre_redact_for_llm(text)
+                manifest.llm_pre_redacted = bool(pre_stats["pre_redacted"])
+                manifest.llm_masked_chars = int(pre_stats["masked_chars"])
+                manifest.llm_masked_spans = int(pre_stats["masked_spans"])
+                if pre_stats["categories"]:
+                    manifest.stats["llm_masked_categories"] = dict(pre_stats["categories"])
+            manifest.llm_chars_sent = len(llm_input)
+            manifest.stats["llm_chars_sent"] = manifest.llm_chars_sent
+
+            llm_entities = self._llm_detect(llm_input)
             for entity in llm_entities:
+                # 【合规】掩码段被 LLM 误识为实体时丢弃——其文本在原文中不存在，
+                # 写回会失败，且保留会把掩码符当成真实内容。
+                if _MASK_CHAR in (entity.text or ""):
+                    continue
                 manifest.add_entity(entity)
             manifest.llm_calls += 1
 
@@ -299,8 +418,11 @@ def build_llm_detector(config_path: Optional[str] = None) -> EntityDetector:
     """
     构建混合实体检测器（LLM + Regex + 角色词 三层）。
 
-    任何初始化失败（缺配置 / 无 API Key / 网络异常）都会静默降级为
-    纯规则检测器，绝不抛异常——保证脱敏流程永远可用。
+    任何初始化失败（缺配置 / 未启用 / 端点未通过出网守卫 / 无 API Key / 网络异常）
+    都会静默降级为纯规则检测器，绝不抛异常——保证脱敏流程永远可用。
+
+    【合规】可用性判定同时校验 llm_client.LLMClient.available，
+    该属性已内含「出网端点守卫」结果，违规端点绝不外发原文。
     """
     cfg = None
     try:
@@ -309,9 +431,15 @@ def build_llm_detector(config_path: Optional[str] = None) -> EntityDetector:
             with open(config_path, encoding="utf-8") as f:
                 cfg = _json.load(f)
         client = LLMClient(config_path=config_path) if config_path else LLMClient()
-        if not client.api_key:
-            logger.warning("LLM API Key 未配置，降级为纯规则检测（LLM 层跳过）")
-            print(f'  [DEBUG build_llm_detector] NO API KEY, returning EntityDetector(None, cfg)'); return EntityDetector(None, cfg)
+        if not client.available:
+            reason = getattr(client, "egress_reason", "LLM 不可用")
+            logger.warning(
+                "LLM 不可用（出网守卫/开关/密钥未通过）：%s，降级为纯规则检测（LLM 层跳过）",
+                reason,
+            )
+            print(f'  [DEBUG build_llm_detector] LLM unavailable: {reason}; '
+                  f'returning EntityDetector(None, cfg)')
+            return EntityDetector(None, cfg)
         return EntityDetector(client, cfg)
     except Exception as e:
         logger.warning("LLM 检测器初始化失败，降级为纯规则检测: %s", e)

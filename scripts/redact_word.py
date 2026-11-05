@@ -35,6 +35,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from common_rules import apply_redactions, protect_iso_datetimes, restore_iso_datetimes, find_libreoffice, redact_filename_stem, load_agent_decisions
 from entity_detector import build_llm_detector
+from workdir import work_dir
 
 _llm_logger = _logging.getLogger("redact_word.llm")
 
@@ -1662,7 +1663,9 @@ def redact_word(input_path: str, output_path: str = None,
         counts = redact_docx(input_path, output_path, detector=detector)
     elif ext == ".doc":
         # .doc → .docx → 处理（R-④：无 LibreOffice 时报错终止，不生成输出）
-        tmp_docx = str(Path(tempfile.gettempdir()) / f"_tmp_{Path(input_path).stem}.docx")
+        # 【合规】转换中间产物落受控工作目录（0700/0600），不散落系统临时目录
+        tmp_docx = str(work_dir(str(Path(output_path).resolve().parent))
+                        / f"_tmp_{Path(input_path).stem}.docx")
         try:
             counts = redact_doc_to_docx(input_path, tmp_docx, detector=detector)
             # R-⑥连带修复（v1.3.5）：a6aab58 重构 try/except 时丢失 os.replace，

@@ -141,8 +141,11 @@ class QualityValidator:
         if self.llm is None and config_path:
             try:
                 self.llm = LLMClient(config_path=config_path)
-                if not self.llm.api_key:
-                    logger.warning("QualityValidator: LLM API Key 未配置，降级为纯规则验证")
+                if not self.llm.available:
+                    logger.warning(
+                        "QualityValidator: LLM 不可用（%s），降级为纯规则验证",
+                        getattr(self.llm, "egress_reason", "api_key 未配置"),
+                    )
                     self.llm = None
             except Exception as e:
                 logger.warning("QualityValidator: LLM 初始化失败，降级为纯规则验证: %s", e)
@@ -321,8 +324,11 @@ def build_quality_validator(config_path: Optional[str] = None) -> QualityValidat
     """
     try:
         client = LLMClient(config_path=config_path) if config_path else LLMClient()
-        if not client.api_key:
-            logger.warning("QualityValidator: API Key 未配置，降级为纯规则验证")
+        if not client.available:
+            logger.warning(
+                "QualityValidator: LLM 不可用（%s），降级为纯规则验证",
+                getattr(client, "egress_reason", "api_key 未配置"),
+            )
             return QualityValidator(None)
         return QualityValidator(client)
     except Exception as e:

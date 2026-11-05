@@ -88,6 +88,14 @@ class RedactionManifest:
         self.redacted_characters = 0
         self.file_size = 0
         self.llm_calls = 0
+        # ---- 合规审计字段（Issue P0-1 / P1-2：LLM 出网与最小化留痕）----
+        # 只记计数与策略指纹，**不记任何原文**
+        self.llm_enabled = False
+        self.llm_chars_sent = 0
+        self.llm_pre_redacted = False
+        self.llm_masked_chars = 0
+        self.llm_masked_spans = 0
+        self.llm_egress_policy = ""
 
     def add_entity(self, entity: SensitiveEntity) -> None:
         self.entities.append(entity)
@@ -143,6 +151,14 @@ class RedactionManifest:
             "redacted_characters": self.redacted_characters,
             "file_size": self.file_size,
             "llm_calls": self.llm_calls,
+            "llm_audit": {
+                "enabled": bool(self.llm_enabled),
+                "chars_sent": int(self.llm_chars_sent),
+                "pre_redacted": bool(self.llm_pre_redacted),
+                "masked_chars": int(self.llm_masked_chars),
+                "masked_spans": int(self.llm_masked_spans),
+                "egress_policy": self.llm_egress_policy,
+            },
         }
 
     def to_markdown(self) -> str:
@@ -174,6 +190,10 @@ class RedactionManifest:
             f"| 指标 | 值 |",
             f"|------|---|",
             f"| LLM 调用次数 | {self.llm_calls} |",
+            f"| LLM 层启用 | {'是' if self.llm_enabled else '否'} |",
+            f"| 送出字符数 | {self.llm_chars_sent:,} |",
+            f"| 送出前已预脱敏 | {'是' if self.llm_pre_redacted else '否'} |",
+            f"| 预脱敏遮蔽字符数 | {self.llm_masked_chars:,} |",
             f"| 图片脱敏项 | {len(self.image_items)} |",
             f"| 待人工确认 | {len(self.unresolved)} |",
             f"| 误报排除 | {len(self.rejected)} |",

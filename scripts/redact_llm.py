@@ -65,40 +65,40 @@ ENTITY_EXTRACT_PROMPT = """你是一个金融文档敏感信息识别专家。�
 # LLM 调用（轻量实现，支持 OpenAI 兼容接口）
 # ---------------------------------------------------------------------------
 
-def _call_llm(prompt: str, api_key: str, base_url: str = "https://api.openai.com") -> str:
-    """调用 OpenAI 兼容 API，返回响应文本"""
+def _call_llm(prompt: str, api_key: str, base_url: str = "") -> str:
+    """调用 OpenAI 兼容 API，返回响应文本
+
+    【合规】base_url 无公网默认值，必须显式提供，且须通过 llm_egress 守卫
+    （白名单 / 内网地址）。守卫不通过 → 直接抛错，不发起任何请求。
+    """
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY 环境变量未设置")
 
-    # 判断使用的是 OpenAI 还是兼容接口
-    if "api.openai.com" in base_url:
-        conn = http.client.HTTPSConnection("api.openai.com", timeout=30)
-        path = "/v1/chat/completions"
-        payload = json.dumps({
-            "model": "gpt-4o-mini",
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.1,
-            "max_tokens": 2048,
-        }).encode()
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
-    else:
-        # 通用 OpenAI 兼容接口（如硅基流动、火山引擎等）
-        parsed = http.client.urlparse(base_url)
-        conn = http.client.HTTPSConnection(parsed.netloc, timeout=60)
-        path = "/v1/chat/completions"
-        payload = json.dumps({
-            "model": "deepseek-ai/DeepSeek-V2.5",
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.1,
-            "max_tokens": 2048,
-        }).encode()
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
+    from llm_egress import check_egress
+
+    allowed_hosts = os.environ.get("LLM_ALLOWED_HOSTS", "")
+    allowed = [h.strip() for h in allowed_hosts.split(",") if h.strip()]
+    require_private = os.environ.get("LLM_REQUIRE_PRIVATE_NETWORK", "1") != "0"
+
+    ok, reason = check_egress(base_url, allowed, require_private)
+    if not ok:
+        raise RuntimeError(f"LLM 出网被端点守卫阻断：{reason}")
+
+    parsed = http.client.urlparse(base_url)
+    conn = http.client.HTTPSConnection(parsed.netloc, timeout=60) \
+        if parsed.scheme == "https" \
+        else http.client.HTTPConnection(parsed.netloc, timeout=60)
+    path = "/v1/chat/completions"
+    payload = json.dumps({
+        "model": os.environ.get("LLM_MODEL", "local-model"),
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.1,
+        "max_tokens": 2048,
+    }).encode()
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
 
     conn.request("POST", path, body=payload, headers=headers)
     resp = conn.getresponse()
@@ -147,7 +147,14 @@ class LLMRedactor:
 
     def __init__(self, api_key: Optional[str] = None, base_url: Optional[str] = None):
         self.api_key = api_key or os.environ.get("OPENAI_API_KEY") or os.environ.get("LLM_API_KEY")
-        self.base_url = base_url or os.environ.get("LLM_BASE_URL", "https://api.openai.com")
+        # 【合规】base_url 无公网默认值，必须显式配置（环境变量或构造参数）
+        self.base_url = base_url or os.environ.get("LLM_BASE_URL", "")
+        if not self.base_url:
+            raise RuntimeError(
+                "未配置 LLM_BASE_URL（无公网默认值）。"
+                "请指向企业内网推理网关地址，"
+                "并按需设置 LLM_ALLOWED_HOSTS / LLM_REQUIRE_PRIVATE_NETWORK"
+            )
         if not self.api_key:
             raise RuntimeError(
                 "请设置 OPENAI_API_KEY 或 LLM_API_KEY 环境变量，"

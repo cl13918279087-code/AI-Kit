@@ -37,6 +37,51 @@ from common_rules import (
     GRAY_CONFIDENCE_THRESHOLD, is_gray_entity, load_agent_decisions,
     classify_hit_channel, find_entity_span, CHANNEL_UNKNOWN
 )
+from workdir import (
+    WORK_DIR_NAME, work_dir as _work_dir,
+    write_secure_json as _write_secure_json,
+    fingerprint as _fingerprint,
+    cleanup_work_files,
+)
+import llm_egress
+
+
+# ---------------------------------------------------------------------------
+# 受控工作目录（合规：敏感中间产物不再散落系统临时目录）
+# ---------------------------------------------------------------------------
+# 具体实现见 scripts/workdir.py：统一 <基准目录>/.redact_work/，
+# 目录 0700 / 文件 0600，任务结束由 main() 的 finally 清理。
+
+
+def _resolve_base_dir(input_path: str = None, output_path: str = None) -> str:
+    """选择受控工作目录的基准目录：输出目录优先，其次输入目录。"""
+    if output_path:
+        return str(Path(output_path).resolve().parent)
+    if input_path:
+        return str(Path(input_path).resolve().parent)
+    return tempfile.gettempdir()
+
+
+# ---------------------------------------------------------------------------
+# 运行时 LLM 状态（供 manifest 审计留痕）
+# ---------------------------------------------------------------------------
+# 具体状态存储见 llm_egress.record_runtime / get_runtime，
+# 只记状态与计数，绝不含原文。
+
+
+def record_llm_runtime(detector=None) -> None:
+    """记录本次运行的 LLM 状态（供审计留痕）。
+
+    detector 为 None 或其 llm 为 None（LLM 不可用）时，enabled 置 False。
+    """
+    llm = getattr(detector, "llm", None) if detector is not None else None
+    if llm is None:
+        llm_egress.record_runtime(enabled=False)
+        return
+    llm_egress.record_runtime(
+        enabled=True,
+        egress_policy=getattr(llm, "egress_reason", "") or "",
+    )
 
 
 def _find_span(text: str, snippet: str, start_hint=None, end_hint=None):
@@ -157,6 +202,17 @@ def detect_gray_entities(input_path: str, output_json: str = None,
     manifest = detector.detect(text)
     manifest.filename = p.name
 
+    # 【合规】记录 LLM 运行时状态（审计留痕，不含原文）
+    record_llm_runtime(detector)
+    llm_egress.record_runtime(
+        enabled=bool(getattr(manifest, "llm_enabled", False)),
+        chars_sent=int(getattr(manifest, "llm_chars_sent", 0)),
+        pre_redacted=bool(getattr(manifest, "llm_pre_redacted", False)),
+        masked_chars=int(getattr(manifest, "llm_masked_chars", 0)),
+        masked_spans=int(getattr(manifest, "llm_masked_spans", 0)),
+        egress_policy=getattr(manifest, "llm_egress_policy", "") or "",
+    )
+
     green = []
     gray = []
 
@@ -189,18 +245,19 @@ def detect_gray_entities(input_path: str, output_json: str = None,
     if output_json:
         gray_detail_path = output_json
     else:
-        gray_detail_path = str(Path(tempfile.gettempdir()) / f"redact_gray_{os.getpid()}.json")
+        # 【合规】写入受控工作目录（0700/0600），不再散落系统临时目录
+        gray_detail_path = str(_work_dir(_resolve_base_dir(input_path=str(p)))
+                               / f"redact_gray_{os.getpid()}.json")
 
-    with open(gray_detail_path, "w", encoding="utf-8") as f:
-        json.dump({
-            "file": str(p),
-            "threshold": GRAY_CONFIDENCE_THRESHOLD,
-            "total": len(green) + len(gray),
-            "green_count": len(green),
-            "gray_count": len(gray),
-            "green": green,
-            "gray": gray,
-        }, f, ensure_ascii=False, indent=2)
+    _write_secure_json(gray_detail_path, {
+        "file": str(p),
+        "threshold": GRAY_CONFIDENCE_THRESHOLD,
+        "total": len(green) + len(gray),
+        "green_count": len(green),
+        "gray_count": len(gray),
+        "green": green,
+        "gray": gray,
+    })
 
     print(f"[灰区] 已写入: {gray_detail_path}")
     if not quiet:
@@ -243,12 +300,16 @@ def export_auto_gray_decisions(input_path: str, output_path: str = None) -> Opti
         base = Path(output_path)
         pending_path = str(base.with_name(base.stem + "_decisions_pending.json"))
     else:
-        pending_path = str(Path(tempfile.gettempdir()) / f"decisions_pending_{os.getpid()}.json")
+        # 【合规】写入受控工作目录（0700/0600）
+        pending_path = str(_work_dir(str(Path(input_path).resolve().parent))
+                           / f"decisions_pending_{os.getpid()}.json")
 
     pending = []
     for e in result.get("gray", []):
         pending.append({
             "text": e.get("text", ""),
+            # 【合规】不可逆指纹，供审计以非明文方式关联
+            "fingerprint": _fingerprint(e.get("text", "")),
             "decision": "redact",          # 自动裁决：灰区一律遮盖
             "confidence": e.get("confidence"),
             "category": e.get("category"),
@@ -261,14 +322,13 @@ def export_auto_gray_decisions(input_path: str, output_path: str = None) -> Opti
         })
 
     try:
-        with open(pending_path, "w", encoding="utf-8") as f:
-            json.dump({
-                "file": str(Path(input_path).resolve()),
-                "threshold": GRAY_CONFIDENCE_THRESHOLD,
-                "mode": "auto-gray",
-                "gray_count": len(pending),
-                "pending": pending,
-            }, f, ensure_ascii=False, indent=2)
+        _write_secure_json(pending_path, {
+            "file": str(Path(input_path).resolve()),
+            "threshold": GRAY_CONFIDENCE_THRESHOLD,
+            "mode": "auto-gray",
+            "gray_count": len(pending),
+            "pending": pending,
+        })
         print(f"[留痕] 灰区自动裁决已写入: {pending_path}")
         return pending_path
     except OSError as e:
@@ -297,10 +357,12 @@ def apply_agent_decisions(input_path: str, decisions_path: str) -> None:
     redact_set = {t for t, d in decisions.items() if d == "redact"}
     print(f"[决策] 跳过 {len(skip_set)} 个实体，追加遮盖 {len(redact_set)} 个实体")
 
-    # 将追加遮盖实体写入 manifest_override 临时文件，供 handler 读取
-    override_path = Path(tempfile.gettempdir()) / f"redact_override_{os.getpid()}.json"
-    with open(override_path, "w", encoding="utf-8") as f:
-        json.dump({"skip": list(skip_set), "redact": list(redact_set)}, f, ensure_ascii=False)
+    # 将追加遮盖实体写入受控工作目录的 override 文件，供 handler 读取
+    # 【合规】写入受控目录（0700/0600），并在任务结束后清理（见 main 的 finally）
+    base_dir = _resolve_base_dir(input_path=input_path)
+    override_path = _work_dir(base_dir) / f"redact_override_{os.getpid()}.json"
+    _write_secure_json(str(override_path),
+                       {"skip": list(skip_set), "redact": list(redact_set)})
 
     return str(override_path)
 
@@ -358,6 +420,14 @@ def write_redaction_manifest(output_path: str, counts: dict = None,
         m.stats["mode"] = mode
         m.stats["source_file"] = str(source_path)
         m.add_decisions(decisions or [])
+        # 【合规】LLM 审计字段随 manifest 归档（只记状态与计数，不含原文）
+        rt = llm_egress.get_runtime()
+        m.llm_enabled = rt["enabled"]
+        m.llm_chars_sent = rt["chars_sent"]
+        m.llm_pre_redacted = rt["pre_redacted"]
+        m.llm_masked_chars = rt["masked_chars"]
+        m.llm_masked_spans = rt["masked_spans"]
+        m.llm_egress_policy = rt["egress_policy"]
         json_path = str(out) + "_manifest.json"
         m.save_json(json_path)
         m.save_markdown(str(out) + "_manifest.md")
@@ -520,16 +590,20 @@ def main():
             print("[错误] --agent-decisions 仅支持单文件", file=sys.stderr)
             sys.exit(1)
         override_path = apply_agent_decisions(files[0], agent_decisions)
-        # 正常执行，handlers 会读取 override_path
-        counts = redact_file(files[0], output, method, manifest_override=override_path)
-        # Issue #54 D1：裁决记录随 manifest.json 归档（合规留痕）
-        write_redaction_manifest(
-            _resolve_output_path(files[0], output),
-            counts=counts,
-            decisions=read_decision_records(agent_decisions),
-            source_path=files[0],
-            mode="agent-decisions",
-        )
+        try:
+            # 正常执行，handlers 会读取 override_path
+            counts = redact_file(files[0], output, method, manifest_override=override_path)
+            # Issue #54 D1：裁决记录随 manifest.json 归档（合规留痕）
+            write_redaction_manifest(
+                _resolve_output_path(files[0], output),
+                counts=counts,
+                decisions=read_decision_records(agent_decisions),
+                source_path=files[0],
+                mode="agent-decisions",
+            )
+        finally:
+            # 【合规】override 文件含实体原文，任务结束即清理（异常路径亦清理）
+            cleanup_work_files(override_path)
         sys.exit(0)
 
     # 默认：纯自动化（灰区直接遮盖，不交 Agent）

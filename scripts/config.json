@@ -11208,5 +11208,17 @@
   "common_name_dict_file": "scripts/data/common_name_dict.txt",
   "standalone_exempt_words": [
     "叶子"
-  ]
+  ],
+  "llm": {
+    "enabled": false,
+    "provider": "openai-compatible",
+    "model": "",
+    "base_url": "",
+    "api_key": "",
+    "allowed_hosts": [],
+    "require_private_network": true,
+    "timeout": 120,
+    "max_retries": 3,
+    "pre_redact_before_llm": true
+  }
 }

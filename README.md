@@ -125,10 +125,15 @@ python3 pipeline.py ./docs -t all -o ./output --overwrite
 ```json
 {
   "llm": {
-    "provider": "minimax",
-    "model": "MiniMax-Text-01",
+    "enabled": false,
+    "provider": "openai-compatible",
+    "model": "内网推理网关模型名",
+    "base_url": "http://llm-gateway.intranet.corp/v1",
     "api_key": "***",
-    "timeout": 300
+    "allowed_hosts": ["llm-gateway.intranet.corp"],
+    "require_private_network": true,
+    "timeout": 300,
+    "pre_redact_before_llm": true
   },
   "replacement": {
     "NAME": "XXX",
@@ -147,6 +152,12 @@ python3 pipeline.py ./docs -t all -o ./output --overwrite
 ```
 
 > ⚠️ **重要**：`llm_client.py` 的 HTTP timeout 控制在 `config.json` 的 `timeout` 字段，**不是** `openclaw.json` 的 `timeoutSeconds`。
+
+> 🔒 **重要（合规）**：LLM 通道**默认关闭**且**无公网默认端点**。启用前须确认三点：
+> ① `base_url` 指向企业**内网**推理网关（或已加入 `allowed_hosts` 白名单）；
+> ② 送 LLM 前已启用 `pre_redact_before_llm`（身份证/银行卡/手机/固话/邮箱等唯一标识做等长掩码）；
+> ③ 运行后检查 manifest 的 `llm_audit` 段留痕。
+> 出网守卫判定：`scripts/llm_egress.py`，详见 `docs/技术架构文档.md` §6.2–6.4。
 
 ## OpenClaw Skill 使用
 

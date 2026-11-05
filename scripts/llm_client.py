@@ -15,6 +15,8 @@ from pathlib import Path
 
 import requests
 
+from llm_egress import check_egress, describe_policy
+
 logger = logging.getLogger("llm_client")
 
 
@@ -30,7 +32,11 @@ class LLMResponse:
 class LLMClient:
     """
     多模型 LLM 客户端（配置驱动）
-    支持 minimax / openai / zhipu 等 provider
+
+    【出网守卫】本客户端的 base_url **无公网默认值**，必须显式配置，
+    且须通过 llm_egress.check_egress() 校验（白名单 / 内网地址）。
+    未配置或校验不通过 → self.available=False，调用方降级纯规则检测，
+    绝不发起任何外网请求。详见 llm_egress.py 与 config.json 的 llm 段。
     """
 
     def __init__(self, config_path: Optional[str] = None):
@@ -50,9 +56,10 @@ class LLMClient:
                 self.cfg = {}
 
         llm_cfg = self.cfg.get("llm", {})
-        self.provider = llm_cfg.get("provider", "minimax")
-        self.model = llm_cfg.get("model", "MiniMax-Text-01")
-        self.base_url = llm_cfg.get("base_url", "https://api.minimaxi.com/v1").rstrip("/")
+        self.provider = llm_cfg.get("provider", "openai-compatible")
+        self.model = llm_cfg.get("model", "")
+        # 【合规】无公网默认值——base_url 必须显式配置
+        self.base_url = str(llm_cfg.get("base_url", "") or "").rstrip("/")
         api_key = llm_cfg.get("api_key", "")
         if api_key and api_key.startswith("${"):
             import os
@@ -63,14 +70,34 @@ class LLMClient:
         self.max_retries = llm_cfg.get("max_retries", 3)
         self.fallback_models = llm_cfg.get("fallback_models", [])
 
+        # ---- 出网守卫 ----
+        self.enabled = bool(llm_cfg.get("enabled", False))
+        self.allowed_hosts = list(llm_cfg.get("allowed_hosts", []) or [])
+        self.require_private_network = bool(
+            llm_cfg.get("require_private_network", True)
+        )
+        ok, reason = check_egress(
+            self.base_url,
+            self.allowed_hosts,
+            self.require_private_network,
+        )
+        self.egress_allowed = ok
+        self.egress_reason = reason
+        # 无 api_key 亦不可用（LLM 侧鉴权缺失）
+        self.available = bool(self.enabled and ok and self.api_key)
+        if not self.available:
+            if not self.enabled:
+                logger.info("LLM 层未启用（config.llm.enabled=false），降级纯规则检测")
+            elif not ok:
+                logger.warning("LLM 出网端点校验未通过，已降级纯规则检测：%s", reason)
+            else:
+                logger.warning("LLM api_key 未配置，降级纯规则检测")
+
     @property
     def headers(self) -> Dict[str, str]:
         h = {"Content-Type": "application/json"}
-        if self.provider == "minimax":
-            h["Authorization"] = f"Bearer {self.api_key}"
-        elif self.provider == "openai":
-            h["Authorization"] = f"Bearer {self.api_key}"
-        elif self.provider == "zhipu":
+        # 内网推理网关统一走 OpenAI 兼容鉴权（Bearer）
+        if self.provider in ("minimax", "openai", "zhipu", "openai-compatible"):
             h["Authorization"] = f"Bearer {self.api_key}"
         return h
 
@@ -86,6 +113,17 @@ class LLMClient:
         """
         通用 chat 接口
         """
+        # 【合规】端点未通过守卫 / 未启用 / 无鉴权 → 直接短路，不发任何请求
+        if not self.enabled or not self.egress_allowed or not self.api_key:
+            return LLMResponse(
+                content="",
+                error=(
+                    f"LLM 调用被出网策略阻断："
+                    f"{self.egress_reason}；策略 {describe_policy(self.allowed_hosts, self.require_private_network)}"
+                ),
+                model=self.model,
+            )
+
         url = f"{self.base_url}/chat/completions"
         use_model = model or self.model
 
