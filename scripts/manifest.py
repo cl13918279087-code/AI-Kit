@@ -96,6 +96,28 @@ class RedactionManifest:
         self.llm_masked_chars = 0
         self.llm_masked_spans = 0
         self.llm_egress_policy = ""
+        # ---- 降级事件（架构评审 P0-3：降级标记贯通审计链）----
+        # 记录「有降级但产物仍成功」的失真风险，供审计追溯。
+        # 只记组件名/级别/原因/复核提示，**不含任何文档原文**。
+        self.degradations: List[Dict[str, Any]] = []
+
+    def add_degradation(self, event: Dict[str, Any]) -> None:
+        """登记一条降级事件（P0-3）。
+
+        降级事件 = 产物已生成，但保真度下降或内容可能缺失/失真，
+        必须在 manifest / 报告 / 退出码三处可见，避免「静默失真」。
+        """
+        if isinstance(event, dict):
+            self.degradations.append({
+                "component": str(event.get("component", "")),
+                "level": str(event.get("level", "info")),
+                "detail": str(event.get("detail", "")),
+                "note": str(event.get("note", "")),
+            })
+
+    def add_degradations(self, events) -> None:
+        for e in events or []:
+            self.add_degradation(e)
 
     def add_entity(self, entity: SensitiveEntity) -> None:
         self.entities.append(entity)
@@ -159,6 +181,10 @@ class RedactionManifest:
                 "masked_spans": int(self.llm_masked_spans),
                 "egress_policy": self.llm_egress_policy,
             },
+            "degradations": {
+                "count": len(self.degradations),
+                "items": [dict(d) for d in self.degradations],
+            },
         }
 
     def to_markdown(self) -> str:
@@ -200,6 +226,23 @@ class RedactionManifest:
             f"| 脱敏后字符数 | {self.redacted_characters:,} |",
             f"",
         ])
+
+        if self.degradations:
+            lines.extend([
+                f"## ⚠️ 降级产物（需人工复核）",
+                f"",
+                f"共 {len(self.degradations)} 项降级事件。降级产物**已生成**，"
+                f"但保真度下降或内容可能失真，须人工比对确认。",
+                f"",
+                f"| 级别 | 组件 | 细节 | 复核提示 |",
+                f"|------|------|------|---------|",
+            ])
+            for d in self.degradations:
+                lines.append(
+                    f"| {d.get('level', '')} | {d.get('component', '')} "
+                    f"| {d.get('detail', '')} | {d.get('note', '')} |"
+                )
+            lines.append("")
 
         if self.entities:
             lines.extend([

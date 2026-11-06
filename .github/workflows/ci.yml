@@ -1,0 +1,135 @@
+name: CI
+
+# ===========================================================================
+# 架构评审 P0-4：接入 CI 流水线
+# ---------------------------------------------------------------------------
+# 【为什么必须有这道流水线】
+# 评审实测：`git ls-files .github` → 此前仅 2 个 issue 模板，**无任何 workflow**。
+# 而 CHANGELOG.md 与 docs/贡献档案.md 多处写「CI 门禁」「CI 回归门禁」，
+# 实情是门禁以 pytest 形态存在却**无人触发**。后果：
+#   · 本项目最有价值的资产（八项指标门禁 + 283 条金标 + 1200 条真实语料零误伤
+#     基线）保护强度等于「靠人记得跑」；
+#   · 任何一次赶工期合并，误伤/漏脱回归不会被自动拦截；
+#   · 贡献档案里「门禁 8 项全 PASS」的历史记录无法复现验证。
+#
+# 【流水线分层】
+#   lint    → 语法编译（compileall），秒级，快速失败
+#   unit    → 单元/回归测试（pytest tests/）
+#   gate    → 八项指标门禁 + 真实语料零误伤（scripts/bench_metrics.py，
+#             唯一阈值源，与 quality_validator.py 同源）
+#
+# 【阈值唯一来源】
+#   门禁阈值全部取自 scripts/bench_metrics.py（Issue #54 口径），
+#   本文件**不得**硬编码任何阈值数字，避免两处口径漂移。
+# ===========================================================================
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# 并发取消：同一分支的新提交取消旧的运行，避免浪费配额
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint（语法编译）
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 编译检查（scripts/ + tests/）
+        run: |
+          python -m compileall -q scripts tests
+
+      - name: JSON 配置合法性
+        run: |
+          python - <<'PY'
+          import json, pathlib, sys
+          ok = True
+          for p in sorted(pathlib.Path(".").rglob("*.json")):
+              if ".git/" in str(p):
+                  continue
+              try:
+                  json.loads(p.read_text(encoding="utf-8"))
+              except Exception as e:
+                  ok = False
+                  print(f"[FAIL] {p}: {e}")
+          if not ok:
+              sys.exit(1)
+          print("[OK] 全部 JSON 配置可解析")
+          PY
+
+  unit:
+    name: Unit Tests（单元与回归）
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          # 门禁与规则层只需要 lxml + jieba；其余重型依赖（图像/OCR/PDF）
+          # 在缺依赖时相关用例自动 skip，不阻断本作业。
+          # requests：entity_detector → llm_client 为模块级 import，缺失会直接 ImportError。
+          pip install lxml jieba pytest python-docx requests
+
+      - name: 单元与回归测试
+        run: |
+          python -m pytest tests/ -q --ignore=tests/benchmark \
+            -p no:cacheprovider
+
+      - name: 完整测试集（含 benchmark 门禁）
+        run: |
+          python -m pytest tests/ -q -p no:cacheprovider
+
+  gate:
+    name: Gate（八项指标门禁 + 真实语料零误伤）
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install lxml jieba pytest python-docx requests
+
+      - name: 八项指标门禁（唯一阈值源 scripts/bench_metrics.py）
+        run: |
+          python scripts/bench_metrics.py
+
+      - name: 门禁指标 JSON 存档
+        if: always()
+        run: |
+          python scripts/bench_metrics.py --json > bench_metrics_report.json || true
+          cat bench_metrics_report.json
+
+      - name: 上传门禁报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-metrics-report
+          path: bench_metrics_report.json
+          if-no-files-found: ignore

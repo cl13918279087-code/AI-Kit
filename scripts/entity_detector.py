@@ -37,14 +37,38 @@ logger = logging.getLogger("entity_detector")
 #   偏移即失效，实体无法回写原文。等长掩码保证偏移语义完全不变。
 #
 # 【不遮蔽什么】
-#   银行名称 / 日期 / 金额 / 地址**不遮蔽**：它们是机构与业务上下文，
+#   银行名称 / 日期 / 金额 **不遮蔽**：它们是机构与业务上下文，
 #   LLM 判「角色词+姓名」需要这些线索；且它们由规则层确定性脱敏，
 #   不构成自然人唯一标识。若遮蔽会显著削弱人名识别准确率。
+#   注：**住址**已按内网合规口径纳入遮蔽范围（见 ADDRESS 类别），但采用
+#   「关键词前缀 + 有界长度」的窄匹配，避免把机构名、地名、金额一并吞掉。
+#
+# 【覆盖范围（合规扩展后）】
+#   唯一标识：身份证 / 邮箱 / 银行卡 / 固话 / 手机
+#   准唯一标识：银行账号（可带空格分组）、证件号码（护照/通行证/社保/公积金）
+#   准唯一标识：住址（关键词前缀限定）
+#   敏感载体：证件影像引用（身份证/护照等扫描件、正反面照片文件名）
 #
 # 【边界】
 #   掩码仅用于**送往 LLM 的副本**；原文与最终脱敏结果不受影响。
+#   所有掩码**等长**，保证 LLM 返回的字符偏移语义不变。
 
 _PREMASK_PATTERNS: List[Tuple[str, "re.Pattern"]] = [
+    # 银行账号 / 卡号：关键词 + 数字（可含空格或短横线分组）。
+    # 只掩码命名组 mask，保留「账号：」这类上下文标签，便于 LLM 理解语义。
+    # 须先于 BANK_CARD，否则纯数字账号会被 16-19 位银行卡规则吞掉。
+    # 注：分隔符字符类**不得**用 [^0-9A-Za-z]（会连中文一起吞掉，
+    #     导致掩码起点错位、上下文标签被吃掉），此处限定为空白与标点。
+    ("ACCOUNT_NO", re.compile(
+        r"(?:银行账号|银行账户|银行帐|账号|帐号|账户号|帐户号|卡号|存折号|信用卡号)"
+        r"[\s:：=＝\-]{0,4}(?P<mask>[0-9][0-9 \-]{6,28}[0-9])"
+    )),
+    # 证件号码：护照 / 通行证 / 社保 / 公积金 / 军官证 等
+    ("DOC_NO", re.compile(
+        r"(?:护照号|通行证号|港澳通行证号|台湾通行证号|军官证号|士兵证号"
+        r"|社保号|社会保障号|公积金号)"
+        r"[\s:：=＝\-]{0,4}(?P<mask>[A-Za-z0-9][A-Za-z0-9\-]{5,19}[A-Za-z0-9])"
+    )),
     # 身份证（18 位，含 X 结尾）——须先于银行卡处理，否则被 16-19 位数字规则吞掉
     ("ID_CARD", re.compile(
         r"[1-9]\d{5}(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx]"
@@ -53,8 +77,41 @@ _PREMASK_PATTERNS: List[Tuple[str, "re.Pattern"]] = [
     ("EMAIL", re.compile(
         r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}"
     )),
+    # 纯格式护照号（G/E + 8 位数字），无关键词前缀时也遮蔽
+    ("PASSPORT_NO", re.compile(r"(?<![A-Za-z0-9])[EG]\d{8}(?![A-Za-z0-9])")),
     # 银行卡（16-19 位）
     ("BANK_CARD", re.compile(r"(?<!\d)\d{16,19}(?!\d)")),
+    # 住址（强终止符型）：关键词前缀 + 到「号/室/栋/单元/楼/层/村/镇」为止。
+    # 前缀做负向断言，避免「邮箱地址 / 网址 / IP地址」被误判为住址。
+    ("ADDRESS", re.compile(
+        r"(?<!邮箱)(?<!邮件)(?<!网)(?<!IP)(?<!ip)"
+        r"(?:家庭住址|常住地址|通讯地址|联系地址|现住址|现居地址|居住地址|家庭地址"
+        r"|户籍地址|地址|住址)"
+        r"[\s:：=＝\-]{0,3}"
+        r"(?P<mask>[^\s，。；、,.;]{2,30}?"
+        r"(?:号|室|栋|单元|楼|层|村|镇))"
+    )),
+    # 住址（行政区划型）：关键词前缀 + 省/直辖市 + 市 + 区/县 链
+    ("ADDRESS", re.compile(
+        r"(?<!邮箱)(?<!邮件)(?<!网)(?<!IP)(?<!ip)"
+        r"(?:家庭住址|常住地址|通讯地址|联系地址|现住址|现居地址|居住地址|家庭地址"
+        r"|户籍地址|地址|住址)"
+        r"[\s:：=＝\-]{0,3}"
+        r"(?P<mask>[\u4e00-\u9fa5]{2,8}(?:省|自治区|特别行政区)"
+        r"[\u4e00-\u9fa5]{2,10}?(?:市|自治州)"
+        r"[\u4e00-\u9fa5]{2,10}?(?:区|县|市))"
+    )),
+    # 证件影像引用：身份证/护照等扫描件、正反面照片的文件名或引用词。
+    # 必须带「影像化限定词」或图片扩展名，否则不匹配（避免把「身份证号码」
+    # 这类纯文字表述也当影像处理）。
+    ("CERT_IMAGE", re.compile(
+        r"(?:身份证|护照|通行证|军官证|士兵证|驾驶证|行驶证|银行卡|社保卡)"
+        r"(?:正反面|复印件|扫描件|影印件|照片件|照片|图片|件图|件照|件)"
+        r"\.(?:jpg|jpeg|png|bmp|tif|tiff|pdf)"
+        r"|"
+        r"(?:身份证|护照|通行证|军官证|士兵证|驾驶证|行驶证|银行卡|社保卡)"
+        r"(?:正反面|复印件|扫描件|影印件|照片件)"
+    )),
     # 固话
     ("PHONE", re.compile(r"(?<![\d\-])\d{2,4}-\d{7,8}(?![\d\-])")),
     # 手机
@@ -78,6 +135,11 @@ def pre_redact_for_llm(text: str) -> Tuple[str, Dict[str, Any]]:
 
     返回 (掩码后文本, 统计信息)。统计信息只含类别与字符数，
     **不含任何被遮蔽的原文**，可直接写入 manifest 审计留痕。
+
+    掩码范围语义：
+      · 若正则定义了命名组 ``mask``，**只掩码该组**（保留关键词上下文，
+        如「账号：XXXXXXXX」中的「账号：」保留）；
+      · 否则掩码整个匹配片段。
     """
     stats: Dict[str, Any] = {
         "pre_redacted": False,
@@ -94,7 +156,10 @@ def pre_redact_for_llm(text: str) -> Tuple[str, Dict[str, Any]]:
 
     for category, pattern in _PREMASK_PATTERNS:
         for m in pattern.finditer(text):
-            s, e = m.start(), m.end()
+            if "mask" in (pattern.groupindex or {}):
+                s, e = m.span("mask")
+            else:
+                s, e = m.start(), m.end()
             if e <= s or _overlaps(covered, s, e):
                 continue
             covered.append((s, e))
@@ -439,8 +504,30 @@ def build_llm_detector(config_path: Optional[str] = None) -> EntityDetector:
             )
             print(f'  [DEBUG build_llm_detector] LLM unavailable: {reason}; '
                   f'returning EntityDetector(None, cfg)')
+            # 【审计链 P0-3】LLM 层降级须留痕。仅在「配置要求启用 LLM 但实际不可用」
+            # 时登记为降级事件——默认关闭 LLM 是正常口径，不是降级。
+            try:
+                import degradation
+                llm_cfg = (cfg or {}).get("llm", {}) if isinstance(cfg, dict) else {}
+                if llm_cfg.get("enabled"):
+                    degradation.record(
+                        "llm_detector", degradation.LEVEL_WARN,
+                        detail="配置要求启用 LLM，但实际降级为纯规则检测",
+                        note=str(reason)[:200],
+                    )
+            except Exception:
+                pass
             return EntityDetector(None, cfg)
         return EntityDetector(client, cfg)
     except Exception as e:
         logger.warning("LLM 检测器初始化失败，降级为纯规则检测: %s", e)
+        try:
+            import degradation
+            degradation.record(
+                "llm_detector", degradation.LEVEL_WARN,
+                detail="LLM 检测器初始化失败，降级为纯规则检测",
+                note=f"{type(e).__name__}: {str(e)[:180]}",
+            )
+        except Exception:
+            pass
         return EntityDetector(None, cfg)

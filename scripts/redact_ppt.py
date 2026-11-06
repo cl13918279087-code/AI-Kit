@@ -32,6 +32,7 @@ from common_rules import set_agent_decisions_override, _get_skip_texts
 from table_role_detector import process_ppt_slide_xml, collect_table_names
 from common_rules import inject_extra_names, clear_extra_names
 from workdir import work_dir
+import degradation
 from html import unescape as _html_unescape
 from xml.sax.saxutils import escape as _xml_escape
 
@@ -378,6 +379,13 @@ def redact_ppt_to_pptx(input_path: str, output_pptx: str) -> dict:
         # 无转换工具时直接复制（无法处理内容）
         print("  [警告] 未找到 LibreOffice，无法转换 .ppt 文件，内容跳过处理")
         shutil.copy2(input_path, output_pptx)
+        # 【审计链 P0-3】跳过内容处理属 critical 级降级：
+        # 产物等于原文件，内容未脱敏，须人工处理并在审计链留痕。
+        degradation.record(
+            "ppt_converter", degradation.LEVEL_CRITICAL,
+            detail="未找到 LibreOffice，.ppt 内容未处理",
+            note="产物等同原文件，内容未经脱敏，须人工处理",
+        )
     return {}
 
 

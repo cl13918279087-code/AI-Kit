@@ -1,5 +1,104 @@
 # Changelog
 
+## [Unreleased] - 2026-11-06（架构评审整改第三批：审计链闭环 P0-3 + CI 接入 P0-4 + 合规覆盖面扩展）
+
+### 背景
+
+架构评审（`docs/架构评审-2026-11-05.md`）第一、二批整改后仍遗留 4 项：
+**P0-3 降级标记未进审计链**、**P0-4 无 CI 流水线**、
+**预脱敏覆盖仅 5 类唯一标识**、**Agent 直处理模式端点无从验证**。
+本批次按常规工程模式（改代码 + 补测试 + 验证 + 提交）全部实施。
+
+### ① P0-3 降级标记贯通审计链
+
+- **新增降级台账 `scripts/degradation.py`**：进程内列表统一登记「有降级但产物仍生成」的
+  失真风险，三级分级（`info` / `warn` / `critical`）；登记内容**只含组件名、级别、原因与
+  复核提示，不含任何文档原文**。
+- **审计链三处贯通**：
+  - manifest（`scripts/manifest.py`）新增 `degradations` 段（`count` + `items`）
+    与 Markdown「⚠️ 降级产物」章节；
+  - 批量报告（`scripts/pipeline.py`）新增 `RedactResult.degradations` 字段与
+    「⚠️ 降级产物清单（需人工复核）」章节；
+  - 退出码（`scripts/redact_all.py`）新增 `_exit_code_for_degradations()`。
+- **登记入口**：`redact_word.py`（`.doc` 三级转换降级、人工检查项）、
+  `redact_ppt.py`（未找到 LibreOffice 直接复制原文件 → `critical`）、
+  `entity_detector.py`（配置要求启用 LLM 却实际不可用 → `warn`；默认关闭属正常口径，不登记）。
+- **跨进程约束**：`batch_process` 用 `ProcessPoolExecutor`（spawn），台账为进程内状态，
+  故在**子进程内、处理刚结束时**读取后随 `RedactResult` 回传父进程。
+
+### ② P0-4 CI 流水线接入
+
+- **新增 `.github/workflows/ci.yml`**，三层作业：
+  - `lint`：`python -m compileall -q scripts tests` + 全仓 JSON 合法性校验；
+  - `unit`：`pytest tests/ -q --ignore=tests/benchmark` → 再跑完整 `pytest tests/ -q`；
+  - `gate`：`python scripts/bench_metrics.py`（**八项门禁，唯一阈值源**）+ `--json` 存档
+    并以 artifact 上传。
+- 触发条件：`push` / `pull_request` on `main` + `workflow_dispatch`；同分支并发取消；
+  `permissions: contents: read`。
+- **阈值不硬编码**：全部取自 `scripts/bench_metrics.py`（与 `quality_validator.py` 同源），
+  避免两处口径漂移。
+- 依赖补全：`requests` 为 `entity_detector → llm_client` 的**模块级** import，
+  缺失会直接 ImportError，已补入 `pip install` 列表。
+
+### ③ 预脱敏覆盖面扩展
+
+- `scripts/entity_detector.py` 的 `_PREMASK_PATTERNS` 由 5 类扩展为：
+  - 唯一标识：身份证 / 邮箱 / 银行卡 / 固话 / 手机（原有）
+  - 准唯一标识：**银行账号与卡号**（可带空格分组）、**证件号码**（护照 / 通行证 / 社保 /
+    公积金，含纯格式护照号）、**住址**（关键词前缀限定）
+  - 敏感载体：**证件影像引用**（正反面 / 扫描件 / 复印件 / 照片 + 图片扩展名）
+- **掩码引擎支持「命名组掩码」**：只遮蔽数值部分、保留「账号：」「地址：」等上下文标签，
+  既满足最小化又不破坏 LLM 的语义理解。
+- 住址采用**关键词前缀限定**（住址 / 通讯地址 / 户籍地址 …），避免误伤机构地址与正文地名；
+  「邮箱地址 / 网址 / IP地址」有负向断言排除。
+
+### ④ Agent 直处理模式端点管控
+
+- **新增 `scripts/endpoint_check.py`**：**只读、不发任何网络请求**，复用
+  `llm_egress.check_egress()`，保证「自检口径」与「实际守卫口径」永不漂移；
+  退出码 `0` 全部合规 / `2` 存在不合规端点 / `3` 参数或配置错误；支持 `--json` 输出
+  供内网合规扫描与流水线调用。
+- `SKILL.md` 第五节-A 新增 **Step 0 · LLM 端点合规自检（内网部署必做）**。
+
+### 顺带修复的两处真实缺陷（实测发现）
+
+1. **`.doc` 路径 TypeError 崩溃**：`redact_doc_to_docx()` 把 `doc_converter`（str）、
+   `degraded_level`、`degraded_note` 直接塞进 counts 字典，`redact_word()` 随后
+   `sum(counts.values())` 抛 `TypeError: unsupported operand type(s) for +: 'int' and 'str'`。
+   修复：统计字典只保留 int 值（`{k: v for k, v in raw.items() if isinstance(v, int)}`），
+   元数据改由降级台账承载。
+2. **失败被降级掩盖**：`.doc` 转换全链失败属**失败**（R-④ 契约：拒绝生成输出文件），
+   但失败路径同样登记了 `manual_check` 降级事件，导致退出码被判为 2（降级）而非 1（失败）。
+   修复：新增 `_LAST_FILE_FAILED` 标志，**失败优先于降级**；批量场景另增
+   `_ALL_DEGRADATIONS` 累计列表，避免退出码只反映最后一个文件。
+
+### 文档同步
+
+- `docs/架构评审-2026-11-05.md`：新增 §五之四「修复记录（第三批）」，含四项整改明细、
+  两处顺带修复的缺陷分析、验证结果；§一 P0-3 / P0-4 标记已闭环；§五之三遗留项更新。
+- `docs/技术架构文档.md`：§6.3 预脱敏覆盖范围改写、新增 §6.3.1「Agent 直处理模式的端点
+  合规自检」；§八 新增 §8.4「降级台账与审计链」与 §8.5「CI 门禁」。
+- `README.md`：新增「退出码与降级产物」「CI 门禁」两节，补 Agent 端点自检用法与项目结构。
+- `SKILL.md`：第五节-A 新增 Step 0 端点自检；Step 2A 掩码范围更新为扩展后的分类表。
+
+### 验证
+
+- 新增 `tests/test_degradation_audit.py`：**31 项全 PASS**（台账登记/清空/分级/摘要、
+  manifest 序列化与 Markdown 章节、批量报告降级章节、退出码 0/1/2 语义、
+  `.doc` counts 与元数据分离、预脱敏新类别/等长/偏移/上下文保留、端点自检四类判定）。
+- 全量回归：**346 passed / 1 skipped / 1 xfailed / 1 xpassed**，零失败（272s；
+  较上一批 310 增 36 项）。
+- 门禁八项 `bench_metrics.py`：**全 PASS**（recall 283/283、precision 99.9%、
+  真实语料误伤 0/1200、歧义集 13/13、确定性/幂等 100%）。
+- CI workflow YAML 经 `yaml.safe_load` 解析通过，三个 job 结构正确。
+- **未改动任何脱敏规则**，金标与真实语料基线零劣化。
+
+### 说明
+
+- 沙箱环境下 pytest 内置 `tmp_path` fixture 不可用（basetemp 创建报 `EEXIST`），
+  致 `test_pipeline_status_consistency` / `test_full_name_list_perf` 共 12 项 ERROR；
+  指定 `--basetemp` 后全绿；**改动前基线同样如此**，与本批次无关，CI 全新容器不受影响。
+
 ## [Unreleased] - 2026-11-06（架构评审整改第二批：LLM 层合规收口 P0-1 + 中间产物受控 P1-2）
 
 ### 背景

@@ -160,6 +160,29 @@ python3 scripts/redact_image.py <输入文件路径> [输出文件路径]
 
 **处理流程**：
 
+**Step 0 - LLM 端点合规自检（内网部署必做）**
+
+> **为什么必做**：脚本侧的出网守卫（`scripts/llm_egress.py`）只管得住**脚本自带**
+> 的 LLM 客户端通道；本模式用的是 **Agent 侧配置的 LLM 端点**，不在仓库守卫管辖内。
+> 若不校验，端点是否落在内网只能靠口头承诺——这是投产合规上的实质空洞。
+
+在首次使用本模式前（或每次更换 Agent 端点后），执行：
+
+```bash
+# 校验 Agent 实际使用的 LLM 端点（可重复传入多个）
+python3 scripts/endpoint_check.py \
+    --base-url https://llm-gw.corp.bank.local/v1
+
+# 内网合规扫描用（机器可读）
+python3 scripts/endpoint_check.py --base-url https://llm-gw.corp.bank.local/v1 --json
+```
+
+- 判定口径与脚本侧守卫**同源**（复用 `llm_egress.check_egress`）：scheme 须为
+  http/https，且 host 命中 `allowed_hosts` 白名单**或**为内网地址（私网 IP /
+  localhost / `.internal` / `.lan` / `.corp` 等）。
+- 退出码：`0` = 全部合规；`2` = 存在不合规端点；`3` = 参数/配置错误。
+- **不合规即不得使用本模式处理生产文档**，须先改端点或补白名单。
+
 **Step 1 - 提取文档文本**
 用 Read 工具读取上传的文档内容（Word/PDF/Excel 等）。
 对于 .docx / .pptx / .xlsx：先用 zipfile + lxml 提取纯文本。
@@ -169,8 +192,8 @@ python3 scripts/redact_image.py <输入文件路径> [输出文件路径]
 **Step 2 - LLM 实体识别（⚠️ 必须先做 2A 最小化预脱敏）**
 
 > **合规前置**：把原文直接送 LLM 会让个人唯一标识（身份证 / 银行卡 / 手机 /
-> 固话 / 邮箱）一并进入 LLM 上下文。Agent 直处理模式下同样须先执行 **Step 2A**，
-> 只把掩码后的文本送 LLM。
+> 固话 / 邮箱 / 账号 / 证件号 / 住址）一并进入 LLM 上下文。Agent 直处理模式下
+> 同样须先执行 **Step 2A**，只把掩码后的文本送 LLM。
 
 **Step 2A - 最小化预脱敏（必做）**
 
@@ -181,8 +204,15 @@ python3 scripts/redact_image.py <输入文件路径> [输出文件路径]
 python3 scripts/llm_premask.py --file extracted.txt --out masked.txt --stats
 ```
 
-- 掩码范围：**身份证 / 银行卡 / 手机 / 固话 / 邮箱** → 全角 `Ｘ`
+- 掩码范围（等长全角 `Ｘ`）：
+  | 类别 | 覆盖内容 |
+  |------|---------|
+  | 唯一标识 | 身份证 / 邮箱 / 银行卡 / 固话 / 手机 |
+  | 准唯一标识 | 银行账号与卡号（可带空格分组）/ 证件号码（护照 / 通行证 / 社保 / 公积金）/ 住址（关键词前缀限定） |
+  | 敏感载体 | 证件影像引用（身份证正反面 / 扫描件 / 复印件等） |
 - **等长替换**：字符长度与偏移不变，LLM 返回的 `start/end` 仍能准确回写原文
+- **上下文标签保留**：账号 / 证件号 / 住址等采用「只遮蔽数值部分」策略，
+  「账号：」「地址：」等标签保留，便于 LLM 理解语义
 - 统计信息只含类别与字符数，**不含任何被遮蔽的原文**，可直接写入交付说明
 - 该掩码**只作用于送往 LLM 的副本**，原始文档与最终脱敏结果不受影响
 
@@ -225,6 +255,7 @@ python3 scripts/llm_premask.py --file extracted.txt --out masked.txt --stats
 
 **注意事项**：
 - **先掩码后送 LLM**（Step 2A 必做），不要把含个人唯一标识的原文直接送 LLM
+- **先自检端点**（Step 0 必做），确认 Agent 侧 LLM 端点在内网或白名单内
 - LLM 识别分段处理，每段不超过 3000 字
 - 优先处理含角色词（负责人、联系人、行长等）的段落
 - 宁可漏脱，不可误脱——对不确定的文本跳过

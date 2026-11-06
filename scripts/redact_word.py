@@ -36,6 +36,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from common_rules import apply_redactions, protect_iso_datetimes, restore_iso_datetimes, find_libreoffice, redact_filename_stem, load_agent_decisions
 from entity_detector import build_llm_detector
 from workdir import work_dir
+import degradation
 
 _llm_logger = _logging.getLogger("redact_word.llm")
 
@@ -514,6 +515,12 @@ _MANUAL_CHECK_ITEMS: list = []
 def _mark_manual_check(item: str, reason: str) -> None:
     """记录一项需人工检查的媒体/处理异常。"""
     _MANUAL_CHECK_ITEMS.append((item, reason))
+    # 【审计链 P0-3】人工检查项同步登记为降级事件，
+    # 使其进入 manifest / 批量报告 / 退出码三处审计链。
+    degradation.record(
+        "manual_check", degradation.LEVEL_WARN,
+        detail=str(item)[:80], note=str(reason)[:200],
+    )
     print(f"  [人工检查] {item}: {reason}", file=sys.stderr)
 
 
@@ -1623,6 +1630,14 @@ def redact_doc_to_docx(input_path: str, output_docx: str, detector=None) -> dict
                     f".doc 经 {degraded} 转换，格式/表格结构可能丢失，"
                     f"需人工比对确认脱敏完整。"
                 )
+                # 【审计链 P0-3】降级事件统一登记，确保 manifest / 报告 / 退出码三处可见
+                degradation.record(
+                    "doc_converter",
+                    degradation.LEVEL_CRITICAL if degraded == "antiword"
+                    else degradation.LEVEL_WARN,
+                    detail=used_converter,
+                    note=result.get("degraded_note", ""),
+                )
         return result
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -1667,7 +1682,11 @@ def redact_word(input_path: str, output_path: str = None,
         tmp_docx = str(work_dir(str(Path(output_path).resolve().parent))
                         / f"_tmp_{Path(input_path).stem}.docx")
         try:
-            counts = redact_doc_to_docx(input_path, tmp_docx, detector=detector)
+            raw = redact_doc_to_docx(input_path, tmp_docx, detector=detector)
+            # 【审计链 P0-3】转换元数据（doc_converter / degraded_level / degraded_note）
+            # 不得混入统计字典——否则 sum(counts.values()) 会因字符串值抛 TypeError，
+            # 且统计口径失真。降级信息已登记到 degradation 台账，此处仅剥离。
+            counts = {k: v for k, v in raw.items() if isinstance(v, int)}
             # R-⑥连带修复（v1.3.5）：a6aab58 重构 try/except 时丢失 os.replace，
             # 致 v1.3.2~v1.3.4 的 .doc 产物滞留 /tmp/_tmp_*.docx、声明的输出路径
             # 从未生成（门禁 G5 实测坐实）。转换+脱敏成功即落盘（含零命中场景）。

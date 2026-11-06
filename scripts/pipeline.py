@@ -150,6 +150,8 @@ class RedactResult:
     manifest_path: str = ""
     # 分层阶段明细（从 redaction_engine.py 的 StageResult 复用）
     stages: List[Dict[str, Any]] = field(default_factory=list)   # [(stage, status, duration_ms, ...), ...]
+    # 降级事件（架构评审 P0-3）：产物已生成，但保真度下降/内容可能失真
+    degradations: List[Dict[str, Any]] = field(default_factory=list)
 
     # -- 终态判定（统一口径，勿再直接比较字符串字面量）--------------------
 
@@ -164,6 +166,11 @@ class RedactResult:
     @property
     def is_skipped(self) -> bool:
         return is_skipped_status(self.status)
+
+    @property
+    def is_degraded(self) -> bool:
+        """本文件是否发生过降级（降级 ≠ 失败，但须人工复核）。"""
+        return bool(self.degradations)
 
 
 # ---------------------------------------------------------------------------
@@ -260,6 +267,7 @@ def process_single_file(args: Tuple[str, str, str, bool]) -> RedactResult:
             )
 
         entities_count = result.get("entities_count", 0)
+        degradations = result.get("degradations", []) or []
         stages.append({
             "stage": "detecting",
             "status": STATUS_COMPLETE,
@@ -293,6 +301,7 @@ def process_single_file(args: Tuple[str, str, str, bool]) -> RedactResult:
             file_size=file_size,
             manifest_path=manifest_path,
             stages=stages,
+            degradations=degradations,
         )
 
     except Exception as e:
@@ -315,32 +324,47 @@ def process_single_file(args: Tuple[str, str, str, bool]) -> RedactResult:
 
 def _process_word(input_path: str, output_path: str) -> Dict[str, Any]:
     from redact_word import redact_word
+    import degradation
+    degradation.clear_degradations()
     manifest = redact_word(input_path, output_path)
-    return {"entities_count": sum(manifest.values())}
+    return {"entities_count": sum(v for v in manifest.values() if isinstance(v, int)),
+            "degradations": degradation.get_degradations()}
 
 
 def _process_excel(input_path: str, output_path: str) -> Dict[str, Any]:
     from redact_excel import redact_excel
+    import degradation
+    degradation.clear_degradations()
     manifest = redact_excel(input_path, output_path)
-    return {"entities_count": sum(manifest.values())}
+    return {"entities_count": sum(v for v in manifest.values() if isinstance(v, int)),
+            "degradations": degradation.get_degradations()}
 
 
 def _process_ppt(input_path: str, output_path: str) -> Dict[str, Any]:
     from redact_ppt import redact_ppt
+    import degradation
+    degradation.clear_degradations()
     manifest = redact_ppt(input_path, output_path)
-    return {"entities_count": sum(manifest.values())}
+    return {"entities_count": sum(v for v in manifest.values() if isinstance(v, int)),
+            "degradations": degradation.get_degradations()}
 
 
 def _process_pdf(input_path: str, output_path: str) -> Dict[str, Any]:
     from redact_pdf import redact_pdf
+    import degradation
+    degradation.clear_degradations()
     manifest = redact_pdf(input_path, output_path)
-    return {"entities_count": sum(manifest.values())}
+    return {"entities_count": sum(v for v in manifest.values() if isinstance(v, int)),
+            "degradations": degradation.get_degradations()}
 
 
 def _process_image(input_path: str, output_path: str) -> Dict[str, Any]:
     from redact_image import redact_image
+    import degradation
+    degradation.clear_degradations()
     manifest = redact_image(input_path, output_path)
-    return {"entities_count": sum(manifest.values())}
+    return {"entities_count": sum(v for v in manifest.values() if isinstance(v, int)),
+            "degradations": degradation.get_degradations()}
 
 
 # ---------------------------------------------------------------------------
@@ -468,6 +492,7 @@ def generate_markdown_report(
     success = [r for r in results if is_success_status(r.status)]
     failed = [r for r in results if is_failed_status(r.status)]
     skipped = [r for r in results if is_skipped_status(r.status)]
+    degraded = [r for r in results if r.degradations]
 
     total_duration = sum(r.duration_ms for r in results)
     total_entities = sum(r.entities_count for r in success)
@@ -488,7 +513,8 @@ def generate_markdown_report(
         f"",
         f"**生成时间**: {timestamp}",
         f"**处理文件数**: {len(results)}",
-        f"**成功**: {len(success)} | **失败**: {len(failed)} | **跳过**: {len(skipped)}",
+        f"**成功**: {len(success)} | **失败**: {len(failed)} | **跳过**: {len(skipped)}"
+        + (f" | **降级**: {len(degraded)}" if degraded else ""),
         f"",
         f"---",
         f"",
@@ -500,6 +526,7 @@ def generate_markdown_report(
         f"| ✅ 成功 | {len(success)} |",
         f"| ❌ 失败 | {len(failed)} |",
         f"| ⏭️ 跳过 | {len(skipped)} |",
+        f"| ⚠️ 降级 | {len(degraded)} |",
         f"| 总耗时 | {total_duration/1000:.1f} 秒 |",
         f"| 检测敏感项总数 | {total_entities} |",
         f"| 输入文件总大小 | {_format_size(total_size)} |",
@@ -553,6 +580,31 @@ def generate_markdown_report(
         ])
         for r in skipped:
             lines.append(f"- `{Path(r.input_path).name}` — {r.error}")
+
+    # 【审计链 P0-3】降级产物清单：产物已生成但保真度下降/内容可能失真，
+    # 必须显式列出，避免「静默失真」被当作正常产物归档。
+    if degraded:
+        lines.extend([
+            f"",
+            f"## ⚠️ 降级产物清单（需人工复核）",
+            f"",
+            f"共 {len(degraded)} 个文件在脱敏过程中发生降级。降级产物**已生成**，"
+            f"但保真度下降或内容可能失真（如 `.doc` 经备用转换器转换后表格结构丢失），"
+            f"须人工比对确认脱敏完整后再归档。",
+            f"",
+            f"| # | 文件名 | 级别 | 组件 | 细节 | 复核提示 |",
+            f"|---|--------|------|------|------|---------|",
+        ])
+        row = 0
+        for r in degraded:
+            for d in r.degradations:
+                row += 1
+                lines.append(
+                    f"| {row} | `{Path(r.input_path).name}` "
+                    f"| {d.get('level', '')} | {d.get('component', '')} "
+                    f"| {d.get('detail', '')} | {d.get('note', '')} |"
+                )
+        lines.append("")
 
     lines.extend([
         f"",
@@ -664,12 +716,27 @@ def main():
     success = [r for r in results if is_success_status(r.status)]
     failed = [r for r in results if is_failed_status(r.status)]
     skipped = [r for r in results if is_skipped_status(r.status)]
+    degraded = [r for r in results if r.degradations]
     total_time = time.time() - start_time
 
     print("\n" + "=" * 60)
-    print(f"  脱敏完成  —  ✅{len(success)}  ❌{len(failed)}  ⏭️{len(skipped)}  ⏱️{total_time:.1f}s")
+    print(f"  脱敏完成  —  ✅{len(success)}  ❌{len(failed)}  ⏭️{len(skipped)}"
+          + (f"  ⚠️{len(degraded)}" if degraded else "")
+          + f"  ⏱️{total_time:.1f}s")
     print(f"  报告: {report_path}")
+    if degraded:
+        print(f"  ⚠️ 存在 {len(degraded)} 个降级产物（保真度下降/内容可能失真）"
+              f"，详见报告「降级产物清单」章节，须人工复核后再归档")
     print("=" * 60)
+
+    # 【审计链 P0-3】退出码体现降级：降级产物以成功状态返回会让调度侧无从感知。
+    #   0 = 全部成功且无降级
+    #   1 = 存在失败文件
+    #   2 = 无失败，但存在降级产物（须人工复核）
+    if failed:
+        sys.exit(1)
+    if degraded:
+        sys.exit(2)
 
 
 if __name__ == "__main__":

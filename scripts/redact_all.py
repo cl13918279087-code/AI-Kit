@@ -44,6 +44,7 @@ from workdir import (
     cleanup_work_files,
 )
 import llm_egress
+import degradation
 
 
 # ---------------------------------------------------------------------------
@@ -428,6 +429,8 @@ def write_redaction_manifest(output_path: str, counts: dict = None,
         m.llm_masked_chars = rt["masked_chars"]
         m.llm_masked_spans = rt["masked_spans"]
         m.llm_egress_policy = rt["egress_policy"]
+        # 【审计链 P0-3】降级事件随 manifest 归档（只有降级信息，无原文）
+        m.add_degradations(degradation.get_degradations())
         json_path = str(out) + "_manifest.json"
         m.save_json(json_path)
         m.save_markdown(str(out) + "_manifest.md")
@@ -441,6 +444,18 @@ def write_redaction_manifest(output_path: str, counts: dict = None,
 # ---------------------------------------------------------------------------
 # 批量脱敏（支持 glob 模式）
 # ---------------------------------------------------------------------------
+
+#: 本次运行中是否有文件**处理失败**（失败 ≠ 降级）。
+#: 失败意味着**没有产物**，必须以退出码 1 呈现；
+#: 降级意味着**有产物但保真度下降**，以退出码 2 呈现。
+#: 两者同时发生时，失败优先（无产物比有次品更需要立即介入）。
+_LAST_FILE_FAILED = False
+
+#: 本次运行累计的全部降级事件（跨文件）。
+#: 台账本身是「每文件清空」的进程内状态，批量场景下需在此累积，
+#: 否则退出码只会反映最后一个文件的降级情况。
+_ALL_DEGRADATIONS: list = []
+
 
 def _resolve_output_path(input_path: str, output_path: str = None) -> str:
     """推导最终输出路径（与 redact_file 的默认命名口径一致）。"""
@@ -478,6 +493,10 @@ def redact_file(input_path: str, output_path: str = None,
     if manifest_override:
         print(f"[决策] 加载 Agent 评审决策: {manifest_override}")
 
+    # 【审计链 P0-3】每次处理前清空降级台账，避免跨文件串味；
+    # 处理结束后立即取走本文件事件并并入累计列表（台账是每文件口径）。
+    degradation.clear_degradations()
+
     try:
         if ext in (".pdf",):
             return handler(str(input_path), str(output_path),
@@ -487,12 +506,22 @@ def redact_file(input_path: str, output_path: str = None,
                           manifest_override=manifest_override, auto_gray=auto_gray)
         else:
             return handler(str(input_path), str(output_path),
-                          manifest_override=manifest_override, auto_gray=auto_gray)
+                           manifest_override=manifest_override, auto_gray=auto_gray)
     except Exception as e:
+        # 【审计链 P0-3】处理失败 = **无产物**，与「降级但有产物」是两种终态。
+        # 此处显式置失败标志，使退出码取 1（失败）而非 2（降级），
+        # 避免「失败被降级掩盖」——那正是 P0-3 要消除的静默失真。
+        global _LAST_FILE_FAILED
+        _LAST_FILE_FAILED = True
         print(f"[错误] 处理失败: {e}", file=sys.stderr)
         import traceback
         traceback.print_exc()
         return {}
+    finally:
+        # 【审计链 P0-3】本文件的降级事件并入累计列表（含失败路径——
+        # 失败路径同样可能伴随降级事件，如「转换全链失败」本身被登记为
+        # manual_check 告警），保证批量场景下退出码不漏计。
+        _ALL_DEGRADATIONS.extend(degradation.get_degradations())
 
 
 def redact_batch(patterns: list, output_dir: str = None,
@@ -528,17 +557,52 @@ def redact_batch(patterns: list, output_dir: str = None,
         print("汇总统计:")
         for k, v in sorted(total_counts.items(), key=lambda x: -x[1]):
             print(f"  {k}: {v} 处")
+    # 【审计链 P0-3】批量路径同样按终态给出退出码（1=失败 / 2=降级）
+    sys.exit(_exit_code_for_degradations())
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
+def _exit_code_for_degradations() -> int:
+    """【审计链 P0-3】按终态决定退出码。
+
+    0 = 全部成功且无降级
+    1 = 存在**失败**文件（无产物，必须立即介入）
+    2 = 无失败但存在降级产物（产物已生成，但保真度下降/内容可能失真，须人工复核）
+
+    失败优先于降级：失败意味着「没有产物」，降级意味着「有次品」，
+    二者不可混为一谈——否则失败会被降级掩盖，正是 P0-3 要消除的静默失真。
+    """
+    global _LAST_FILE_FAILED
+    if _LAST_FILE_FAILED:
+        print("[⚠️ 失败] 存在处理失败的文件（无产物），退出码 1")
+        return 1
+    # 累计口径：批量场景下台账是「每文件清空」的，退出码须反映全量降级
+    events = list(_ALL_DEGRADATIONS) or degradation.get_degradations()
+    if not events:
+        return 0
+    summary = degradation.summarize(events)
+    print(f"\n[⚠️ 降级] 共 {summary['count']} 项降级事件"
+          f"（最重级别：{summary['worst_level']}）：")
+    for e in events:
+        print(f"  - [{e.get('level')}] {e.get('component')}: "
+              f"{e.get('detail')} {e.get('note')}")
+    print("[⚠️ 降级] 产物已生成，须人工复核后归档（退出码 2）")
+    return 2
+
+
 def print_usage():
     print(__doc__)
 
 
 def main():
+    # 【审计链 P0-3】运行级状态初始化（进程内单次运行语义）
+    global _LAST_FILE_FAILED, _ALL_DEGRADATIONS
+    _LAST_FILE_FAILED = False
+    _ALL_DEGRADATIONS = []
+
     if len(sys.argv) < 2:
         print_usage()
         sys.exit(1)
@@ -604,7 +668,7 @@ def main():
         finally:
             # 【合规】override 文件含实体原文，任务结束即清理（异常路径亦清理）
             cleanup_work_files(override_path)
-        sys.exit(0)
+        sys.exit(_exit_code_for_degradations())
 
     # 默认：纯自动化（灰区直接遮盖，不交 Agent）
     if len(files) == 1:
@@ -621,6 +685,7 @@ def main():
             source_path=files[0],
             mode="auto-gray" if auto_gray else "manual",
         )
+        sys.exit(_exit_code_for_degradations())
     else:
         redact_batch(files, output, method)
 

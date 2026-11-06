@@ -155,9 +155,21 @@ python3 pipeline.py ./docs -t all -o ./output --overwrite
 
 > 🔒 **重要（合规）**：LLM 通道**默认关闭**且**无公网默认端点**。启用前须确认三点：
 > ① `base_url` 指向企业**内网**推理网关（或已加入 `allowed_hosts` 白名单）；
-> ② 送 LLM 前已启用 `pre_redact_before_llm`（身份证/银行卡/手机/固话/邮箱等唯一标识做等长掩码）；
+> ② 送 LLM 前已启用 `pre_redact_before_llm`（身份证/银行卡/手机/固话/邮箱等唯一标识，以及账号/证件号/住址/证件影像引用做等长掩码）；
 > ③ 运行后检查 manifest 的 `llm_audit` 段留痕。
 > 出网守卫判定：`scripts/llm_egress.py`，详见 `docs/技术架构文档.md` §6.2–6.4。
+
+**Agent 直处理模式的端点自检**（内网部署必做）：
+
+```bash
+# 校验 Agent 实际使用的 LLM 端点（只读，不发任何请求）
+python3 scripts/endpoint_check.py --base-url http://llm-gateway.intranet.corp/v1
+# 机器可读（供内网合规扫描）
+python3 scripts/endpoint_check.py --base-url http://llm-gateway.intranet.corp/v1 --json
+```
+
+退出码：`0` 全部合规 / `2` 存在不合规端点 / `3` 参数或配置错误。判定口径与脚本侧
+出网守卫**同源**（复用 `llm_egress.check_egress`）。详见 `docs/技术架构文档.md` §6.3.1。
 
 ## OpenClaw Skill 使用
 
@@ -180,6 +192,36 @@ output/
 └── .redact_state.json     # 断点续传状态（--resume 时生成）
 ```
 
+## 退出码与降级产物
+
+「降级但产物仍生成」是典型的**静默失真**（如 `.doc` 经备用转换器转换后表格结构丢失）。
+本项目把降级事件在审计链三处同时呈现，退出码语义明确：
+
+| 退出码 | 含义 | 处置 |
+|--------|------|------|
+| `0` | 全部成功且无降级 | 正常归档 |
+| `1` | 存在**失败**文件（**无产物**） | 必须立即介入排查 |
+| `2` | 无失败但存在**降级产物**（产物已生成，保真度下降） | 须人工复核后归档 |
+
+- manifest 新增 `degradations` 段（`count` + `items`），Markdown 清单含「⚠️ 降级产物」章节；
+- 批量报告含「⚠️ 降级产物清单（需人工复核）」章节；
+- 降级台账登记内容**只含组件名、级别、原因与复核提示，不含任何文档原文**。
+
+详见 `docs/技术架构文档.md` §8.4。
+
+## CI 门禁
+
+`.github/workflows/ci.yml` 提供三层强制卡口（`push` / `pull_request` on `main`）：
+
+| 层 | 内容 |
+|----|------|
+| `lint` | `compileall` 语法编译 + 全仓 JSON 合法性校验 |
+| `unit` | `pytest tests/`（先不含 benchmark，再完整） |
+| `gate` | `python scripts/bench_metrics.py` — **八项指标门禁，唯一阈值源** |
+
+门禁阈值全部取自 `scripts/bench_metrics.py`（与 `quality_validator.py` 同源），
+workflow 内不硬编码任何阈值数字，避免两处口径漂移。
+
 ## 项目结构
 
 ```
@@ -188,10 +230,15 @@ doc-redact-project/
 ├── requirements.txt     # Python 依赖
 ├── pipeline.py          # 统一入口 / 批量处理 / 断点续传
 ├── common_rules.py      # 统一脱敏规则（所有脚本共享）
-├── entity_detector.py   # LLM 增强检测层
+├── entity_detector.py   # LLM 增强检测层 + 送 LLM 前最小化预脱敏
 ├── llm_client.py        # 多模型 LLM 客户端
+├── llm_egress.py        # LLM 出网端点守卫（内网投产合规）
+├── llm_premask.py       # 送 LLM 前预脱敏 CLI（等长掩码）
+├── endpoint_check.py    # Agent 端点合规自检 CLI
+├── degradation.py       # 降级事件台账（审计链三处呈现）
 ├── manifest.py          # 脱敏清单与报告生成
 ├── prompts.py           # LLM Prompt 模板
+├── .github/workflows/   # CI 流水线（lint / unit / gate）
 ├── scripts/
 │   ├── __init__.py
 │   ├── redact_word.py   # Word 脱敏
