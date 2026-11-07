@@ -13,10 +13,24 @@ name: CI
 #   · 贡献档案里「门禁 8 项全 PASS」的历史记录无法复现验证。
 #
 # 【流水线分层】
-#   lint    → 语法编译（compileall），秒级，快速失败
-#   unit    → 单元/回归测试（pytest tests/）
-#   gate    → 八项指标门禁 + 真实语料零误伤（scripts/bench_metrics.py，
-#             唯一阈值源，与 quality_validator.py 同源）
+#   lint          → 语法编译（compileall），秒级，快速失败
+#   unit          → 单元/回归测试（pytest tests/）
+#   gate          → 八项指标门禁 + 真实语料零误伤（scripts/bench_metrics.py，
+#                   唯一阈值源，与 quality_validator.py 同源）
+#   install-check → 内网装载模拟：构建分发包 → 校验 SHA256 → 解压到「技能目录」
+#                   → 从任意 CWD 跑 doctor 自检 → 真实脱敏冒烟
+#
+# 【为什么需要 install-check】
+#   前三个 job 都在开发仓库里跑，回答的是「代码逻辑对不对」；但内网投产
+#   要回答的是「这个包下载到一台干净机器上，装完能不能跑起来」。后者有
+#   一批前者覆盖不到的失败模式：分发包漏文件、依赖声明与实际 import 不符、
+#   包内残留开发者本机路径、SKILL.md 元数据不合规导致技能无法注册。
+#   必须走一遍真实的「构建 → 解压 → 自检 → 冒烟」链路才能拦住。
+#
+# 【依赖声明唯一来源】
+#   各 job 的 pip 安装一律以 requirements.txt / requirements-dev.txt 为准，
+#   本文件**不得**手写包名清单——此前手写清单漏装 tqdm（pipeline.py 顶层
+#   import），已导致两个测试文件在 CI 上 collection error。
 #
 # 【阈值唯一来源】
 #   门禁阈值全部取自 scripts/bench_metrics.py（Issue #54 口径），
@@ -86,10 +100,14 @@ jobs:
       - name: 安装依赖
         run: |
           python -m pip install --upgrade pip
-          # 门禁与规则层只需要 lxml + jieba；其余重型依赖（图像/OCR/PDF）
-          # 在缺依赖时相关用例自动 skip，不阻断本作业。
-          # requests：entity_detector → llm_client 为模块级 import，缺失会直接 ImportError。
-          pip install lxml jieba pytest python-docx requests
+          # 【重要】统一以 requirements.txt 为唯一依赖声明源。
+          #   此前本作业手写 `pip install lxml jieba pytest python-docx requests`，
+          #   漏装 tqdm —— 而 pipeline.py 顶层 `from tqdm import tqdm`，
+          #   tests/test_pipeline_status_consistency.py 与
+          #   tests/test_degradation_audit.py 均 `import pipeline`，
+          #   导致这两个文件在 CI 上直接 collection error。
+          #   改为按 requirements 安装后，声明与实装不再可能漂移。
+          pip install -r requirements.txt -r requirements-dev.txt
 
       - name: 单元与回归测试
         run: |
@@ -114,7 +132,7 @@ jobs:
       - name: 安装依赖
         run: |
           python -m pip install --upgrade pip
-          pip install lxml jieba pytest python-docx requests
+          pip install -r requirements.txt -r requirements-dev.txt
 
       - name: 八项指标门禁（唯一阈值源 scripts/bench_metrics.py）
         run: |
@@ -132,4 +150,101 @@ jobs:
         with:
           name: bench-metrics-report
           path: bench_metrics_report.json
+          if-no-files-found: ignore
+
+  # ===========================================================================
+  # install-check：模拟「企业内网 Agent 装载」全流程
+  # ---------------------------------------------------------------------------
+  # 【为什么必须是独立 job】
+  #   单元测试与门禁都在**开发仓库**里跑，覆盖的是「代码逻辑对不对」；
+  #   但内网投产要回答的是另一个问题——「这个包下载到一台干净机器上，
+  #   装完能不能跑起来」。二者的失败模式完全不同：
+  #     · 仓库里测试全绿，但分发包漏了某个文件 → 内网装完即崩；
+  #     · requirements 声明与实际 import 不符 → 内网装完缺模块；
+  #     · 包内残留开发者本机路径 → 内网机器上必然不存在；
+  #     · SKILL.md 元数据不合规 → Agent 根本无法注册技能。
+  #   这些都不是 unit job 能发现的，必须走一遍真实的「构建 → 解压 →
+  #   自检 → 冒烟」链路。
+  # ===========================================================================
+  install-check:
+    name: Install Check（内网装载模拟）
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: 构建分发包
+        run: |
+          python scripts/build_package.py --outdir ./dist
+
+      - name: 分发包完整性校验
+        run: |
+          cd dist
+          sha256sum -c doc-redact-*.zip.sha256
+
+      - name: 解压到「内网技能目录」并自检
+        run: |
+          mkdir -p /tmp/agent-skills/doc-redact
+          unzip -q dist/doc-redact-*.zip -d /tmp/agent-skills/doc-redact
+          cd /tmp/agent-skills/doc-redact
+          # 从任意 CWD 运行，验证脚本不依赖当前工作目录
+          cd /
+          python3 /tmp/agent-skills/doc-redact/scripts/doctor.py
+
+      - name: 自检 JSON 存档
+        if: always()
+        run: |
+          python3 /tmp/agent-skills/doc-redact/scripts/doctor.py --json \
+            > doctor_report.json || true
+          cat doctor_report.json
+
+      - name: 分发包冒烟（真实脱敏一次）
+        run: |
+          cd /tmp/agent-skills/doc-redact
+          python3 - <<'PY'
+          import io, zipfile, sys
+          buf = io.BytesIO()
+          z = zipfile.ZipFile(buf, 'w')
+          z.writestr('[Content_Types].xml',
+              '<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+              '<Default Extension="xml" ContentType="application/xml"/></Types>')
+          z.writestr('_rels/.rels',
+              '<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+              '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument"'
+              ' Target="word/document.xml"/></Relationships>')
+          z.writestr('word/document.xml',
+              '<?xml version="1.0"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+              '<w:body><w:p><w:r><w:t>联系人张三，手机13812345678，身份证110101199003072345</w:t></w:r></w:p></w:body></w:document>')
+          z.close()
+          open('/tmp/smoke.docx','wb').write(buf.getvalue())
+          PY
+          python3 scripts/redact_word.py /tmp/smoke.docx /tmp/smoke_out.docx
+          python3 - <<'PY'
+          import re, zipfile, sys
+          xml = zipfile.ZipFile('/tmp/smoke_out.docx').read('word/document.xml').decode()
+          texts = re.findall(r'<w:t[^>]*>(.*?)</w:t>', xml)
+          joined = ' '.join(texts)
+          print('[脱敏结果]', joined)
+          bad = [t for t in ('张三', '13812345678', '110101199003072345') if t in joined]
+          if bad:
+              print('[FAIL] 未脱敏内容残留:', bad)
+              sys.exit(1)
+          print('[OK] 姓名/手机/身份证均已遮盖')
+          PY
+
+      - name: 上传安装态报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: install-check-report
+          path: doctor_report.json
           if-no-files-found: ignore

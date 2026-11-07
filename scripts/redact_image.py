@@ -34,14 +34,36 @@ _tesseract_paths = [
     r"C:\Program Files\Tesseract-OCR\tesseract.exe",
     'tesseract',
 ]
-for _p in _tesseract_paths:
-    if os.path.exists(_p) or _p == 'tesseract':
+
+
+def _detect_tesseract() -> str:
+    """探测 tesseract 可执行文件，返回可用路径；不可用返回空串。
+
+    【修复】原实现在模块级直接访问 `pytesseract.pytesseract.tesseract_cmd`，
+    但 pytesseract 是**函数内延迟导入**的——该赋值会抛 NameError 并被
+    `except Exception` 静默吞掉，导致 `tesseract_cmd` **从未真正生效**。
+    后果：Windows 内网部署（tesseract.exe 不在 PATH、仅在标准安装目录）
+    时 OCR 完全不可用且无任何报错。
+
+    现改为：延迟导入 pytesseract → 真实执行二进制探测 → 设置 cmd。
+    """
+    for _p in _tesseract_paths:
+        if not (os.path.exists(_p) or _p == 'tesseract'):
+            continue
         try:
             subprocess.run([_p, '--version'], capture_output=True, timeout=5)
-            pytesseract.pytesseract.tesseract_cmd = _p
-            break
+        except Exception:
+            continue
+        try:
+            import pytesseract as _pt
+            _pt.pytesseract.tesseract_cmd = _p
         except Exception:
             pass
+        return _p
+    return ""
+
+
+_TESSERACT_PATH = _detect_tesseract()
 
 
 

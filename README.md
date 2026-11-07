@@ -51,9 +51,14 @@
  (LLM层)      (Regex层)
     │           │
     ▼           ▼
- MiniMax     链式正则替换
- Text-01     (邮箱/手机/身份证/银行名...)
+ 内网推理网关  链式正则替换
+ (Agent侧LLM)  (邮箱/手机/身份证/银行名...)
 ```
+
+> 📌 **LLM 归属口径**：本技能包**不自带、不托管**任何 LLM 服务与凭据。LLM 通道默认关闭，
+> 实体识别仅**复用 Agent 侧已有的 LLM 调用能力**；若由 Agent 直接执行脱敏脚本，
+> 则由 Agent 自行决定是否注入上下文，本包不外呼、不存储 API Key。
+> 详见 `docs/内网部署指南.md` §5。
 
 **姓名检测三规则体系：**
 
@@ -75,16 +80,21 @@ Rule C: (?<=：)(?:姓氏)[名字汉字]{1}(?![a-zA-Z0-9])
 git clone https://github.com/cl13918279087-code/AI-Kit.git
 cd AI-Kit/doc-redact-project
 
-# 安装依赖
-pip install -r requirements.txt
+# 安装依赖（运行时 + 测试）
+pip install -r requirements.txt -r requirements-dev.txt
 
 # macOS 安装 tesseract（OCR 依赖）
 brew install tesseract tesseract-lang
 
-# 配置 API Key
-export MINIMAX_API_KEY="***"
-# 或直接编辑 config.json 中的 api_key 字段
+# 装载后自检（内网投产必做）
+python3 scripts/doctor.py
 ```
+
+> ⚠️ **LLM 凭据**：本包**默认不使用任何 API Key**（`llm.enabled = false`）。
+> 若内网启用 LLM 通道，请在 `scripts/config.json` 的 `llm.api_key` 填写**内网推理网关**
+> 的凭据，或由 Agent 侧注入环境变量；`base_url` **必须**指向内网端点，否则被出网守卫拒绝。
+
+> 📦 **企业内网部署**：请看 [企业内网部署](#企业内网部署) 章节与 `docs/内网部署指南.md`。
 
 ## 快速开始
 
@@ -171,6 +181,73 @@ python3 scripts/endpoint_check.py --base-url http://llm-gateway.intranet.corp/v1
 退出码：`0` 全部合规 / `2` 存在不合规端点 / `3` 参数或配置错误。判定口径与脚本侧
 出网守卫**同源**（复用 `llm_egress.check_egress`）。详见 `docs/技术架构文档.md` §6.3.1。
 
+## 企业内网部署
+
+面向「内网 OpenClaw 类 Agent 装载本技能包」场景的完整交付链路。
+
+### 1. 构建分发包（交付物）
+
+仓库 ≠ 可交付物。构建脚本产出**最小运行集**三件套：
+
+```bash
+python3 scripts/build_package.py
+# 产出 dist/doc-redact-1.0.0.zip
+#      dist/doc-redact-1.0.0.zip.sha256      （验签）
+#      dist/doc-redact-1.0.0.manifest.json  （逐文件 SHA256 + 依赖声明）
+```
+
+打包时自动剥离 `tests/`、`docs/`、`.github/`、`scripts/mine_*.py` 等开发资产，
+并**剥离 `config.json` 中的内联真实人名库**；若未配置 `full_name_list_file`，
+构建会**直接失败**（拒绝交付「看着干净但能力残缺」的包）。
+
+### 2. 内网侧安装与自检
+
+```bash
+sha256sum -c doc-redact-1.0.0.zip.sha256
+unzip doc-redact-1.0.0.zip -d /opt/agent-skills/doc-redact
+
+# 离线安装（内网无公网 pip）
+pip install --no-index --find-links=/opt/wheelhouse -r requirements.txt
+
+# 装载后体检（内网投产门禁）
+cd /opt/agent-skills/doc-redact && python3 scripts/doctor.py
+```
+
+`doctor.py` 覆盖六组检查：Python 版本、必需/可选 Python 包、外部二进制、
+包内必需文件、LLM 端点合规、开发者本机路径残留。
+
+| 退出码 | 含义 | 处置 |
+|--------|------|------|
+| `0` | 全部通过 | 可投产 |
+| `1` | 必装项缺失 / 端点不合规 | **禁止投产**，按 `hint` 补齐 |
+| `2` | 仅告警项（如 OCR/LibreOffice 缺失） | 可运行，须确认降级影响面 |
+| `3` | 自检无法执行 | 排查运行环境 |
+
+常用参数：`--json`（机器可读，供内网合规扫描）、`--strict`（告警升级为失败）、
+`--base-url`（校验实际使用的 LLM 端点）。
+
+### 3. 外部二进制（不在 Python 包体系内，须运维离线安装）
+
+| 组件 | 用途 | 缺失影响 |
+|------|------|---------|
+| `tesseract` + `chi_sim` | 图片 OCR | 图片脱敏不可用 |
+| `soffice` / LibreOffice | `.doc` → `.docx` 转换 | `.doc` 报错终止（防假脱敏） |
+
+非标准路径可用 `SOFFICE_PATH` 指定；Windows 下 `tesseract` 路径由脚本自动探测。
+
+### 4. 人名库外置口径（内网数据不出包）
+
+配置项 `full_name_list_file` 指向行分隔的人名清单文件，**优先级高于**内联库；
+也可用环境变量 `AIKIT_FULL_NAME_LIST` 直接指定文件路径，或用 `AIKIT_DATA_ROOT`
+指定数据根目录。语义为 **内联 ∪ 外置**（外置优先、去重保序），外置文件缺失时
+**静默回退**到内联库（不报错、不中断）。
+
+### 5. LLM 端点合规
+
+内网启用 LLM 通道时，`base_url` 必须为内网地址并加入 `allowed_hosts`；
+判定口径与出网守卫**同源**（`scripts/llm_egress.py`），可用
+`python3 scripts/endpoint_check.py --base-url <URL>` 独立校验。
+
 ## OpenClaw Skill 使用
 
 将 `SKILL.md` 复制到 OpenClaw skills 目录，即可通过对话调用：
@@ -218,6 +295,10 @@ output/
 | `lint` | `compileall` 语法编译 + 全仓 JSON 合法性校验 |
 | `unit` | `pytest tests/`（先不含 benchmark，再完整） |
 | `gate` | `python scripts/bench_metrics.py` — **八项指标门禁，唯一阈值源** |
+| `install-check` | 构建分发包 → SHA256 校验 → 解压到干净目录 → 任意 CWD 跑 `doctor.py` → **真实 docx 脱敏冒烟** |
+
+依赖安装一律按 `requirements.txt` + `requirements-dev.txt` 执行（依赖声明唯一来源），
+CI 内不手写包名清单。
 
 门禁阈值全部取自 `scripts/bench_metrics.py`（与 `quality_validator.py` 同源），
 workflow 内不硬编码任何阈值数字，避免两处口径漂移。
@@ -226,31 +307,36 @@ workflow 内不硬编码任何阈值数字，避免两处口径漂移。
 
 ```
 doc-redact-project/
-├── config.json          # 全局配置（LLM / 规则 / 批处理参数）
-├── requirements.txt     # Python 依赖
-├── pipeline.py          # 统一入口 / 批量处理 / 断点续传
-├── common_rules.py      # 统一脱敏规则（所有脚本共享）
-├── entity_detector.py   # LLM 增强检测层 + 送 LLM 前最小化预脱敏
-├── llm_client.py        # 多模型 LLM 客户端
-├── llm_egress.py        # LLM 出网端点守卫（内网投产合规）
-├── llm_premask.py       # 送 LLM 前预脱敏 CLI（等长掩码）
-├── endpoint_check.py    # Agent 端点合规自检 CLI
-├── degradation.py       # 降级事件台账（审计链三处呈现）
-├── manifest.py          # 脱敏清单与报告生成
-├── prompts.py           # LLM Prompt 模板
-├── .github/workflows/   # CI 流水线（lint / unit / gate）
+├── SKILL.md             # Agent 技能包注册入口（YAML frontmatter）
+├── LICENSE              # MIT + 第三方组件许可说明
+├── requirements.txt     # 运行时依赖（唯一来源）
+├── requirements-dev.txt # 开发/测试依赖
+├── .github/workflows/   # CI 流水线（lint / unit / gate / install-check）
 ├── scripts/
-│   ├── __init__.py
+│   ├── config.json      # 全局配置（LLM / 规则 / 批处理参数）
+│   ├── pipeline.py      # 统一入口 / 批量处理 / 断点续传
+│   ├── common_rules.py  # 统一脱敏规则（所有脚本共享）
+│   ├── entity_detector.py  # LLM 增强检测层 + 送 LLM 前最小化预脱敏
+│   ├── llm_client.py    # 多模型 LLM 客户端
+│   ├── llm_egress.py    # LLM 出网端点守卫（内网投产合规）
+│   ├── llm_premask.py   # 送 LLM 前预脱敏 CLI（等长掩码）
+│   ├── endpoint_check.py # Agent 端点合规自检 CLI
+│   ├── degradation.py   # 降级事件台账（审计链三处呈现）
+│   ├── manifest.py      # 脱敏清单与报告生成
+│   ├── prompts.py       # LLM Prompt 模板
+│   ├── doctor.py        # 装载后安装自检（六组检查 / 退出码门禁）
+│   ├── build_package.py # 分发包构建（zip + sha256 + manifest）
 │   ├── redact_word.py   # Word 脱敏
 │   ├── redact_excel.py  # Excel 脱敏
 │   ├── redact_ppt.py    # PPT 脱敏
 │   ├── redact_pdf.py    # PDF 脱敏
 │   └── redact_image.py  # 图片脱敏
-├── docs/                # 项目文档
-│   ├── 技术架构文档.md   # v1.2.0
-│   └── 项目实施手册.md   # v1.2.0
+├── references/          # 脱敏规则与规格说明（随包交付）
+├── docs/                # 项目文档（不随分发包交付）
+│   ├── 技术架构文档.md
+│   ├── 项目实施手册.md
+│   └── 内网部署指南.md  # 内网投产部署手册
 ├── tests/               # 单元测试
-├── SKILL.md             # OpenClaw Skill
 └── README.md
 ```
 
@@ -266,7 +352,9 @@ sudo apt install tesseract-ocr tesseract-ocr-chi-sim
 ```
 
 **Q: LLM 调用失败？**
-检查 `config.json` 中 `api_key` 是否正确，或设置环境变量 `MINIMAX_API_KEY`。
+先确认 `scripts/config.json` 中 `llm.enabled` 是否为 `true`（默认 `false`）、
+`base_url` 是否指向内网端点、`api_key` 是否正确。公网端点会被出网守卫直接拒绝。
+若由 Agent 直接执行脚本，LLM 能力由 Agent 侧提供，本包不管理凭据。
 
 **Q: .doc 文件无法处理？**
 需要安装 LibreOffice：
@@ -288,7 +376,7 @@ Word/Excel/PPT 脚本直接操作 XML，不会调用 python-docx/pptx 的保存�
 
 ## License
 
-MIT License
+MIT License（见 `LICENSE`，含第三方组件与数据许可说明）
 
 ---
 

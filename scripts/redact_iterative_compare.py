@@ -20,7 +20,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from common_rules import reset_patterns, apply_redactions, get_config
 
-WORK_DIR = Path("/Users/clzxr/WorkBuddy/Claw/工作目录")
+# 工作目录：默认取环境变量 AIKIT_WORK_DIR；未设置时回落到仓库内 工作目录/
+# （若存在），再否则回落到当前目录。
+# 【内网部署口径】不得硬编码任何开发者本机绝对路径。
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+WORK_DIR = Path(
+    os.environ.get("AIKIT_WORK_DIR")
+    or (_REPO_ROOT / "工作目录" if (_REPO_ROOT / "工作目录").is_dir() else Path.cwd())
+)
 
 # 六组文件配置
 FILE_GROUPS = [

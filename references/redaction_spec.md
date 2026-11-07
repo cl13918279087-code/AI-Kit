@@ -211,8 +211,8 @@ python3 scripts/redact_word.py <输入文件路径> [输出文件路径]
 ### 示例
 
 ```bash
-python3 scripts/redact_word.py "/Users/clzxr/WorkBuddy/Claw/工作目录/郑州银行新一代信息系统建设项目文档_差异分析启动会.docx"
-# 输出：/Users/clzxr/.../郑州银行新一代信息系统建设项目文档_差异分析启动会_脱敏.docx
+python3 "$SKILL_ROOT/scripts/redact_word.py" "<输入目录>/项目文档_启动会.docx"
+# 输出：<输入目录>/项目文档_启动会_脱敏.docx
 ```
 
 ---

@@ -32,6 +32,7 @@
 """
 import argparse
 import json
+import os
 import re
 import sys
 import zipfile
@@ -43,7 +44,13 @@ sys.path.insert(0, str(REPO / "scripts"))
 
 import common_rules as cr  # noqa: E402
 
-DEFAULT_SRC = Path("/Users/clzxr/公司Agent规划")
+# 语料源目录：默认取环境变量 AIKIT_CORPUS_DIR；未设置时回落到仓库内
+# 的 工作目录/（若存在），再否则回落到当前目录。
+# 【内网部署口径】不得硬编码任何开发者本机绝对路径。
+DEFAULT_SRC = Path(
+    os.environ.get("AIKIT_CORPUS_DIR")
+    or (REPO / "工作目录" if (REPO / "工作目录").is_dir() else Path.cwd())
+)
 MIN_FREQ = 3
 CJK_RUN = re.compile(r"[一-龥]+")
 

@@ -27,7 +27,15 @@ import subprocess
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-WORK_DIR = Path("/Users/clzxr/WorkBuddy/Claw/工作目录")
+# 工作目录：默认取环境变量 AIKIT_WORK_DIR；未设置时回落到仓库内 工作目录/
+# （若存在），再否则回落到当前目录。
+# 【内网部署口径】不得硬编码任何开发者本机绝对路径——内网机器上该路径
+# 必然不存在，会导致脚本启动即失败。
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+WORK_DIR = Path(
+    os.environ.get("AIKIT_WORK_DIR")
+    or (_REPO_ROOT / "工作目录" if (_REPO_ROOT / "工作目录").is_dir() else Path.cwd())
+)
 OUTPUT_DIR = WORK_DIR / ".redact_v2_output"
 STATE_FILE = WORK_DIR / ".redact_v2_state.json"
 REPORT_DIR = WORK_DIR / ".redact_v2_reports"

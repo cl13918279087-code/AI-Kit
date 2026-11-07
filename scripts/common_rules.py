@@ -253,6 +253,79 @@ def get_name_pool_chars() -> str:
 # D16 精确全名库（Issue #50 N-C 层需要「D16 命中」作为区域判定的种子信号）
 _FULL_NAME_SET_CACHE: Optional[set] = None
 
+# D16 全名库中的「非人名」条目（字段标签 / 表头），必须排除出精确匹配层。
+# 背景：实测 full_name_list 含「姓名」——它是文档字段名不是人名，
+# 精确层会把它替换成 XXX（「请填写姓名」→「请填写XXX」），属误伤。
+# 【定义位置】必须先于 get_full_name_set()——该函数体在**调用时**才引用本常量，
+# 若定义在其后，模块导入后首次调用即抛 NameError。
+_D16_NON_NAME_ENTRIES = frozenset({"姓名"})
+
+
+def _get_full_name_list(cfg: Optional[Dict[str, Any]] = None) -> List[str]:
+    """返回 D16 全名库条目列表（内联 + 外置文件合并）。
+
+    【为什么需要外置文件】
+    `config.json` 的 `full_name_list` 是从真实业务语料中抽取的**自然人姓名**
+    （约 7400 条）。它既是姓名规则字频自举的种子数据，也是精确匹配层——
+    但把它固化在分发包里，会带来两个问题：
+      1. **分发侧 PII 风险**：包一旦流出（内网扩散、二次分发、开发机同步），
+         真实人名清单随之扩散，且难以追溯；
+      2. **内网无法注入本行名单**：投产时真正该用的是「本行员工花名册」，
+         而非语料派生名单。
+
+    因此支持 `full_name_list_file`：指向一个**每行一个姓名**的外部文本文件，
+    内网部署方用本行花名册覆盖/补充即可，无需改动代码。
+
+    合并语义：内联列表 ∪ 外置文件（外置优先，去重保序）。
+    外置文件缺失时静默回退到内联列表，保证既有行为完全不变。
+    """
+    if cfg is None:
+        cfg = _load_config()
+
+    names: List[str] = []
+    seen = set()
+
+    for n in (cfg.get("full_name_list") or []):
+        if isinstance(n, str) and n and n not in seen:
+            seen.add(n)
+            names.append(n)
+
+    rel = str(cfg.get("full_name_list_file") or "").strip()
+    # 环境变量优先：内网部署方无需改动分发包内的配置文件即可注入本行花名册
+    env_file = os.environ.get("AIKIT_FULL_NAME_LIST", "").strip()
+    if env_file:
+        rel = env_file
+    if rel:
+        for p in _resolve_data_paths(rel):
+            if not p.exists():
+                continue
+            try:
+                text = p.read_text(encoding="utf-8")
+            except Exception:
+                continue
+            for line in text.splitlines():
+                n = line.strip()
+                if n and not n.startswith("#") and n not in seen:
+                    seen.add(n)
+                    names.append(n)
+            break
+
+    return names
+
+
+def _resolve_data_paths(rel: str) -> List[Path]:
+    """数据文件路径解析：环境变量根 / 包根 / scripts/ 自身 / 原样。"""
+    here = Path(__file__).resolve().parent
+    candidates = [
+        here.parent / rel,
+        here / rel,
+        Path(rel),
+    ]
+    env_root = os.environ.get("AIKIT_DATA_ROOT", "").strip()
+    if env_root:
+        candidates.insert(0, Path(env_root) / rel)
+    return candidates
+
 
 def get_full_name_set() -> set:
     """返回 D16 精确全名库（已剔除字段标签型污染条目）。
@@ -262,8 +335,7 @@ def get_full_name_set() -> set:
     """
     global _FULL_NAME_SET_CACHE
     if _FULL_NAME_SET_CACHE is None:
-        cfg = _load_config()
-        names = cfg.get("full_name_list", []) or []
+        names = _get_full_name_list()
         _FULL_NAME_SET_CACHE = {n for n in names if n not in _D16_NON_NAME_ENTRIES}
     return _FULL_NAME_SET_CACHE
 
@@ -362,11 +434,6 @@ _NAME_GATE_COMPOUND_SURNAMES = (
     "淳于", "太叔",
 )
 
-# D16 全名库中的「非人名」条目（字段标签 / 表头），必须排除出精确匹配层。
-# 背景：实测 full_name_list 含「姓名」——它是文档字段名不是人名，
-# 精确层会把它替换成 XXX（「请填写姓名」→「请填写XXX」），属误伤。
-_D16_NON_NAME_ENTRIES = frozenset({"姓名"})
-
 # D16 全名库名字位字频缓存（按全名库内容 key）
 _NAME_CHAR_FREQ_CACHE: Dict[str, Any] = {}
 
@@ -381,7 +448,7 @@ def _get_name_char_freq(cfg: Optional[Dict] = None) -> Dict[str, int]:
     """
     if cfg is None:
         cfg = _load_config()
-    names = cfg.get("full_name_list") or []
+    names = _get_full_name_list(cfg)
     key = f"{len(names)}:{hash(tuple(names[:64]))}"
     cached = _NAME_CHAR_FREQ_CACHE.get(key)
     if cached is not None:
@@ -499,7 +566,7 @@ def _get_surname_char_freq(cfg: Optional[Dict] = None) -> Dict[str, int]:
     """
     if cfg is None:
         cfg = _load_config()
-    names = cfg.get("full_name_list") or []
+    names = _get_full_name_list(cfg)
     key = f"s:{len(names)}:{hash(tuple(names[:64]))}"
     cached = _NAME_CHAR_FREQ_CACHE.get(key)
     if cached is not None:
@@ -897,7 +964,7 @@ def _build_safe_cut_words(cfg: Optional[Dict] = None) -> set:
     """
     if cfg is None:
         cfg = _load_config()
-    names = {n for n in (cfg.get("full_name_list") or []) if isinstance(n, str)}
+    names = {n for n in _get_full_name_list(cfg) if isinstance(n, str)}
     names.discard("姓名")
     safe = set()
     for w in EXCLUDED_COMMON_WORDS:
@@ -1441,7 +1508,7 @@ def _get_standalone_name_candidates() -> set:
     if _STANDALONE_NAME_CANDIDATES is None:
         words = _get_standalone_exempt_words()
         cfg = _load_config()
-        names = {n for n in (cfg.get("full_name_list") or []) if isinstance(n, str)}
+        names = {n for n in _get_full_name_list(cfg) if isinstance(n, str)}
         _STANDALONE_NAME_CANDIDATES = {
             n for n in names if any(n.startswith(w) for w in words)
         }

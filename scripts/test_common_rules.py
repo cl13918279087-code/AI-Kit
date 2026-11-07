@@ -4,7 +4,7 @@ test_common_rules.py - common_rules.py 单元测试
 覆盖所有公开 API 及关键内部函数，确保分词器重构（jieba 可选依赖）不破坏既有逻辑。
 
 运行方式：
-    cd /Users/clzxr/WorkBuddy/Claw/scripts
+    cd scripts
     python3 -m pytest test_common_rules.py -v
     # 或直接
     python3 test_common_rules.py

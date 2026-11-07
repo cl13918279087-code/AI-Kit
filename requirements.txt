@@ -1,27 +1,45 @@
-# doc-redact 依赖包
-# pip install -r requirements.txt
+# doc-redact 运行时依赖
+# ============================================================================
+# 安装（内网离线环境见 docs/内网部署指南.md）：
+#   pip install -r requirements.txt
+#   pip install -r requirements.txt -i <内网 PyPI 镜像>
+#
+# 版本约束口径：
+#   · 下限取「实测可用版本」，保证功能完整；
+#   · 上限仅卡住已知破坏性大版本，避免内网镜像自动升级导致装完即崩；
+#   · 精确锁定版本见 requirements.lock.txt（投产推荐，附哈希校验）。
+#
+# 【重要】tqdm 为 pipeline.py 顶层硬导入（批量处理进度条），缺失将导致
+#          `import pipeline` 直接失败——属必装项，勿删。
+# ============================================================================
 
-# 核心依赖
-lxml           # Word/Excel/PPT XML 操作（所有脚本共用）
-requests       # LLM 客户端（llm_client.py 调用 MiniMax API）
+# ---- 核心：脚本公共依赖（全部脚本共用，缺一即装完即崩） ----
+lxml>=4.9,<6                 # Word/Excel/PPT XML 操作（所有脚本共用）
+requests>=2.28,<3            # LLM 客户端（llm_client.py 顶层 import）
+tqdm>=4.64,<5                # pipeline.py 批量进度条（顶层 import，必装）
 
-# Word 文档
-python-docx    # 辅助解析（可选，主要用 lxml）
+# ---- Word 文档 ----
+python-docx>=1.1,<2         # .doc 降级链 antiword 重建 / 辅助解析
 
-# Excel 电子表格
-openpyxl       # .xlsx 读写
-xlrd           # .xls 读取
-xlwt           # .xls 写入
+# ---- Excel 电子表格 ----
+openpyxl>=3.1,<4            # .xlsx 读写
+xlrd>=2.0,<3                # .xls 读取
+xlwt>=1.5,<2                # .xls 写入
 
-# PPT 演示文稿
-python-pptx    # 辅助解析（可选，主要用 lxml）
+# ---- PPT 演示文稿 ----
+python-pptx>=0.6,<2         # 辅助解析（可选，主要用 lxml）
+Pillow>=9.5,<13             # 图片处理（redact_ppt.py 顶层 import）
 
-# PDF 文档
-pymupdf        # 文本型 PDF + 页面渲染
-pytesseract    # 扫描版 PDF OCR
-Pillow         # 图片处理
-numpy          # 数组运算
-opencv-python  # 图像分析（Logo 检测）
+# ---- PDF 文档 ----
+pymupdf>=1.23,<2            # 文本型 PDF + 页面渲染
 
-# OLE 文件格式检测
-olefile        # .doc/.xls/.ppt 二进制格式检测
+# ---- 图片 / OCR（扫描件与 Logo 检测） ----
+pytesseract>=0.3.10,<0.4    # OCR 封装（需另装 tesseract 二进制）
+numpy>=1.24,<3              # 数组运算
+opencv-python>=4.8,<5       # 图像分析（Logo 检测，redact_image.py 顶层 import）
+
+# ---- OLE 文件格式检测 ----
+olefile>=0.46,<1            # .doc/.xls/.ppt 二进制格式检测
+
+# ---- 中文分词（可选，缺失时 mine_boundary_pairs 降级为滑窗统计） ----
+jieba>=0.42,<1

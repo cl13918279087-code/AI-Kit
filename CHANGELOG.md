@@ -1,5 +1,110 @@
 # Changelog
 
+## [Unreleased] - 2026-11-07（内网安装就绪性整改第四批：技能包可无缝装载至内网 Agent）
+
+### 背景
+
+以「银行资深 AI 专家 / 内网 Agent 平台」视角复核本技能包的**内网可装载性**，
+识别出 8 类不符合项。核心风险在于：**仓库能跑 ≠ 内网 Agent 能装**。
+四层差异：① Python 包缺失（import 期失败）② 外部二进制缺失（功能期降级）
+③ 开发者本机路径残留（内网必然不存在）④ 分发包内容边界（仓库 ≠ 可交付物）。
+本批次全部实施整改（改代码 + 补测试 + 验证 + 提交）。
+
+### ① 新增安装自检工具 `scripts/doctor.py`
+
+- 装载后一键体检，**六组检查**：Python 版本（≥3.9）、必需包（`lxml`/`requests`/`tqdm`）
+  与可选包（13 项）、外部二进制（`tesseract`/`soffice`/`antiword`）、包内必需文件（9 项）、
+  LLM 端点合规（复用 `llm_egress.check_egress`，口径同源）、开发者本机路径残留。
+- 退出码门禁语义：`0`=通过 / `1`=必装项缺失或端点不合规（**禁止投产**）/
+  `2`=仅告警（可运行，须确认降级影响面）/ `3`=自检无法执行。
+- `--json` 机器可读（供内网合规扫描归档）、`--strict`（告警升级为失败）、
+  `--base-url`（可重复）校验实际使用的 LLM 端点。
+- 实测 36 项检查：通过 28 / 提示 1 / 告警 7 / 失败 0；公网端点 `https://api.openai.com/v1`
+  → fail + exit 1；内网端点 → ok。
+
+### ② 依赖声明修复（装完即崩项）
+
+- `requirements.txt` 重写为分层 + 版本约束口径。
+- **补入 `tqdm`**：`pipeline.py` 顶层 `from tqdm import tqdm`，缺失则 `import pipeline`
+  直接失败，且两个测试文件 `import pipeline` → CI 上 collection error。
+- 补齐 `jieba`（分词）；`requirements-dev.txt` 新建，测试依赖独立。
+- **依赖声明唯一来源**：`requirements.txt`（运行时）+ `requirements-dev.txt`（测试）；
+  CI 各 job 一律按 requirements 安装，不再手写包名清单。
+
+### ③ 开发者本机硬编码路径清零
+
+- `mine_guard_words.py` / `mine_boundary_pairs.py` → `AIKIT_CORPUS_DIR` 环境变量优先。
+- `redact_iterative_v2.py` / `redact_iterative_compare.py` → `AIKIT_WORK_DIR` 环境变量优先。
+- `test_common_rules.py` 文档字符串、`references/redaction_spec.md` 示例路径 → 通用写法。
+- `grep /Users/clzxr scripts/` 仅剩注释行（已改通用）。
+
+### ④ LICENSE + 内网部署指南
+
+- 新增 `LICENSE`：MIT + 「第三方组件与数据许可说明」（Apache-2.0 语料许可、
+  通用人名词典适用 Apache-2.0、`full_name_list` 属使用方自有数据可用 `full_name_list_file` 替换）。
+- 新增 `docs/内网部署指南.md`（九章）：部署形态总览 / 分发包准备（含人名清单三种处置
+  口径 A保留 B外置 C脱敏）/ 内网侧安装（校验、解压、pip 内外网镜像与离线 wheelhouse、
+  外部二进制、自检门禁）/ Agent 装载与调用 / LLM 端点合规 / 数据目录与权限 /
+  升级与回滚 / FAQ / 文件清单速查。
+
+### ⑤ 分发包构建脚本 `scripts/build_package.py`
+
+- 产出**三件套**：`doc-redact-<version>.zip` + `.zip.sha256`（验签）+ `.manifest.json`
+  （逐文件 SHA256 + 依赖声明 + 外部二进制清单）。
+- **最小运行集 31 文件**（剥离 `tests/`、`docs/`、`.github/`、`scripts/mine_*.py`、
+  `bench_metrics.py` 等开发资产）。
+- `strip_pii_from_config()`：清空内联 `full_name_list`；**未配置 `full_name_list_file`
+  时直接 `raise SystemExit`**（拒绝交付「看着干净但能力残缺」的包）。
+- 包内自动写入「安装与部署说明（分发包内）」。
+- 实测 587,019 字节；解压到干净目录后 doctor 通过 + 真实脱敏冒烟通过。
+
+### ⑥ `SKILL.md` 元数据与装载契约
+
+- frontmatter 新增 `version: 1.0.0`、`requires_python: ">=3.9"`、
+  `requires_binaries: [tesseract, soffice]`、`license: MIT`（Agent 注册入口）。
+- 新增「零、安装与自检（装载后必做）」章节：pip 安装 + `doctor.py`；退出码语义表；
+  包根定位约定（`SKILL_ROOT`），保证包内脚本自解析路径不依赖 CWD。
+
+### ⑦ `config.json` 真实人名库外置化
+
+- 新增 `full_name_list_file`（紧邻 `common_name_dict_file`）。
+- 统一入口 `common_rules._get_full_name_list()`：语义 = **内联 ∪ 外置**（外置优先、
+  去重保序）；4 处原调用点全部改走该入口。
+- 双注入通道：`AIKIT_FULL_NAME_LIST`（直接指定文件）/ `AIKIT_DATA_ROOT`（数据根目录）；
+  外置缺失**静默回退**内联，不报错不中断。
+- 实测内联 7399 → 外置合并 7401（+2 新增，注释行跳过，重复去重）。
+
+### ⑧ CI 新增 `install-check` 作业层
+
+- 9 steps：构建分发包 → SHA256 校验 → 解压到 `/tmp/agent-skills/doc-redact` →
+  从 `/` 运行 doctor（验证任意 CWD 可用）→ JSON 存档 → **真实脱敏冒烟**
+  （构造 docx → `redact_word.py` → 断言姓名/手机/身份证均已遮盖）→ 上传报告。
+- 修掉 `unit`/`gate` job 手写依赖清单漏装 `tqdm` 导致的 collection error。
+
+### 顺带修复的 3 处真实缺陷
+
+- **`redact_image.py` 的 `tesseract_cmd` 从未生效**：原代码在模块级直接赋值
+  `pytesseract.pytesseract.tesseract_cmd`，但 `pytesseract` 是函数内延迟导入 →
+  `NameError` 被 `except Exception` 吞掉 → 该赋值从未执行。Windows 内网 tesseract
+  不在 PATH 时 OCR 完全不可用且**无任何报错**。改为 `_detect_tesseract()`：
+  探测候选路径 → 校验可执行 → 在探测函数内完成注入。
+- **配置缓存语义固化**：`_load_config()` 返回**进程内共享缓存对象**，调用方就地改写会
+  污染全进程。测试改用 `dict(...)` 副本，并新增 `test_load_config_returns_cache_protected` 固化。
+- **`describe_policy` 调用参数**：doctor 初版误传字典导致 `list(dict)` 得键名，
+  输出 `allowed_hosts=['allowed_hosts','require_private_network']`；改为位置参数。
+
+### 验证结论
+
+- 新增 `tests/test_install_readiness.py` **31 passed**（六大组：doctor 契约 /
+  requirements / 无开发者路径 / 分发包 / 人名库外置 / SKILL.md 元数据）。
+- 全量回归 **377 passed / 1 skipped / 1 xfailed / 1 xpassed**，零失败。
+- 八项门禁 `python3 scripts/bench_metrics.py` **总判定: PASS**
+  （recall 100% 283/283、precision 99.9%、通用语料改动 2/102（姓名类 0/102）、
+  真实语料误伤 0/1200、歧义集 13/13、确定性/幂等 100%）。
+- 分发包端到端验收：解压到干净目录 → 从 `/` 运行 doctor 通过 → 真实 docx 脱敏输出
+  `联系人XXX，手机XXXXXXXXXXX，身份证XXXXXXXXXXXXXXXXXX`（姓名/手机/身份证均正确遮盖，
+  LLM 通道正确降级为纯规则）。
+
 ## [Unreleased] - 2026-11-06（架构评审整改第三批：审计链闭环 P0-3 + CI 接入 P0-4 + 合规覆盖面扩展）
 
 ### 背景

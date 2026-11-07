@@ -1,8 +1,65 @@
 ---
 name: doc-redact
+version: 1.0.0
 description: 文档脱敏技能包。当用户要求对 Word、PPT、Excel、PDF、图片进行敏感信息遮盖、匿名化处理、数据脱敏、去标识化，或提及"脱敏"、"去标识"、"隐私保护"、"数据匿名"、"敏感信息遮盖"时触发。支持 .docx/.doc/.pptx/.ppt/.xlsx/.xls/.pdf/.png/.jpg/.jpeg/.bmp 等格式。
 agent_created: true
+requires_python: ">=3.9"
+requires_binaries:
+  - tesseract
+  - soffice
+license: MIT
 ---
+
+# 文档脱敏技能包（doc-redact）
+
+## 零、安装与自检（装载后必做）
+
+> **本节面向部署方**：技能包下载至企业内网 Agent 后，**先跑自检再投产**。
+> 内网机器与开发机的差异（缺包、缺二进制、端点配错）在开发机全部不可见，
+> 只有装载后自检才能提前暴露。
+
+```bash
+# 安装 Python 依赖（内网请加 -i <内网 PyPI 镜像>）
+pip install -r requirements.txt
+
+# 一键体检（必做）
+python3 scripts/doctor.py
+```
+
+`doctor.py` 覆盖六类检查：Python 版本、Python 依赖包、外部二进制
+（tesseract / LibreOffice）、包内文件完整性、LLM 端点合规、开发者路径残留。
+
+| 退出码 | 含义 | 处置 |
+|---|---|---|
+| `0` | 全部通过 | 可投产 |
+| `1` | 有必装项缺失 / 端点不合规 | **禁止投产**，先补齐 |
+| `2` | 有告警项（可选能力缺失） | 可运行，须确认降级影响面 |
+| `3` | 自检本身无法执行 | 检查参数与路径 |
+
+> **包内路径不依赖当前工作目录**——所有脚本以 `__file__` 自解析包根，
+> 可从任意目录调用。数据文件（人名库等）可用环境变量 `AIKIT_DATA_ROOT`
+> 指向内网统一数据目录。
+>
+> 完整部署步骤见 `docs/内网部署指南.md`；分发包构建见
+> `python3 scripts/build_package.py`。
+
+### 包根定位约定
+
+> **本文后续所有命令中的 `scripts/` 均相对「技能包根目录」**。
+> Agent 调用脚本前应先确定包根，再执行命令。
+
+```bash
+# 定位技能包根目录（取 SKILL.md 所在目录）
+SKILL_ROOT="$(cd "$(dirname "$(find /opt/agent/skills -name SKILL.md -path '*doc-redact*' | head -1)")" && pwd)"
+
+# 之后统一用绝对路径调用
+python3 "$SKILL_ROOT/scripts/redact_word.py" <输入文件> [输出文件]
+```
+
+若 Agent 运行时已知包根（如配置项 `skill_root`），直接使用即可，
+无须每次重新定位。
+
+
 
 # 文档脱敏技能包（doc-redact）
 
