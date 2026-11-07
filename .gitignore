@@ -42,3 +42,13 @@ output/
 **/[0-9a-z_][0-9a-z_][0-9a-z_][0-9a-z_][0-9a-z_][0-9a-z_][0-9a-z_][0-9a-z_]
 wtest_probe.txt
 .wb_*
+
+# 测试执行临时区（测试辅助物与基线副本，不入库）
+.tmpwork/
+
+# 断点续传状态文件（运行时产物，默认落在输出目录；此处兜底 CWD 残留）
+.redact_state.json
+
+# 探针残留
+zz_probe_normal.txt
+/-

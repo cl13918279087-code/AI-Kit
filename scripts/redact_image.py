@@ -289,8 +289,57 @@ def _apply_year_spans_by_block(img_arr, ocr_data: dict, apply_fn,
 # 命中→专用通道（与人工返工逐字节一致）；未命中→通用通道（行为与旧版全同）
 # ---------------------------------------------------------------------------
 
-import cv2
-import numpy as np
+# 【可选依赖延迟导入】
+#   cv2 / numpy 属**可选**依赖（doctor.py 中列为 warn 级），内网机器可能未装。
+#   原实现为模块级 `import cv2`，导致缺包时**整个脚本无法导入**——
+#   连 `--help`、用法提示都直接抛 ModuleNotFoundError 崩溃，
+#   运维无法从错误信息判断「是缺包还是用法错」。
+#   现改为按需延迟导入 + 缺失时给出可读提示与明确退出码。
+try:  # pragma: no cover - 依赖探测
+    import cv2
+except ImportError:  # pragma: no cover
+    cv2 = None
+
+try:  # pragma: no cover
+    import numpy as np
+except ImportError:  # pragma: no cover
+    np = None
+
+try:  # pragma: no cover
+    import pytesseract
+except ImportError:  # pragma: no cover
+    pytesseract = None
+
+
+def _require_cv2(feature: str = "图像结构化检测"):
+    """确保 cv2 可用；不可用时抛出可读异常（不抛裸 ImportError 栈）。"""
+    if cv2 is None:
+        raise RuntimeError(
+            f"缺少可选依赖 opencv-python，无法执行「{feature}」。"
+            "请在目标机器安装：pip install opencv-python（离线环境请用内网 wheelhouse）"
+        )
+    return cv2
+
+
+def _require_np(feature: str = "图像数组运算"):
+    """确保 numpy 可用；不可用时抛出可读异常。"""
+    if np is None:
+        raise RuntimeError(
+            f"缺少可选依赖 numpy，无法执行「{feature}」。"
+            "请在目标机器安装：pip install numpy（离线环境请用内网 wheelhouse）"
+        )
+    return np
+
+
+def _require_pytesseract(feature: str = "图片 OCR 文字识别"):
+    """确保 pytesseract 可用；不可用时抛出可读异常（不抛裸 ImportError 栈）。"""
+    if pytesseract is None:
+        raise RuntimeError(
+            f"缺少可选依赖 pytesseract，无法执行「{feature}」。"
+            "请在目标机器安装：pip install pytesseract（离线环境请用内网 wheelhouse），"
+            "并确认 tesseract 二进制已加入 PATH"
+        )
+    return pytesseract
 
 
 def _detect_orgchart_scene(img_arr) -> dict:
@@ -299,7 +348,9 @@ def _detect_orgchart_scene(img_arr) -> dict:
     返回 {"matched": bool, "detail": dict}。
     命中条件：底部带冒号组标签 ≥3 且 角色前缀行 ≥2 且 存在表格框线。
     """
-    import pytesseract
+    pytesseract = _require_pytesseract("组织架构图场景检测")
+
+    _require_cv2("组织架构图场景检测")
 
     ih, iw = img_arr.shape[:2]
     gray = cv2.cvtColor(img_arr, cv2.COLOR_RGB2GRAY)
@@ -451,7 +502,7 @@ def _redact_by_border_boxes(img_arr, apply_fn,
       - 标签行以下所有单元格整格打码（马赛克覆盖，包括 OCR 漏检区域）
     返回打码格数。
     """
-    import pytesseract
+    pytesseract = _require_pytesseract()
 
     ih, iw = img_arr.shape[:2]
     grid = _find_table_grid(img_arr)
@@ -538,7 +589,7 @@ def _redact_orgchart_table(img_arr, apply_fn, method: str = "mosaic") -> int:
     底部：组标签行锚定 + 表格框线定位（G2），整格遮蔽标签行以下全部内容。
     返回打码处数。
     """
-    import pytesseract
+    pytesseract = _require_pytesseract()
 
     ih, iw = img_arr.shape[:2]
     ocr_data = pytesseract.image_to_data(img_arr, output_type=pytesseract.Output.DICT)
@@ -630,7 +681,7 @@ def _redact_image_iterative(img_arr, apply_fn,
     H6（赵辉，第5批，2026-10-09）：OCR 选区打码复验迭代。
     返回 {"counts": {label: n}, "iterations": int, "total": int}。
     """
-    import pytesseract
+    pytesseract = _require_pytesseract()
 
     total_counts = {}
     iterations = 0
@@ -708,9 +759,9 @@ def detect_logo_regions(img_arr) -> list:
     策略：OCR 找到含"银行"文本 → 扩展左侧区域 → 颜色/边缘启发式判断。
     返回 [(x1, y1, x2, y2), ...]。
     """
-    import cv2
-    import numpy as np
-    import pytesseract
+    cv2 = _require_cv2("银行 Logo 检测")
+    np = _require_np("图像数组运算")
+    pytesseract = _require_pytesseract("银行 Logo 检测")
 
     h, w = img_arr.shape[:2]
     logo_regions = []
@@ -781,7 +832,7 @@ def _merge_overlapping(regions, threshold=50) -> list:
 
 def _apply_mosaic(arr, x1, y1, x2, y2, block_size=16) -> None:
     """原地马赛克"""
-    import cv2
+    cv2 = _require_cv2("马赛克遮盖")
     region = arr[y1:y2, x1:x2]
     rh, rw = region.shape[:2]
     sh = max(2, rh // block_size)
@@ -793,7 +844,7 @@ def _apply_mosaic(arr, x1, y1, x2, y2, block_size=16) -> None:
 
 def _apply_blur(arr, x1, y1, x2, y2, radius=15) -> None:
     """原地高斯模糊"""
-    import cv2
+    cv2 = _require_cv2("高斯模糊遮盖")
     region = arr[y1:y2, x1:x2]
     blurred = cv2.GaussianBlur(region, (radius * 2 + 1, radius * 2 + 1), 0)
     arr[y1:y2, x1:x2] = blurred
@@ -824,7 +875,7 @@ def _apply_solid_fill(arr, x1, y1, x2, y2) -> None:
     if x2 + 5 <= arr.shape[1]:
         border_pixels.append(arr[y1:y2, x2:x2+5].reshape(-1, 3))
     if border_pixels:
-        import numpy as np
+        np = _require_np("纯色填充取色")
         all_border = np.vstack(border_pixels)
         # 众数 RGB（按行聚合成元组后统计）
         from collections import Counter
@@ -858,8 +909,8 @@ def redact_image(input_path: str, output_path: str = None,
     返回:
         各类遮盖计数
     """
-    import pytesseract
-    import numpy as np
+    pytesseract = _require_pytesseract("图片脱敏主流程")
+    np = _require_np("图像数组运算")
 
     if output_path is None:
         # R-⑬（v1.3.7，Issue #13-①）：默认输出名统一走文件名脱敏
@@ -977,7 +1028,20 @@ def main():
         print(f"[错误] 不支持的文件格式: {ext}", file=sys.stderr)
         sys.exit(1)
 
-    redact_image(input_file, output_file, method)
+    try:
+        redact_image(input_file, output_file, method)
+    except RuntimeError as e:
+        # 可选依赖缺失 → 可读提示 + 明确退出码，不打印 Python 栈
+        print(f"[错误] {e}", file=sys.stderr)
+        print("[错误] 未生成任何产物（原文件未改动）", file=sys.stderr)
+        sys.exit(2)
+    except Exception as e:
+        print(f"[错误] 处理失败: {type(e).__name__}: {e}", file=sys.stderr)
+        print("[错误] 已中止处理，未生成任何产物（原文件未改动）", file=sys.stderr)
+        if os.environ.get("AIKIT_DEBUG", "").strip() in ("1", "true", "True"):
+            import traceback
+            traceback.print_exc()
+        sys.exit(1)
 
 
 if __name__ == "__main__":

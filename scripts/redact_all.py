@@ -458,9 +458,44 @@ _ALL_DEGRADATIONS: list = []
 
 
 def _resolve_output_path(input_path: str, output_path: str = None) -> str:
-    """推导最终输出路径（与 redact_file 的默认命名口径一致）。"""
+    """推导最终输出路径（与 redact_file 的默认命名口径一致）。
+
+    【输出参数语义】
+      `output_path` 既可以是**输出文件路径**，也可以是**输出目录**——
+      判据（任一成立即按目录处理）：
+        1) 已是存在的目录；
+        2) 以路径分隔符结尾（如 `./output/`）；
+        3) **路径无扩展名**（如 `./output`）——输出文件必有扩展名
+           （docx/xlsx/pptx/pdf/图片），无扩展名几乎必然是目录语义。
+      按目录处理时，在其下按默认命名 `<原文件名>_脱敏<扩展名>` 落盘，
+      manifest 同样落在该目录内（不越权写到目录之外）。
+
+      【修复记录】
+        原实现只认前两个判据，`-o ./output`（无尾斜杠、目录尚不存在）
+        会被当成**文件路径**，产出一个名为 `output` 的无扩展名文件，
+        且 manifest 落到目录之外（`output_manifest.json`）——
+        违反「产物不得越权写出输出目录」的审计要求。
+    """
     if output_path:
-        return str(Path(output_path).resolve())
+        p = Path(output_path)
+        is_dir_semantic = (
+            p.is_dir()
+            or str(output_path).endswith(("/", "\\"))
+            or not p.suffix          # 无扩展名 → 目录语义
+        )
+        if is_dir_semantic:
+            p.mkdir(parents=True, exist_ok=True)
+            src = Path(input_path).resolve()
+            ext = src.suffix.lower()
+            suffix_map = {
+                ".docx": "_脱敏.docx", ".doc": "_脱敏.doc",
+                ".xlsx": "_脱敏.xlsx", ".xls": "_脱敏.xls",
+                ".pptx": "_脱敏.pptx", ".ppt": "_脱敏.ppt",
+                ".pdf": "_脱敏.pdf",
+            }
+            default_suffix = suffix_map.get(ext, "_脱敏" + ext)
+            return str(p / f"{src.stem}{default_suffix}")
+        return str(p.resolve())
     p = Path(input_path).resolve()
     ext = p.suffix.lower()
     suffix_map = {
@@ -477,7 +512,19 @@ def redact_file(input_path: str, output_path: str = None,
                 method: str = "mosaic",
                 manifest_override: str = None,
                 auto_gray: bool = False) -> dict:
-    """对单个文件执行脱敏，返回统计"""
+    """对单个文件执行脱敏，返回统计。
+
+    【契约】
+      · 不支持格式 → 返回 ``None``，并在 stderr 给出可读错误（不留任何产物）；
+      · 处理失败   → 返回 ``None``，置失败标志（退出码 1），不留任何产物；
+      · 成功       → 返回统计字典。
+    返回 ``None`` 而非空字典，是为了与「成功但 0 处遮盖」区分开——
+    后者返回 ``{}``（空字典），调用方据此判定「处理完成但无命中」。
+    """
+    # 【语法】global 声明必须置于函数内对该名字的首次赋值之前，
+    # 否则 Python 报 "assigned to before global declaration"。统一上提至函数首行。
+    global _LAST_FILE_FAILED
+
     input_path = Path(input_path).resolve()
     ext = input_path.suffix.lower()
 
@@ -485,8 +532,9 @@ def redact_file(input_path: str, output_path: str = None,
 
     handler = _load_handler(ext)
     if handler is None:
+        _LAST_FILE_FAILED = True
         print(f"[错误] 不支持的文件格式: {ext}", file=sys.stderr)
-        return {}
+        return None
 
     print(f"\n[处理] {input_path.name}")
     print(f"[格式] {ext}")
@@ -511,12 +559,16 @@ def redact_file(input_path: str, output_path: str = None,
         # 【审计链 P0-3】处理失败 = **无产物**，与「降级但有产物」是两种终态。
         # 此处显式置失败标志，使退出码取 1（失败）而非 2（降级），
         # 避免「失败被降级掩盖」——那正是 P0-3 要消除的静默失真。
-        global _LAST_FILE_FAILED
         _LAST_FILE_FAILED = True
-        print(f"[错误] 处理失败: {e}", file=sys.stderr)
-        import traceback
-        traceback.print_exc()
-        return {}
+        print(f"[错误] 处理失败: {type(e).__name__}: {e}", file=sys.stderr)
+        print(f"[错误] 已中止该文件处理，未生成任何产物（原文件未改动）",
+              file=sys.stderr)
+        # 【可读性】默认不向 stderr 倾泻 Python 栈——内网运维看到的是
+        # 「可读原因 + 无产物」，而非开发期调试栈。调试时置 AIKIT_DEBUG=1。
+        if os.environ.get("AIKIT_DEBUG", "").strip() in ("1", "true", "True"):
+            import traceback
+            traceback.print_exc()
+        return None
     finally:
         # 【审计链 P0-3】本文件的降级事件并入累计列表（含失败路径——
         # 失败路径同样可能伴随降级事件，如「转换全链失败」本身被登记为
@@ -548,6 +600,8 @@ def redact_batch(patterns: list, output_dir: str = None,
     for f in files:
         out = out_dir / f.name if out_dir else None
         counts = redact_file(str(f), str(out) if out else None, method)
+        if counts is None:
+            continue        # 失败：已置失败标志并输出可读错误，不参与汇总
         for k, v in counts.items():
             total_counts[k] = total_counts.get(k, 0) + v
 
@@ -657,14 +711,16 @@ def main():
         try:
             # 正常执行，handlers 会读取 override_path
             counts = redact_file(files[0], output, method, manifest_override=override_path)
-            # Issue #54 D1：裁决记录随 manifest.json 归档（合规留痕）
-            write_redaction_manifest(
-                _resolve_output_path(files[0], output),
-                counts=counts,
-                decisions=read_decision_records(agent_decisions),
-                source_path=files[0],
-                mode="agent-decisions",
-            )
+            # 失败（counts is None）→ 不归档 manifest（避免留下「看似已处理」的伪留痕）
+            if counts is not None:
+                # Issue #54 D1：裁决记录随 manifest.json 归档（合规留痕）
+                write_redaction_manifest(
+                    _resolve_output_path(files[0], output),
+                    counts=counts,
+                    decisions=read_decision_records(agent_decisions),
+                    source_path=files[0],
+                    mode="agent-decisions",
+                )
         finally:
             # 【合规】override 文件含实体原文，任务结束即清理（异常路径亦清理）
             cleanup_work_files(override_path)
@@ -677,14 +733,16 @@ def main():
             # Issue #21 / #54 D1：灰区自动裁决留痕（不阻断脱敏）
             pending_path = export_auto_gray_decisions(files[0], output)
         counts = redact_file(files[0], output, method, auto_gray=auto_gray)
-        # Issue #54 D1：裁决记录随 manifest.json 归档（合规留痕）
-        write_redaction_manifest(
-            _resolve_output_path(files[0], output),
-            counts=counts,
-            decisions=read_decision_records(pending_path) if pending_path else [],
-            source_path=files[0],
-            mode="auto-gray" if auto_gray else "manual",
-        )
+        # 失败（counts is None）→ 不归档 manifest（避免留下「看似已处理」的伪留痕）
+        if counts is not None:
+            # Issue #54 D1：裁决记录随 manifest.json 归档（合规留痕）
+            write_redaction_manifest(
+                _resolve_output_path(files[0], output),
+                counts=counts,
+                decisions=read_decision_records(pending_path) if pending_path else [],
+                source_path=files[0],
+                mode="auto-gray" if auto_gray else "manual",
+            )
         sys.exit(_exit_code_for_degradations())
     else:
         redact_batch(files, output, method)

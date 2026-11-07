@@ -203,7 +203,11 @@ def test_redact_result_is_degraded_flag():
 
 def _run_cli(args, cwd):
     env = dict(os.environ)
-    env["PYTHONPATH"] = str(Path(cwd) / "scripts")
+    # 【环境兼容】追加而非覆盖 PYTHONPATH：受限环境（禁止删除临时文件）下
+    # 子进程需继承 sitecustomize 适配，否则 tempfile 探针失败、
+    # CLI 报 "No usable temporary directory" 而非真实业务错误。
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(Path(cwd) / "scripts"), env.get("PYTHONPATH", "")]).strip(os.pathsep)
     p = subprocess.run([sys.executable] + args, cwd=str(cwd),
                        capture_output=True, text=True, env=env)
     return p
@@ -397,7 +401,8 @@ def test_endpoint_check_empty_url_rejected():
 
 def test_endpoint_check_cli_exit_codes():
     env = dict(os.environ)
-    env["PYTHONPATH"] = str(REPO_ROOT / "scripts")
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(REPO_ROOT / "scripts"), env.get("PYTHONPATH", "")]).strip(os.pathsep)
     script = str(REPO_ROOT / "scripts" / "endpoint_check.py")
 
     p = subprocess.run([sys.executable, script, "--base-url",
@@ -421,7 +426,8 @@ def test_endpoint_check_cli_exit_codes():
 
 def test_endpoint_check_cli_no_endpoint_exits_3():
     env = dict(os.environ)
-    env["PYTHONPATH"] = str(REPO_ROOT / "scripts")
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(REPO_ROOT / "scripts"), env.get("PYTHONPATH", "")]).strip(os.pathsep)
     script = str(REPO_ROOT / "scripts" / "endpoint_check.py")
     p = subprocess.run([sys.executable, script, "--config", "/nonexistent.json"],
                        capture_output=True, text=True, env=env)

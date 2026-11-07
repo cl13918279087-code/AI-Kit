@@ -283,9 +283,11 @@ def process_single_file(args: Tuple[str, str, str, bool]) -> RedactResult:
             "entities_count": entities_count,
         })
 
-        # Stage 3: WRITING（文件写出）
+        # Stage 3: WRITING（文件写出 + manifest 归档）
         stage_write_start = time.time()
-        manifest_path = str(output_path) + "_manifest.json"
+        manifest_path = _write_manifest(
+            str(output_path), counts=result.get("counts") or {},
+            degradations=degradations, source_path=input_path)
         stages.append({
             "stage": "writing",
             "status": STATUS_COMPLETE,
@@ -322,12 +324,62 @@ def process_single_file(args: Tuple[str, str, str, bool]) -> RedactResult:
         )
 
 
+def _write_manifest(output_path: str, counts: dict, degradations: list,
+                    source_path: str = "") -> str:
+    """写出脱敏 manifest（JSON + Markdown），返回 manifest.json 路径。
+
+    【审计链 P0-4 补强】
+      此前 `RedactResult.manifest_path` 只**声明**了一个路径，
+      实际从不落盘——下游按该字段取审计留痕会拿到「文件不存在」。
+      本函数让声明与事实一致：**要么真实落盘，要么返回空串**。
+
+    与 `redact_all.write_redaction_manifest` 同口径：
+      · 只记计数、类别、决策、LLM 审计状态与降级元数据；
+      · **不含任何文档原文**。
+    """
+    try:
+        from manifest import RedactionManifest
+        import llm_egress
+    except Exception:
+        return ""
+
+    try:
+        out = Path(output_path)
+        m = RedactionManifest(filename=out.name)
+        stats = {k: v for k, v in (counts or {}).items()
+                 if isinstance(v, (int, float)) and not isinstance(v, bool)}
+        m.set_stats(**stats)
+        m.stats["mode"] = "pipeline"
+        if source_path:
+            m.stats["source_file"] = str(source_path)
+        m.add_degradations(degradations or [])
+        try:
+            rt = llm_egress.get_runtime()
+            m.llm_enabled = rt["enabled"]
+            m.llm_chars_sent = rt["chars_sent"]
+            m.llm_pre_redacted = rt["pre_redacted"]
+            m.llm_masked_chars = rt["masked_chars"]
+            m.llm_masked_spans = rt["masked_spans"]
+            m.llm_egress_policy = rt["egress_policy"]
+        except Exception:
+            pass
+        json_path = str(out) + "_manifest.json"
+        m.save_json(json_path)
+        m.save_markdown(str(out) + "_manifest.md")
+        return json_path
+    except Exception as e:
+        print(f"[提示] manifest 归档失败（{e}）", file=sys.stderr)
+        return ""
+
+
 def _process_word(input_path: str, output_path: str) -> Dict[str, Any]:
     from redact_word import redact_word
     import degradation
     degradation.clear_degradations()
     manifest = redact_word(input_path, output_path)
-    return {"entities_count": sum(v for v in manifest.values() if isinstance(v, int)),
+    counts = {k: v for k, v in (manifest or {}).items() if isinstance(v, int)}
+    return {"entities_count": sum(counts.values()),
+            "counts": counts,
             "degradations": degradation.get_degradations()}
 
 
@@ -336,7 +388,9 @@ def _process_excel(input_path: str, output_path: str) -> Dict[str, Any]:
     import degradation
     degradation.clear_degradations()
     manifest = redact_excel(input_path, output_path)
-    return {"entities_count": sum(v for v in manifest.values() if isinstance(v, int)),
+    counts = {k: v for k, v in (manifest or {}).items() if isinstance(v, int)}
+    return {"entities_count": sum(counts.values()),
+            "counts": counts,
             "degradations": degradation.get_degradations()}
 
 
@@ -345,7 +399,9 @@ def _process_ppt(input_path: str, output_path: str) -> Dict[str, Any]:
     import degradation
     degradation.clear_degradations()
     manifest = redact_ppt(input_path, output_path)
-    return {"entities_count": sum(v for v in manifest.values() if isinstance(v, int)),
+    counts = {k: v for k, v in (manifest or {}).items() if isinstance(v, int)}
+    return {"entities_count": sum(counts.values()),
+            "counts": counts,
             "degradations": degradation.get_degradations()}
 
 
@@ -354,7 +410,9 @@ def _process_pdf(input_path: str, output_path: str) -> Dict[str, Any]:
     import degradation
     degradation.clear_degradations()
     manifest = redact_pdf(input_path, output_path)
-    return {"entities_count": sum(v for v in manifest.values() if isinstance(v, int)),
+    counts = {k: v for k, v in (manifest or {}).items() if isinstance(v, int)}
+    return {"entities_count": sum(counts.values()),
+            "counts": counts,
             "degradations": degradation.get_degradations()}
 
 
@@ -363,7 +421,9 @@ def _process_image(input_path: str, output_path: str) -> Dict[str, Any]:
     import degradation
     degradation.clear_degradations()
     manifest = redact_image(input_path, output_path)
-    return {"entities_count": sum(v for v in manifest.values() if isinstance(v, int)),
+    counts = {k: v for k, v in (manifest or {}).items() if isinstance(v, int)}
+    return {"entities_count": sum(counts.values()),
+            "counts": counts,
             "degradations": degradation.get_degradations()}
 
 
@@ -654,7 +714,8 @@ def main():
     parser.add_argument("--workers", type=int, default=5, help="并行处理数量（默认: 5）")
     parser.add_argument("--overwrite", action="store_true", help="覆盖已存在的输出文件")
     parser.add_argument("--resume", action="store_true", help="启用断点续传")
-    parser.add_argument("--resume-state", default=".redact_state.json", help="断点续传状态文件路径")
+    parser.add_argument("--resume-state", default=None,
+                        help="断点续传状态文件路径（默认: <输出目录>/.redact_state.json）")
     parser.add_argument("-v", "--verbose", action="store_true", help="显示详细日志")
 
     args = parser.parse_args()
@@ -687,16 +748,20 @@ def main():
     logger.info(f"输入路径: {args.input}")
     logger.info(f"找到 {len(input_files)} 个文件")
 
-    # 断点续传
-    resume_state = None
-    if args.resume:
-        resume_state = ResumeState(args.resume_state)
-        summary = resume_state.get_summary()
-        logger.info(f"断点续传状态: 已完成 {summary['done']}/{summary['total']}")
-
     # 创建输出目录
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # 断点续传
+    # 【修复】状态文件默认落**输出目录**而非当前工作目录——
+    # 落在 CWD 会污染调用方工作目录（Agent 场景 CWD 往往是用户数据目录），
+    # 且同一次运行的多次调用会互相覆盖。显式传 --resume-state 时尊重用户指定。
+    resume_state = None
+    if args.resume:
+        state_path = args.resume_state or str(output_dir / ".redact_state.json")
+        resume_state = ResumeState(state_path)
+        summary = resume_state.get_summary()
+        logger.info(f"断点续传状态: 已完成 {summary['done']}/{summary['total']}")
 
     # 执行批量处理
     start_time = time.time()

@@ -4934,29 +4934,24 @@ REDACTION_LABELS: Dict[str, str] = {
 
 
 def count_redactions(text: str) -> Dict[str, int]:
-    """统计文本中各类敏感信息的出现次数"""
+    """统计文本中各类敏感信息的出现次数。
+
+    【修复说明】
+      原实现用「规则序号 → REDACTION_LABELS.values() 下标」映射类别标签，
+      但生效规则数（40+）与标签表条目数（14）根本不对齐，且残留一段
+      `for (key,), (pattern, _) in zip(...)` 的死代码——该解包对
+      `[[k] for k in ...]` 与 `[[p] for p in ...]` 恒抛 ValueError，
+      导致本函数**任何输入都直接崩溃**（下游 `redact_excel` /
+      `redact_all` 若调用将整链失败）。
+
+      现改为复用 `apply_redactions_counted`——它按**实际生效的替换动作**
+      逐处计数并由 `_label_for_replacement` 归类，口径与真实脱敏结果一致。
+    """
     if not text:
         return {}
 
-    counts: Dict[str, int] = {}
-    patterns = _get_patterns()
-
-    # 使用 REDACTION_LABELS 的 key 顺序统计
-    for (key,), (pattern, _) in zip(
-        [[k] for k in REDACTION_LABELS.keys()],
-        [[p] for p in patterns]
-    ):
-        pass  # 先统计再映射
-
-    # 简化：按类型名统计
-    labels = list(REDACTION_LABELS.values())
-    for i, (pattern, _) in enumerate(patterns):
-        found = pattern.findall(text)
-        if found:
-            label = labels[i] if i < len(labels) else f"类型{i}"
-            counts[label] = counts.get(label, 0) + len(found)
-
-    return counts
+    _, counts = apply_redactions_counted(text)
+    return dict(counts)
 
 
 def get_redaction_map() -> List[Tuple[str, str]]:
