@@ -365,6 +365,42 @@ def test_skill_has_required_metadata():
         assert key in fm, f"SKILL.md frontmatter 缺 {key}"
 
 
+def test_skill_has_platform_file_header_fields():
+    """平台文件头规范字段须齐备（发布登记/装载必读）。"""
+    fm = _skill_frontmatter()
+    for key in ("name:", "display_name:", "description:", "author:",
+                "department:", "Version:", "Usage_scope:"):
+        assert key in fm, f"SKILL.md frontmatter 缺 {key}"
+
+
+def test_skill_name_format_is_lowercase_hyphen():
+    """name 须为小写英文单词 + 短横线分隔（平台唯一标识 key 约束）。"""
+    fm = _skill_frontmatter()
+    name = re.search(r"^name:\s*(\S+)", fm, re.M).group(1).strip()
+    assert re.match(r"^[a-z0-9]+(-[a-z0-9]+)*$", name), \
+        f"name 不合规（小写+短横线）：{name}"
+    assert " " not in name and "_" not in name
+
+
+def test_skill_display_name_and_description_are_chinese():
+    """display_name 与 description 须为中文（平台展示与检索口径）。"""
+    fm = _skill_frontmatter()
+    display = re.search(r"^display_name:\s*(\S+)", fm, re.M).group(1).strip()
+    assert re.search(r"[\u4e00-\u9fff]", display), \
+        f"display_name 须为中文：{display}"
+    desc = re.search(r'^description:\s*"(.*)"\s*$', fm, re.M).group(1)
+    assert re.search(r"[\u4e00-\u9fff]", desc), "description 须为中文"
+
+
+def test_skill_version_fields_are_both_present():
+    """Version（发布标识）与 version（semver）须并存且各自合规。"""
+    fm = _skill_frontmatter()
+    pub = re.search(r"^Version:\s*(\S+)", fm, re.M).group(1).strip()
+    assert re.match(r"^V\d+\.\d+\.\d+$", pub), f"Version 格式不合规：{pub}"
+    ver = re.search(r"^version:\s*(\S+)", fm, re.M).group(1).strip()
+    assert re.match(r"^\d+\.\d+\.\d+", ver), f"version 格式不合规：{ver}"
+
+
 def test_skill_name_matches_package_dir():
     """技能名须与分发目录名一致（Agent 按名装载）。"""
     fm = _skill_frontmatter()

@@ -1,7 +1,14 @@
 ---
 name: doc-redact
+display_name: 文档脱敏
+description: "文档脱敏技能包：对 Word、PPT、Excel、PDF、图片中的敏感信息做遮盖与匿名化处理，并产出可审计的脱敏清单。当用户要求数据脱敏、去标识化、隐私保护、敏感信息遮盖，或提及“脱敏”“去标识”“数据匿名”时触发。支持 .docx/.doc/.pptx/.ppt/.xlsx/.xls/.pdf/.png/.jpg/.jpeg/.bmp 等格式。"
+author: hui.zhao18
+department: "BUCON"
+Version: V0.0.1
+Usage_scope: 云端本地都能使用
+# version 为内网 Agent 装载契约字段（须为可解析的 semver，用于升级/回滚判定）；
+# Version 为对外发布标识。二者独立维护：发布标识随发布批次递增，semver 随功能批次递增。
 version: 1.0.0
-description: 文档脱敏技能包。当用户要求对 Word、PPT、Excel、PDF、图片进行敏感信息遮盖、匿名化处理、数据脱敏、去标识化，或提及"脱敏"、"去标识"、"隐私保护"、"数据匿名"、"敏感信息遮盖"时触发。支持 .docx/.doc/.pptx/.ppt/.xlsx/.xls/.pdf/.png/.jpg/.jpeg/.bmp 等格式。
 agent_created: true
 requires_python: ">=3.9"
 requires_binaries:

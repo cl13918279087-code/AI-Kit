@@ -1,5 +1,20 @@
 # Changelog
 
+## [Unreleased] - 2026-11-07（技能文件头按平台规范填制完善）
+
+### 变更
+
+- `SKILL.md` frontmatter 按平台文件头规范填制完善，新增字段：
+  `display_name`（文档脱敏）、`author`（hui.zhao18）、`department`（BUCON）、
+  `Version`（V0.0.1）、`Usage_scope`（云端本地都能使用）；
+  `name` 保持 `doc-redact`（小写 + 短横线分隔，兼作唯一标识 key），
+  `description` 改为带引号的中文用途描述。
+- `Version`（对外发布标识）与 `version`（内网装载契约 semver）并存，
+  职责分离：后者供 Agent 做升级/回滚判定，`scripts/build_package.py` 只读小写 `version`。
+- `README.md` 增补「技能元信息」表，`docs/内网部署指南.md` 同步 4.1 装载示例与版本标识发布流程。
+- `tests/test_install_readiness.py` 新增 4 项文件头契约测试（字段齐备、name 命名格式、
+  中文展示名与描述、双版本字段格式），共 35 项通过。
+
 ## [Unreleased] - 2026-11-07（内网安装就绪性整改第四批：技能包可无缝装载至内网 Agent）
 
 ### 背景

@@ -52,3 +52,8 @@ wtest_probe.txt
 # 探针残留
 zz_probe_normal.txt
 /-
+
+# 测试运行时解包临时目录（docx/pptx/xlsx 解包产物，不入库）
+redact_docx_*/
+redact_pptx_*/
+redact_xlsx_*/

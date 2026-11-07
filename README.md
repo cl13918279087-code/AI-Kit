@@ -5,6 +5,23 @@
 [![Python >= 3.9](https://img.shields.io/badge/Python-%3E%3D%203.9-blue)](https://www.python.org/)
 [![License MIT](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
+## 技能元信息
+
+| 字段 | 值 |
+|------|-----|
+| name（唯一标识 key） | `doc-redact` |
+| display_name | 文档脱敏 |
+| description | 文档脱敏技能包：对 Word/PPT/Excel/PDF/图片中的敏感信息做遮盖与匿名化，产出可审计脱敏清单 |
+| author | hui.zhao18 |
+| department | BUCON |
+| Version（对外发布标识） | V0.0.1 |
+| Usage_scope | 云端本地都能使用 |
+| version（内网装载 semver） | 1.0.0 |
+| license | MIT |
+
+> 完整文件头见 `SKILL.md` frontmatter。`Version` 与 `version` 并列：
+> 前者为对外发布标识，后者为内网 Agent 做升级/回滚判定用的 semver。
+
 ## 功能特性
 
 | 格式 | 支持类型 | 核心能力 |
