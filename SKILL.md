@@ -8,7 +8,7 @@ Version: V0.0.1
 Usage_scope: 云端本地都能使用
 # version 为内网 Agent 装载契约字段（须为可解析的 semver，用于升级/回滚判定）；
 # Version 为对外发布标识。二者独立维护：发布标识随发布批次递增，semver 随功能批次递增。
-version: 1.0.0
+version: 1.5.0
 agent_created: true
 requires_python: ">=3.9"
 requires_binaries:
