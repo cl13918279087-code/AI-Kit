@@ -4568,6 +4568,203 @@ def _apply_title_name_pass(text: str, counts: Dict[str, int]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# D-10（Issue #62）：正文叙述型人名 —— 「姓名 + 职务后缀」形态
+#
+# 【问题】Issue #62 §二 指出：程序召回人名依赖「D16 名单库」与
+#   「区域上下文（名单区 / 角色槽位 / 签名落款区）」双闸门。两者在
+#   **正文叙述句**中同时失效：
+#       "孙海刚行长指示业务部门"  →  原文一字未动
+#   该形态既不在 D16 精确全名库（孙海刚为库外姓名），
+#   也不在名单区（是正文散落叙述）。
+#   七组比对中 G2 组 9 处真实残留全部为「孙海刚」，标准版遮盖为 XXX。
+#
+# 【解法】新增独立通道 `_apply_narrative_title_pass`：
+#   匹配「姓 + 名用字{1,3} + 职务后缀」形态，命中时**只遮姓名**，
+#   职务后缀整体保留（"孙海刚行长" → "XXX行长"）。
+#
+# 【证据口径：上下文证据 + 部分字频证据（Issue #62 §四 方案 A）】
+#   职务后缀本身就是**上下文证据**——「某某+行长/经理/主任」里的前置二~四字
+#   几乎不可能是业务术语（业务术语的职务位在**后**："业务资深经理"）。
+#   故本通道**不要求尾字字频达标**：这正是 #62 漏脱的主因——
+#   "李义申"的尾字「申」字频仅 2，被 L1 字频闸门拦死在门外。
+#   但上下文证据不能单独用（否则"客户关系管理主管"类误伤），
+#   故按姓名长度分档收紧（见 `_has_narrative_name_evidence`）：
+#     · 2 字（姓 + 1 名用字）：尾字必须 **hot**（与 S1 高危姓规则同口径）
+#       ——「管理主管」（尾字「理」仅 warm）、「方案经理」（尾字「案」非 hot）豁免；
+#     · 3~4 字（姓 + 2~3 名用字）：尾字可低频，但要求其余字 ∈ hot∪warm
+#       且至少一个名用字 ∈ hot∪warm。
+#   姓氏位用 D16 实证姓氏集、护栏（业务词 / 整词保护 / 通用词豁免 / 边界误判）
+#   与纯职务标签判定一应俱全，保证「各条线副行长」这类纯职务标签不被拆。
+#
+# 【与既有通道的分工】
+#   · `_apply_title_name_pass`（#52）：「姓 + 职务后缀」（"李工"），2 字形态；
+#   · 本通道（#62）：「姓 + 名用字{1,3} + 职务后缀」（"孙海刚行长"）；
+#   · `_apply_role_context_pass`（#59）：「角色锚点 + 姓名」，锚点在**前**。
+#   三者形态互斥，不重叠。
+# ---------------------------------------------------------------------------
+
+# 叙述型职务后缀（L2 职务标签表之外的补充）
+#   "总" 是「李义申总提出」这类叙述句里的**单字**职务后缀（Issue #62 §四 方案 A
+#   给出的实例）。单字后缀的误伤面远大于双字后缀（"张总共"/"李总结"），
+#   故单列并收紧 —— 要求姓名部分 ≥ 3 字时才生效（见 _apply_narrative_title_pass）。
+_NARRATIVE_EXTRA_SUFFIXES = ("总", "董事长", "监事长", "首席", "会长", "社长")
+
+# 单字职务后缀集合（须收紧：姓名部分 ≥ 3 字）
+_NARRATIVE_SINGLE_SUFFIXES = frozenset({"总"})
+
+# 后缀 + 下一字 的组织形式排除：委员会 / 理事会 是「组织」而非「职务」——
+#   "风险管理委员会"里的"管理"不是人名（真实业务语料实测误伤点）。
+_NARRATIVE_SUFFIX_NEXT_GUARDS = {("委员", "会"), ("理事", "会")}
+
+# 姓名字尾字 + 职务后缀 组成的**词**（不是「人名 + 职务」）——必须排除。
+# 真实语料实测点（G7）："各条线执行人员提供执行数据，张瑜汇总，在决策会…"
+#   D-10 把「张瑜汇」当成名字、把「总」当成职务后缀 → 遮成 "XXX总"，
+#   把"汇总"拦腰切坏。此处按「字尾 + 单字后缀」成词表拦截。
+_NARRATIVE_NAME_TAIL_WORD_GUARDS = {
+    ("汇", "总"),   # 汇总
+    ("结", "总"),   # 总结
+    ("归", "总"),   # 归总
+    ("全", "总"),   # 全总
+}
+
+# 「姓 + 名用字{1,3} + 职务后缀」正则（带缓存）
+_NARRATIVE_TITLE_RE_CACHE: Optional[re.Pattern] = None
+
+
+def _get_narrative_title_re() -> Optional[re.Pattern]:
+    """「姓 + 名用字{1,3} + 职务后缀」正则（带缓存）。
+
+    姓氏位用 **D16 实证姓氏集**（gated surnames）——排除「刁/阚/…」等仅见于
+    《百家姓》的冷僻姓，它们是业务术语首字的高发区（水平/单元/沙子/明天）。
+    名用字用**名字用字池**；池外生僻字（谧/熔/缋）属 #60 的名字位字池缺口，
+    本通道不承担，候补由 #60 承接。
+    """
+    global _NARRATIVE_TITLE_RE_CACHE
+    if _NARRATIVE_TITLE_RE_CACHE is not None:
+        return _NARRATIVE_TITLE_RE_CACHE
+    pat = _get_role_label_patterns()
+    suffixes = {s for s in pat.get("suffixes", []) if s}
+    suffixes |= set(_NARRATIVE_EXTRA_SUFFIXES)
+    if not suffixes:
+        _NARRATIVE_TITLE_RE_CACHE = None
+        return None
+    # 长后缀优先（副行长 > 行长）
+    suf_sorted = sorted(suffixes, key=len, reverse=True)
+    suf_alt = "|".join(re.escape(s) for s in suf_sorted)
+    cfg = _load_config()
+    surnames = "".join(sorted(_get_gated_surnames(cfg)))
+    name_class = _build_name_char_class(_get_name_pool_chars())
+    _NARRATIVE_TITLE_RE_CACHE = re.compile(
+        rf"(?P<name>[{surnames}]{name_class}{{1,3}}?)(?P<suffix>{suf_alt})"
+    )
+    return _NARRATIVE_TITLE_RE_CACHE
+
+
+def _has_narrative_name_evidence(name: str) -> bool:
+    """D-10 证据层：**上下文证据**（职务后缀）+ **部分字频证据**。
+
+    方案 A 的立论：职务后缀本身就是上下文证据——「某某+行长/经理/主任」里的
+    前置二~四字几乎不可能是业务术语（业务术语的职务位在**后**：
+    "业务资深经理"/"市场推广经理"）。故本通道**不要求尾字字频达标**，
+    这正是 #62 漏脱的主因（"李义申"的尾字「申」字频为 2，被字频闸门拦死）。
+
+    但上下文证据不能单独用（否则"客户关系管理主管"类误伤），故按姓名长度分档：
+      · **2 字**（姓 + 1 名用字）：与 S1 高危姓规则**同口径**——尾字必须 hot。
+        「管理主管」（尾字「理」仅 warm）、「方案经理」（尾字「案」非 hot）
+        由此豁免；「张明经理」（尾字「明」hot）仍可脱敏。
+      · **3~4 字**（姓 + 2~3 名用字）：字频闸门放宽到"尾字可低频"，
+        但要求
+          ① 名字位**除尾字外**的字 ∈ hot∪warm；
+          ② 至少一个名用字 ∈ hot∪warm（避免"冷僻姓 + 全冷僻名"整串无证据）；
+          ③ L1 四合一判据（`_has_name_evidence`）命中时直接通过
+             —— 那是更强的证据（D16 全名 / 通用人名词典 / 尾字热）。
+    """
+    if not name or len(name) < 2:
+        return False
+    cfg = _load_config()
+    hot = _get_gated_name_chars(cfg)
+    warm = _get_warm_name_chars(cfg)
+    if len(name) == 2:
+        return name[1] in hot
+    if _has_name_evidence(name):
+        return True
+    mid = name[1:-1]
+    if mid and not all(c in hot or c in warm for c in mid):
+        return False
+    return any(c in hot or c in warm for c in name[1:])
+
+
+def _apply_narrative_title_pass(text: str, counts: Dict[str, int]) -> str:
+    """D-10（Issue #62 方案 A）：正文叙述型人名「姓名 + 职务后缀」召回通道。
+
+    例：
+      "孙海刚行长指示业务部门"  →  "XXX行长指示业务部门"
+      "由李义申总安排"          →  "由XXX总安排"
+      "李义申总提出"            →  "XXX总提出"
+      "各条线副行长、总监"      →  原样保留（纯职务标签，非人名）
+      "金融同业" / "电子银行"   →  原样保留（无职务后缀）
+    """
+    if not text or not isinstance(text, str):
+        return text
+    rx = _get_narrative_title_re()
+    if rx is None:
+        return text
+    out_lines = []
+    for line in text.split("\n"):
+        hits: List[Tuple[int, int]] = []
+        for m in rx.finditer(line):
+            name = m.group("name")
+            suffix = m.group("suffix")
+            s0, s1 = m.start("name"), m.end("name")
+            if len(name) < 2:
+                continue
+            # 单字职务后缀（"总"）误伤面大 → 收紧到姓名部分 ≥ 3 字
+            if suffix in _NARRATIVE_SINGLE_SUFFIXES and len(name) < 3:
+                continue
+            # 组织形式排除（委员会 / 理事会）——"风险管理委员会"不是人名
+            nxt = line[m.end("suffix")] if m.end("suffix") < len(line) else ""
+            if (suffix, nxt) in _NARRATIVE_SUFFIX_NEXT_GUARDS:
+                continue
+            # 「字尾 + 后缀」成词排除（汇总 / 总结）——"张瑜汇总"不是"张瑜 + 总"
+            if (name[-1], suffix) in _NARRATIVE_NAME_TAIL_WORD_GUARDS:
+                continue
+            # 纯职务标签（"各条线副行长"）→ 保留
+            if _is_pure_role_label(name):
+                continue
+            # 护栏：整词保护表 / 通用词豁免 / 边界误判
+            if _is_protected_by_common_word_guard(line, s0, s1):
+                continue
+            if _is_protected_by_standalone_exempt(line, s0, s1):
+                continue
+            if _is_boundary_split_misfire(line, s0, s1):
+                continue
+            # 业务词表命中（"业务资深经理"）→ 保留
+            if name in _get_biz_guard_words():
+                continue
+            # 证据层（上下文证据 + 部分字频证据）
+            if not _has_narrative_name_evidence(name):
+                continue
+            hits.append((s0, s1))
+        if not hits:
+            out_lines.append(line)
+            continue
+        # 去重叠：靠前优先；同起点取更长（贪婪匹配优先）
+        hits.sort(key=lambda x: (x[0], -(x[1] - x[0])))
+        merged: List[Tuple[int, int]] = []
+        last_end = -1
+        for s, e in hits:
+            if s >= last_end:
+                merged.append((s, e))
+                last_end = e
+        new_line = line
+        for s, e in reversed(merged):
+            counts["姓名"] = counts.get("姓名", 0) + 1
+            new_line = new_line[:s] + "XXX" + new_line[e:]
+        out_lines.append(new_line)
+    return "\n".join(out_lines)
+
+
+# ---------------------------------------------------------------------------
 # Issue #54 D1：命中通道分类（供灰区候选清单标注"命中通道"）
 # ---------------------------------------------------------------------------
 
@@ -5713,6 +5910,11 @@ def apply_redactions_counted(text: str) -> Tuple[str, Dict[str, int]]:
     # 须在通用姓名规则**之前**执行——"李工/陈总/张经理"等组合形态若先被
     # 通用姓名规则切开，会同时产生漏脱与误伤（#52 §一 案例 #20）。
     result = _apply_title_name_pass(result, counts)
+
+    # D-10（Issue #62）：正文叙述型人名「姓名 + 职务后缀」召回通道
+    # 须在**姓名规则组之前**执行——否则"孙海刚行长"会先被通用姓名规则
+    # 切成"孙XXX行长"，留下残尾且与标准版的"XXX行长"形态不一致。
+    result = _apply_narrative_title_pass(result, counts)
 
     # N-C 区域内逐项姓名判定（Issue #50 §4.8）
     # 规则A 退出主链路后，由本通道承接其召回职责：
