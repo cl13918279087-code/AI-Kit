@@ -389,6 +389,21 @@ def _build_name_char_class(chars: str) -> str:
     return "[" + escaped + "]"
 
 
+_NAME_POOL_SET_CACHE: Optional[set] = None
+
+
+def _get_name_pool_set() -> set:
+    """名字用字**集合**（带缓存）。
+
+    L1 证据层要逐子串判定「其余字 ∈ 名字用字池」，逐次构造集合的开销
+    不可接受，故在此缓存（原始池字符串变化时随 `_load_config` 重置）。
+    """
+    global _NAME_POOL_SET_CACHE
+    if _NAME_POOL_SET_CACHE is None:
+        _NAME_POOL_SET_CACHE = set(_get_name_pool_chars())
+    return _NAME_POOL_SET_CACHE
+
+
 # ---------------------------------------------------------------------------
 # Issue #49 P1：分级规则集（姓氏分档 + 名字位字频闸门）
 # ---------------------------------------------------------------------------
@@ -2798,6 +2813,21 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
     #   "总分行业务银行"/"各分行银行"中"分行"不应被替换
     #   策略：org pattern 第一分支中移除分行/支行（由 standalone suffix 规则处理）
     #   standalone suffix 含 D10 保护（(?!(?:分行银行|分行支行))），不吞银行名
+    #
+    # ---- D-4 整改（Issue #61-B）：组织名通道接入 L1/L4 守卫，守卫语义拆分
+    #   整改前本通道只用 G4-S「前缀成词整体保留」，语义含混：
+    #     · 「科技部」独立出现 → 脱敏为 XXXX（通用机构词误伤）；
+    #     · 「信息科技部」→ 命中的是「科技部」，因前缀成词而**整词保留**
+    #       （机构实体漏脱）。
+    #   两种表现出自同一条规则的两种副作用，必须按语义拆成两张表：
+    #     · `generic_words`（独立通用词）：本身即通用机构通名，**保留**
+    #       ——口径与人工标准版一致（实测标准版保留「科技部/作战部/运营中心/
+    #       运营部/营运部/管理部/营运管理部/信息技术部/财务部」等）；
+    #     · `composite_words`（前缀成词）：「通名 + 组织后缀」构成的机构
+    #       实体，**整段脱敏**——杜绝「信息XXXX」这类混合态。
+    _org_rules = cfg.get("org_name_rules") or {}
+    _org_generic_words = set(w for w in (_org_rules.get("generic_words") or []))
+    _org_composite_words = set(w for w in (_org_rules.get("composite_words") or []))
     if org_suffixes:
         suffix_alt = '|'.join(re.escape(s) for s in org_suffixes)
         _ORG_NAME_RE = re.compile(
@@ -2806,25 +2836,40 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
             rf'(?<![一-龥])[一-龥]{{2}}(?:部|科|中心|管委会|办公室)(?![一-龥])'
         )
 
+        # 前缀成词表：先于通用组织名规则执行，整段替换（不产生残尾）
+        if _org_composite_words:
+            _composite_alt = '|'.join(
+                re.escape(w) for w in sorted(_org_composite_words, key=len, reverse=True))
+            _ORG_COMPOSITE_RE = re.compile(rf'(?:{_composite_alt})')
+
+            def _org_composite_repl(m):
+                """前缀成词机构实体：整段脱敏（Issue #61 §四 验收 1）。"""
+                return rep.get("ORG", "XXXX")
+
+            patterns.append((_ORG_COMPOSITE_RE, _org_composite_repl))
+
         def _org_name_repl(m):
-            """组织名替换 + G4-S 前缀成词整体保留（Issue #53 §3.2）。
+            """组织名替换 + 守卫语义拆分（D-4：Issue #61-B + Issue #53 §3.2）。
 
-            【§3.2 规则】命中片段若只是某个「名词 + 组织后缀」复合实体的
-            **一部分**（前缀成词），则整词豁免——保留原文，不进入脱敏。
+            【独立通用词 → 保留】
+              命中片段本身就是通用机构通名（「科技部」「作战部」「运营中心」…）
+              时保留原文——它们不含可定位到具体机构的信息，
+              且与人工标准版口径一致（实测标准版全部保留这些词）。
 
-            例：「信息科技部与运维中心联合」
-              · 组织名正则命中的是「科技部」（第一分支硬编码，无左右边界）
-              · 「科技部」严格落在保护词「信息科技部」的出现区间内
-              · → G4-S 判为前缀成词 → 整词保留 → 输出「信息科技部与运维中心联合」
+            【前缀成词 → 整段脱敏】
+              「信息科技部」这类「通名 + 组织后缀」的机构实体由
+              `_ORG_COMPOSITE_RE` 先行整段替换，不留「信息XXXX」残尾。
 
-            【与既有脱敏设计的边界】
-              片段与保护词**完全相同**时不豁免（如独立的「科技部」仍脱敏为
-              XXXX）——否则组织名脱敏能力整体失效，且与门禁的「设计意图」
-              豁免口径冲突。
+            【G4-S 兜底】
+              其余前缀成词情形（如保护表中的更长词）仍按 Issue #53 §3.2
+              整词保留。
             """
+            frag = m.group(0)
+            if frag in _org_generic_words:
+                return frag
             if _is_protected_by_common_word_guard(m.string, m.start(), m.end(),
                                                   strict_longer=True):
-                return m.group(0)
+                return frag
             return rep.get("ORG", "XXXX")
 
         patterns.append((_ORG_NAME_RE, _org_name_repl))
@@ -2833,6 +2878,26 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
 # ---------- 13. 人员姓名（2-3个汉字，粗筛） ----------
     # ↓↓↓ 姓名规则从本行开始单独归组：apply_redactions 中地址通道在其之前执行 ↓↓↓
     _pre_pattern_count = len(patterns)
+
+    # -----------------------------------------------------------------------
+    # D-4 补丁（Issue #61-B）：通用机构词保留后，紧邻的人名仍须脱敏
+    # -----------------------------------------------------------------------
+    # 【问题】D-4 把「运营部」这类通用机构词改为**保留原文**后，
+    # 姓名通道的左边界（「前一字不得为汉字」）不再成立：
+    #     "运营部韩慧丽向部门领导汇报"
+    # 整改前 "运营部" 被脱敏成 XXXX（ASCII），边界成立 → 韩慧丽被脱敏；
+    # 整改后 "运营部" 保留 → 边界失效 → **韩慧丽漏脱**（金标回归）。
+    #
+    # 【解法】把「保留的通用机构词」当作**边界豁免点**：
+    # 其后紧跟的 2-3 字若具备**强**姓名证据（D16 精确全名 / 通用人名词典），
+    # 则整段脱敏。只用强证据而不用字频路径，避免把
+    # 「运营部配合完成」这类业务短语误判为人名。
+    if _org_generic_words:
+        _org_lb = "|".join(
+            f"(?<={re.escape(w)})"
+            for w in sorted(_org_generic_words, key=len, reverse=True))
+        _ORG_GEN_NAME_RE = re.compile(
+            rf'(?:{_org_lb})(?P<name>[\u4e00-\u9fa5]{{2,3}})')
 
     # D16（陈黎 Issue #45，2026-10）：精确全名匹配（7398人名优先于字符池规则）
     # - 从 config.json full_name_list 加载 7398 个已知全名
@@ -3305,17 +3370,30 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
         rep.get("NAME", "XXX")
     ))
 
-    # 规则C：姓氏 + 1个名字汉字（左侧必须是全角冒号，解决"组长：樊霖"型漏检）
-    # Rule B 要求 surname+2名字汉字，但"樊霖"只有 surname+1名字汉字，
-    # 在"组长：樊霖副组长"中 Rule B 无法匹配（霖后跟CJK"副"），
-    # Rule A 也无法匹配（霖后跟CJK"副"违反右边界）。
-    # 本规则专门处理：全角冒号后紧跟「姓氏+1名字汉字」的场景，右边界允许CJK跟随。
-    # R-F（Issue #5）：右边界同步移除
+    # 规则C：姓氏 + 名字汉字（左侧必须是全角冒号，解决"组长：樊霖"型漏检）
+    #
+    # 【D-1 整改（Issue #57）】恢复 `{1,3}` 贪婪量词：
+    #   整改前本规则只吃「姓 + 1 个名字汉字」，导致全角冒号场景的**三字名**
+    #   被截断成「XXX + 尾字」（"负责人：蔡昀煜" → "负责人：XXX煜"）——
+    #   残留的尾字能与人名库反查，等同未脱敏（隐蔽型合规事故）。
+    #   半角冒号规则C-1 与介词规则D 一直用 `{1,3}`，三条并列规则口径必须一致。
+    #
+    # 【贪婪后如何不吞职务词】
+    #   贪婪会把职务词一起吞进来（"组长：樊霖副组长" → 吞成 "樊霖副组"）。
+    #   正确解法不是"永久限制 1 字"，也不是"回退固定 1 字"
+    #   （回退 1 字会把职务词拦腰截断成 "XXX副组"），
+    #   而是**按职务词起点剥离**：命中片段内若出现职务词，
+    #   从该职务词的**起点**切开，姓名部分整段遮盖、职务词整体保留。
+    #
+    # 【为什么职务词通常根本吞不进来】
+    #   名字用字池不含「副/组/主/管/骨」等职务构词字，
+    #   贪婪匹配天然停在这些字之前；剥离逻辑是**兜底**
+    #   （例如「行长」中的「长」在池内，贪婪会多吃一个字）。
     patterns.append((
         re.compile(
-            rf'(?<=：)(?:{surname_alt}){name_char_class}'
+            rf'(?<=：)(?:{surname_alt}){name_char_class}{{1,3}}'
         ),
-        rep.get("NAME", "XXX")
+        _make_colon_name_repl(rep.get("NAME", "XXX"))
     ))
 
     # 规则D：姓氏 + 名字汉字（左侧是常见介词/动词，解决"由XXX负责"型漏检）
@@ -3605,6 +3683,287 @@ _ROLE_LIST_EXCLUDED = {
     "倒数第一", "倒数第二", "倒数第三",
 }
 
+
+# ---------------------------------------------------------------------------
+# 证据分层：L1 姓名证据层 / L2 职务标签层（2026-11-08 统一整改方案 §三）
+#
+# 【为什么要分层】
+# 整改前，槽位类通道（锚点扩散 / 顿号名单）只有**形态判据**：
+# 「2-4 字 CJK 块」「整行 CJK + 顿号」——凡形态像名字就脱敏。
+# 结果是「内部资料，禁止外传」这类并列短语被整段抹除、
+# 「各条线副行长」这类职务标签被当人名切走（Issue #58 / #59）。
+#
+# 【分层后的判定方向】
+#   L1 姓名证据层：**正向证据**（D16 全名 / 通用人名词典 / 姓氏+名用字+字频）
+#                    ——「这一块确实是人名」的证据；
+#   L2 职务标签层：**反向判据**（职务词后缀 / 通名前缀+职务后缀的组合式声明）
+#                    ——「这一块是职务标签」的证据；
+#   两者皆无 → **不可判定 → 保留**（缺省方向不对称：结构化槽位 strict，
+#              非结构化正文 loose——见整改方案 §三）。
+#
+# 【与 Issue #57 的分工】
+#   #57 解决「**确定是名字却切错了**」（精确匹配问题 → 贪婪 + 职务词剥离）；
+#   #58/#59 解决「**不确定是不是名字**」（保守判定问题 → 无证据不脱）。
+#   两条的判定依据不同、落点不同，互不覆盖。
+# ---------------------------------------------------------------------------
+
+_ROLE_LABEL_PATTERNS: Optional[Dict[str, Any]] = None
+_ROLE_SUFFIX_SORTED: Optional[List[str]] = None
+
+
+def _get_role_label_patterns() -> Dict[str, Any]:
+    """L2 职务标签层配置（config.json → role_label_patterns），带缓存。
+
+    【组合式声明】配置里给出的是「职务后缀 suffixes」+「通名前缀
+    prefix_forms」两张表，判定时按「prefix_forms + suffixes → 整体职务标签」
+    的组合规则合成，而不是逐词列举——这才跟得上「各条线副行长」这类
+    「通名 + 职务」的组合（Issue #59 根因 1：枚举法追不上组合爆炸）。
+    """
+    global _ROLE_LABEL_PATTERNS
+    if _ROLE_LABEL_PATTERNS is None:
+        cfg = _load_config()
+        raw = cfg.get("role_label_patterns") or {}
+        suffixes = [str(w).strip() for w in (raw.get("suffixes") or []) if str(w).strip()]
+        prefixes = [str(w).strip() for w in (raw.get("prefix_forms") or []) if str(w).strip()]
+        _ROLE_LABEL_PATTERNS = {"suffixes": suffixes, "prefix_forms": prefixes}
+    return _ROLE_LABEL_PATTERNS
+
+
+def _get_role_suffixes_sorted() -> List[str]:
+    """职务后缀词表（按长度降序，保证最长匹配优先）。"""
+    global _ROLE_SUFFIX_SORTED
+    if _ROLE_SUFFIX_SORTED is None:
+        _ROLE_SUFFIX_SORTED = sorted(
+            _get_role_label_patterns()["suffixes"], key=len, reverse=True)
+    return _ROLE_SUFFIX_SORTED
+
+
+def _find_role_start(word: str, limit: Optional[int] = None) -> Optional[int]:
+    """在 `word` 中定位**职务词起点**（最长匹配优先，同起点取最长词）。
+
+    返回起点下标；未命中返回 None。
+    `limit` 限定起点必须 < limit（用于「职务词起点必须落在贪婪匹配片段内部」
+    的判定）。
+    """
+    if not word:
+        return None
+    best: Optional[int] = None
+    for w in _get_role_suffixes_sorted():
+        idx = word.find(w)
+        if idx < 0:
+            continue
+        if limit is not None and idx >= limit:
+            continue
+        if best is None or idx < best:
+            best = idx
+            if best == 0:
+                break
+    return best
+
+
+def _has_name_evidence(word: str) -> bool:
+    """L1 姓名证据层：判断 `word` 是否具备「人名」的正向证据。
+
+    判据（四者之一即可，见整改方案 §三 L1）：
+      ① 该块 ∈ D16 精确全名表（config.full_name_list）；
+      ② 该块 ∈ 通用人名词典层（Issue #55 落地的那张表）；
+      ③ 该块首字 ∈ 实证姓氏集，且其余字 ∈ 名字用字池（name_pool），
+         且**尾字**字频 ∈ hot ∪ warm（D16 自举字频）；
+      ④ 反向护栏：命中业务词表 / 整词保护表的词**不算**人名证据。
+
+    【为什么尾字要过字频闸门】
+    「方案设计」「金融同业」这类词首字也可能是姓、其余字也在名字池里，
+    只有尾字字频能把它们挡在门外（实测：朴素判据误判 2/28，
+    叠加字频闸门与护栏表后归零）。
+
+    【为什么不要求首字字频】
+    高危姓/低危姓的门槛已在规则组内部处理；这里只做「像不像人名」的
+    粗判，避免把「王根利」这类尾字字频偏低的真名误杀。
+    """
+    if not word or not (2 <= len(word) <= 4):
+        return False
+    if not all("\u4e00" <= c <= "\u9fa5" for c in word):
+        return False
+    # ④ 护栏：业务词 / 整词保护表命中 → 不是人名
+    if word in _get_biz_guard_words():
+        return False
+    if word in _get_common_word_guards():
+        return False
+    # 通用词豁免表（#49 裁决：独立出现时豁免，如「叶子」）同样不构成人名证据
+    if word in _get_standalone_exempt_words():
+        return False
+    # ① D16 精确全名
+    if word in get_full_name_set():
+        return True
+    # ② 通用人名词典
+    if word in _get_common_name_dict():
+        return True
+    # ③ 姓氏 + 名用字 + 尾字字频
+    if word[0] not in SURNAME_SET:
+        return False
+    rest = word[1:]
+    if not all(c in _get_name_pool_set() for c in rest):
+        return False
+    tail = rest[-1]
+    cfg = _load_config()
+    return tail in _get_gated_name_chars(cfg) or tail in _get_warm_name_chars(cfg)
+
+
+def _is_role_label(word: str) -> bool:
+    """L2 职务标签层：判断 `word` 是否是职务标签（含组合式）。
+
+    判据：
+      ① 以职务后缀结尾（副行长 / 总经理 / 骨干 / 总监 …）；
+      ② 本身就是一个通名前缀（各业务部门 / 外部专家 …）；
+      ③ 「通名前缀 + 职务后缀」的组合——由 ① 自动覆盖，此处仅作说明。
+    """
+    if not word:
+        return False
+    pat = _get_role_label_patterns()
+    if word in pat["prefix_forms"]:
+        return True
+    return _find_role_start(word) is not None
+
+
+def _is_pure_role_label(word: str) -> bool:
+    """判断 `word` 是否为**纯职务标签**（不含人名成分）。
+
+    与 `_is_role_label`（L2 粗判）的区别：L2 命中「职务后缀」即可，
+    但「王组长」这类是「人名 + 职务」的混合形态——职务标签可识别，
+    姓氏却是个人信息，必须脱敏。本函数把两者区分开。
+
+    判据（自上而下，命中即返回）：
+      ① 整词 ∈ 通名前缀表（外部专家 / 各条线 / 业务 …）→ 纯标签；
+      ② 「通名前缀 + 职务后缀」组合（技术骨干 / 外部专家骨干 …）→ 纯标签；
+      ③ 职务词起点之前是**姓氏**（王组长 / 李经理 …）→ 混合形态，非纯标签；
+      ④ 其余（通名 + 职务后缀，如"业务骨干"）→ 纯标签。
+
+    【为什么要单列这个函数】
+    D-2（Issue #59）的槽位分型需要「纯职务标签 → 保留」这一档；
+    角色上下文通道（`_apply_role_context_pass`）此前对
+    「成员：技术骨干」这类槽位整段打码，把职务标签当成了人名。
+    """
+    if not word:
+        return False
+    pat = _get_role_label_patterns()
+    if word in pat["prefix_forms"]:
+        return True
+    k = _find_role_start(word)
+    if k is None:
+        return False
+    prefix = word[:k]
+    # ② 通名前缀 + 职务后缀 → 纯职务标签
+    for pf in pat["prefix_forms"]:
+        if prefix.startswith(pf):
+            return True
+    # ③ 姓 + 职务后缀 → 「某人 + 职务」，姓氏属个人信息
+    if prefix and prefix[0] in SURNAME_SET:
+        return False
+    return True
+
+
+def _find_name_spans(text: str, start: int, end: int) -> List[Tuple[int, int]]:
+    """在 text[start:end) 内查找具备 L1 证据的姓名片段（最长优先）。
+
+    【为什么要扫描子串而不是整块】
+    槽位内容常带尾随虚词（「王健负责」「张三的培训」），整块判定会把
+    真名和虚词混在一起判不出证据；按子串扫描则能定位到「王健」本身。
+    """
+    spans: List[Tuple[int, int]] = []
+    i = start
+    while i < end:
+        if not ("\u4e00" <= text[i] <= "\u9fa5"):
+            i += 1
+            continue
+        j = i
+        while j < end and ("\u4e00" <= text[j] <= "\u9fa5"):
+            j += 1
+        seg = text[i:j]
+        hit: Optional[Tuple[int, int]] = None
+        for length in (4, 3, 2):
+            for k in range(0, len(seg) - length + 1):
+                if _has_name_evidence(seg[k:k + length]):
+                    hit = (i + k, i + k + length)
+                    break
+            if hit:
+                break
+        if hit:
+            spans.append(hit)
+            i = hit[1]
+        else:
+            i = j
+    return spans
+
+
+_SLOT_ITEM_SEP_RE = re.compile(r"[、，,]")
+
+
+def _iter_slot_items(text: str) -> List[Tuple[int, int]]:
+    """把槽位内容按顿号/逗号切成条目，返回各条目的 (start, end) 区间。
+
+    【为什么要切条目】
+    槽位内容是「条目列表」而非单一文本：「各条线副行长、总监」是**两个
+    职务标签**，「孙海刚、毛月珍」是**两个人名**。不切条目就无法逐条
+    分型（Issue #59 §三 第二级）。
+    """
+    items: List[Tuple[int, int]] = []
+    start = 0
+    for m in _SLOT_ITEM_SEP_RE.finditer(text):
+        items.append((start, m.start()))
+        start = m.end()
+    items.append((start, len(text)))
+    return items
+
+
+def _find_person_title_span(text: str, start: int, end: int) -> Optional[Tuple[int, int]]:
+    """「人名 + 职务」混合项：返回应脱敏的人名部分区间（无则 None）。
+
+    场景：「王组长」「李经理」——职务词之前是**姓氏**时，说明这是
+    「某人 + 职务」而不是纯职务标签，姓氏仍属个人信息，必须脱敏。
+    """
+    seg = text[start:end]
+    if not seg:
+        return None
+    k = _find_role_start(seg)
+    if k is None or k == 0:
+        return None
+    prefix = seg[:k]
+    if prefix[0] not in SURNAME_SET:
+        return None
+    if not all("\u4e00" <= c <= "\u9fa5" for c in prefix):
+        return None
+    return (start, start + k)
+
+
+def _make_colon_name_repl(mask: str):
+    """构造规则C（全角冒号）的替换器：贪婪匹配 + 按职务词起点剥离。
+
+    【剥离规则】
+      命中片段内若出现职务词（如「副行长」「组长」「经理」），
+      则从该职务词的**起点**切开：
+        · 姓名部分（姓氏 + ≥1 名用字）整段替换为占位符；
+        · 职务词**整体保留**（不得拦腰截断）。
+
+    例：
+      "组长：樊霖副组长" → "组长：XXX副组长"
+      "负责人：蔡昀煜"    → "负责人：XXX"
+      "组长：李经理"      → "组长：XXX"（姓氏+职务整体遮盖，避免尾字泄漏）
+
+    【为什么不是「回退 1 字」】
+      回退 1 字会把职务词切成 "XXX副组"——职务词被拦腰截断，
+      既不是完整职务也不是完整姓名（Issue #57 §五 方案 A 的缺陷）。
+    """
+    def _repl(m: re.Match) -> str:
+        s = m.group(0)
+        # 职务词可能跨越贪婪匹配边界（"樊霖副组" + 后续 "长"），
+        # 故向右多看几个字符再判定起点是否落在命中片段内部。
+        ext = m.string[m.start(): m.end() + 4]
+        k = _find_role_start(ext, limit=len(s))
+        if k is not None and k >= 2:
+            return mask + s[k:]
+        return mask
+    return _repl
+
 # F1~F6/G1（赵辉，第3批）：桂林/柳州场景口径
 _ROLE_EXCLUDED_PHRASES.update({
     "桂林银行", "柳州银行", "南宁分行", "桂林分行", "柳州分行",
@@ -3700,6 +4059,11 @@ def _apply_role_context_pass(text: str, counts: Dict[str, int]) -> str:
             # "批准后即启动"中"批准"是关键词，但"后即"是动宾短语不应脱敏
             # 检查完整候选 + 前2字 + 前3字（覆盖"后即启动"的前缀词片段）
             name_candidate = m.group(1)
+            # D-2（Issue #59）：槽位内容分型——纯职务标签保留，不得当人名打码
+            #   "成员：技术骨干" → "成员：技术骨干"（此前被抹成 "成员：XXX"）
+            #   "组长：王组长"    → "组长：XXX"（姓 + 职务的混合形态仍脱敏）
+            if _is_pure_role_label(name_candidate):
+                return m.group(0)
             if (name_candidate in EXCLUDED_COMMON_WORDS
                     or name_candidate[:2] in EXCLUDED_COMMON_WORDS
                     or name_candidate[:3] in EXCLUDED_COMMON_WORDS):
@@ -4165,9 +4529,57 @@ _RESIDUE_STOP = set("的了和与及或等是在中上下将把被由从向对�
 _LIST_NAME_RE = re.compile(
     r"^[\u4e00-\u9fa5]{2,4}(?:[、，][\u4e00-\u9fa5]{2,4}){1,}$"
 )
+
+
+def _get_list_evidence_gate() -> Dict[str, Any]:
+    """名单通道证据门控配置（config.json → list_evidence_gate）。
+
+    - `enable`：是否启用门控；
+    - `mode`：`strict`（默认，需正向证据才脱敏）/ `loose`（保持整改前行为，
+      作为召回优先场景的回退档，与 #54 的 `--auto-gray` 灰区机制同风格）；
+    - `min_evidence_ratio`：名单中具备 L1 证据的块占比下限。
+    """
+    raw = (_load_config().get("list_evidence_gate") or {})
+    try:
+        ratio = float(raw.get("min_evidence_ratio", 0.5))
+    except (TypeError, ValueError):
+        ratio = 0.5
+    return {
+        "enable": bool(raw.get("enable", True)),
+        "mode": str(raw.get("mode") or "strict").lower(),
+        "min_evidence_ratio": ratio,
+    }
+
+
+def _list_evidence_ratio(text: str) -> Tuple[int, int]:
+    """统计名单中具备 L1 人名证据的块数与总块数。"""
+    blocks = [p for p in re.split(r'[、，]', text) if p]
+    if not blocks:
+        return (0, 0)
+    hit = sum(1 for b in blocks if _has_name_evidence(b))
+    return (hit, len(blocks))
+
+
 def _list_name_repl(m: re.Match) -> str:
-    """顿号名单保形：逐块脱敏，保留顿号/逗号"""
+    """顿号名单保形：逐块脱敏，保留顿号/逗号。
+
+    【D-3 整改（Issue #58）：名单通道接入 L1 证据门控】
+    整改前本通道只做**形态**判定——「整行是 2-4 字 CJK 块 + 顿号」即当名单，
+    未被枚举保护表覆盖的块一律当人名，于是页脚保密标识被整段抹除：
+        "内部资料，禁止外传" → "XXXX，XXXX"   ← 密级声明失效（合规要素丢失）
+        "各方代表、专家骨干" → "XXXX、XXXX"   ← 业务表述被抹
+    整改后**反转判定方向**：先要求该行至少有一项具备 L1 人名证据，
+    否则**整行保留**：
+        "名单的判定应由『名单里的真名』来证明自己，
+          而不是由『它长得像名单』来证明自己。"（Issue #58 §三）
+    """
     text = m.group(0)
+    gate = _get_list_evidence_gate()
+    if gate["enable"] and gate["mode"] == "strict":
+        hit, total = _list_evidence_ratio(text)
+        if total == 0 or (hit / total) < gate["min_evidence_ratio"]:
+            # 证据不足 → 整行保留（不可判定 → 保留）
+            return text
     parts = re.split(r'([、，])', text)
     result = []
     offset = 0  # 各块在原文中的起始偏移（供 G4/G7 定位）
@@ -4307,20 +4719,114 @@ def _apply_list_continuation_pass(text: str, counts: Dict[str, int]) -> str:
     return "\n".join(out_lines)
 
 
+_ORG_GEN_NAME_CTX: Optional[Tuple[re.Pattern, set, set]] = None
+
+
+def _get_org_generic_name_ctx():
+    """通用机构词 + 紧邻人名的判定上下文（正则 + 强证据词表），带缓存。"""
+    global _ORG_GEN_NAME_CTX
+    if _ORG_GEN_NAME_CTX is not None:
+        return _ORG_GEN_NAME_CTX
+    cfg = _load_config()
+    words = set((cfg.get("org_name_rules") or {}).get("generic_words") or [])
+    if not words:
+        _ORG_GEN_NAME_CTX = (None, set(), set())
+        return _ORG_GEN_NAME_CTX
+    # 定长回顾：匹配片段**只含姓名**，机构词不在匹配范围内
+    lb = "|".join(f"(?<={re.escape(w)})"
+                  for w in sorted(words, key=len, reverse=True))
+    pattern = re.compile(rf'(?:{lb})(?P<name>[\u4e00-\u9fa5]{{2,3}})')
+    _ORG_GEN_NAME_CTX = (pattern, get_full_name_set(), _get_common_name_dict())
+    return _ORG_GEN_NAME_CTX
+
+
+def _apply_org_generic_name_pass(text: str, counts: Dict[str, int]) -> str:
+    """D-4 补丁（Issue #61-B）：通用机构词保留后，紧邻的人名仍须脱敏。
+
+    【问题】D-4 把「运营部」这类通用机构词改为**保留原文**后，姓名通道的
+    左边界（「前一字不得为汉字」）不再成立：
+        "运营部韩慧丽向部门领导汇报"
+    整改前 "运营部" 被脱敏成 XXXX（ASCII），边界成立 → 韩慧丽被脱敏；
+    整改后 "运营部" 保留 → 边界失效 → **韩慧丽漏脱**（金标回归）。
+
+    【解法】把「保留的通用机构词」当作**边界豁免点**：其后紧跟的 2-3 字
+    若具备**强**姓名证据（D16 精确全名 / 通用人名词典），则整段脱敏。
+    只用强证据而不用字频路径，避免把「运营部配合完成」这类业务短语
+    误判为人名。
+
+    【为什么不进姓名规则组】姓名规则组的外层守卫会在调用替换函数**之前**
+    就给「姓名」计数；本通道需要「无证据则不替换」，计数必须由本通道
+    自己掌控，故独立成通道执行。
+    """
+    if not text or not isinstance(text, str):
+        return text
+    pattern, d16, cdict = _get_org_generic_name_ctx()
+    if pattern is None:
+        return text
+    out = text
+    pos = 0
+    while True:
+        m = pattern.search(out, pos)
+        if not m:
+            break
+        name = m.group("name")
+        length = 0
+        for cand_len in (3, 2):
+            cand = name[:cand_len]
+            if cand in d16 or cand in cdict:
+                length = cand_len
+                break
+        if not length:
+            pos = m.end()
+            continue
+        s = m.start("name")
+        e = s + length
+        if (_is_protected_by_common_word_guard(out, s, e)
+                or _is_boundary_split_misfire(out, s, e)):
+            pos = m.end()
+            continue
+        counts["姓名"] = counts.get("姓名", 0) + 1
+        out = out[:s] + "XXX" + out[e:]
+        pos = s + 3
+    return out
+
+
 def _apply_anchor_expand_pass(text: str, counts: Dict[str, int]) -> str:
     """
     N-B 层（Issue #16 REQ-NAME-001）：段落角色锚点扩散。
 
-    对含角色关键词 + 冒号的段落，扩散遮蔽冒号后所有姓名块。
+    对含角色关键词 + 冒号的段落，扩散遮蔽冒号后的姓名。
     在 _apply_role_context_pass 之后执行（叠加而非替代）。
+
+    【D-2 整改（Issue #59）：槽位内容分型】
+    整改前本通道只做**形态**判定——「2-4 字 CJK 块」即当人名遮蔽，
+    于是职务标签被整段抹掉：
+        "副组长：各条线副行长、总监"   → "副组长：XXXXXX、XXX"   ❌
+        "成员：业务和技术骨干、外部专家骨干" → "成员：……、XXXXXX"   ❌
+    整改后按**槽位内容性质**分型（先按顿号/逗号切条目，再逐条目判定）：
+
+      | 条目类型   | 判据                        | 动作     |
+      |------------|-----------------------------|----------|
+      | 纯人名     | L1 正向证据（D16/词典/字频） | 脱敏     |
+      | 人名+职务  | 职务词前的部分是姓氏        | 脱敏人名 |
+      | 纯职务标签 | L2 命中（职务后缀/组合式）   | 保留     |
+      | 不可判定   | 无任何证据                  | 保留     |
+
+    【为什么「不可判定」默认保留】
+    银行投产场景下，一处漏脱是**可追溯的单点事件**（可走人工复核），
+    一处误伤是**大面积不可预期的可用性事故**（如 64 页 PPT 全页页脚被抹）。
+    两者不同量级，缺省值倒向可追溯的一侧。
 
     示例：
       "核心组：蔡新发、张瑜、李明" → "核心组：XXX、XXX、XXX"
+      "组长：孙海刚、毛月珍"      → "组长：XXX、XXX"
+      "副组长：各条线副行长、总监" → 原样保留
       "组长张斌负责"              → 由 _apply_role_context_pass 处理（已有规则）
     """
     if not text or not isinstance(text, str):
         return text
 
+    mask = get_replacement("NAME", "XXX")
     out_lines = []
     for line in text.split("\n"):
         new_line = line
@@ -4329,12 +4835,25 @@ def _apply_anchor_expand_pass(text: str, counts: Dict[str, int]) -> str:
             prefix = m.group(1)  # e.g. "核心组："
             rest = m.group(2)    # e.g. "蔡新发、张瑜、李明"
 
-            # 在冒号后内容中捕获所有 2-4 字姓名块
+            # ---- 槽位内容分型：逐条目判定应脱敏的区间 ----
+            spans: List[Tuple[int, int]] = []
+            for item_start, item_end in _iter_slot_items(rest):
+                found = _find_name_spans(rest, item_start, item_end)
+                if found:
+                    spans.extend(found)
+                    continue
+                pt = _find_person_title_span(rest, item_start, item_end)
+                if pt:
+                    spans.append(pt)
+            if not spans:
+                return prefix + rest
+
             result_parts = []
             last_end = 0
-
-            for block_m in _NAME_BLOCK_RE.finditer(rest):
-                word = block_m.group(0)
+            for span_start, span_end in sorted(spans):
+                if span_start < last_end:
+                    continue
+                word = rest[span_start:span_end]
                 # 排除词保护
                 if word in _ANCHOR_EXCLUDED_NAMES:
                     continue
@@ -4343,19 +4862,17 @@ def _apply_anchor_expand_pass(text: str, counts: Dict[str, int]) -> str:
                 if digit_ratio >= 0.4:
                     continue
                 # G4/G7（Issue #51）：整词保护表 / 跨词边界守卫
-                #   「负责人：李四（总经理）」中「总经理」是职位而非姓名
-                #   「成员：业务/财务/IT」中「财务」是职能而非姓名
-                abs_start = m.start(2) + block_m.start()
-                abs_end = m.start(2) + block_m.end()
+                abs_start = m.start(2) + span_start
+                abs_end = m.start(2) + span_end
                 if _is_protected_by_common_word_guard(m.string, abs_start, abs_end):
                     continue
                 if _is_boundary_split_misfire(m.string, abs_start, abs_end):
                     continue
                 # 替换
                 counts["姓名"] = counts.get("姓名", 0) + 1
-                result_parts.append(rest[last_end:block_m.start()])
-                result_parts.append("XXX")
-                last_end = block_m.end()
+                result_parts.append(rest[last_end:span_start])
+                result_parts.append(mask)
+                last_end = span_end
 
             # 保留未匹配的后缀
             if last_end < len(rest):
@@ -4609,6 +5126,10 @@ def apply_redactions_counted(text: str) -> Tuple[str, Dict[str, int]]:
     _name_repl = get_replacement("NAME", "XXX")
     for pattern, replacement in name_patterns:
         result = _name_guard_sub_counted(pattern, result, replacement, counts)
+
+    # D-4 补丁（Issue #61-B）：通用机构词保留后，紧邻的人名仍须脱敏
+    # （须在姓名规则组之后执行——已被遮盖的姓名此时已是 XXX，不会被二次命中）
+    result = _apply_org_generic_name_pass(result, counts)
 
     # 后处理：纠正已知误脱敏
     # 1. 姓名模式误匹配中文词（Rule A 右边界放宽后，可能对常用词造成误匹配）
@@ -4962,6 +5483,10 @@ def reset_patterns() -> None:
     global _ATTESTED_SURNAMES_CACHE
     global _SAFE_CUT_WORDS
     global _COMMON_NAME_DICT
+    global _NAME_POOL_SET_CACHE
+    global _ROLE_LABEL_PATTERNS
+    global _ROLE_SUFFIX_SORTED
+    global _ORG_GEN_NAME_CTX
 
     _PATTERNS = None
     _FULL_NAME_SET_CACHE = None
@@ -4984,6 +5509,10 @@ def reset_patterns() -> None:
     _COMMON_NAME_DICT = None
     _NAME_POOL_CACHE.clear()
     _NAME_CHAR_FREQ_CACHE.clear()
+    _NAME_POOL_SET_CACHE = None
+    _ROLE_LABEL_PATTERNS = None
+    _ROLE_SUFFIX_SORTED = None
+    _ORG_GEN_NAME_CTX = None
 
 
 # ---------------------------------------------------------------------------
