@@ -27,6 +27,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from common_rules import apply_redactions, apply_redactions_counted, find_libreoffice
+from common_rules import apply_redactions_xml_aware
 from common_rules import redistribute_paragraph, redact_filename_stem
 from common_rules import set_agent_decisions_override, _get_skip_texts
 from table_role_detector import process_ppt_slide_xml, collect_table_names
@@ -182,7 +183,10 @@ def _process_xml_file(path: Path, label: str = "") -> dict:
         content = _process_paragraph_level(content, counts)
 
         # 整文件级兜底（占位符幂等；覆盖非 <a:p> 区域）
-        redacted, c2 = apply_redactions_counted(content)
+        # P0：XML 感知——只替换文本节点，标签与属性原样保留。
+        # 否则 XML 属性名（如 spd="slow" 的 spd）会命中脱敏规则，
+        # 产出非法 XML，产物 PPTX 无法打开（实测平安信用卡 PPTX 12 处损坏）。
+        redacted, c2 = apply_redactions_xml_aware(content)
         _merge_counts(counts, c2)
 
         if redacted != original:

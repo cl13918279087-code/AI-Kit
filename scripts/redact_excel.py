@@ -18,6 +18,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from common_rules import apply_redactions, apply_redactions_counted, REDACTION_LABELS, protect_iso_datetimes, restore_iso_datetimes, redact_filename_stem, set_agent_decisions_override, load_agent_decisions
+from common_rules import apply_redactions_xml_aware
 from table_role_detector import process_xlsx_sheet_xml, collect_table_names
 from common_rules import inject_extra_names, clear_extra_names
 
@@ -131,7 +132,9 @@ def _process_xml_file(path: Path, label: str = "") -> dict:
             content, table_count = process_xlsx_sheet_xml(content)
             if table_count > 0:
                 counts["姓名"] = counts.get("姓名", 0) + table_count
-        redacted, c2 = apply_redactions_counted(content)
+        # P0：XML 感知——只替换文本节点，标签与属性原样保留。
+        # 否则 XML 属性名可能命中脱敏规则，产出非法 XML、工作簿被判损坏。
+        redacted, c2 = apply_redactions_xml_aware(content)
         _merge_counts(counts, c2)
         if tokens:
             redacted = restore_iso_datetimes(redacted, tokens)

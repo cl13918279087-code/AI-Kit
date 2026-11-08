@@ -4784,6 +4784,113 @@ def apply_redactions(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# XML 感知脱敏（P0：整文件级兜底通道破坏 XML 结构）
+#
+# 背景
+# ----
+# PPT / Word / Excel 处理器的「整文件级兜底」通道会对 XML 原文整体跑正则。
+# XML 原文里除文本节点外，还含大量标签与属性，其中属性名也可能命中脱敏规则：
+#
+#     <p:transition spd="slow" p14:dur="2000"/>
+#              ↑ 属性名 "spd" 命中拉丁银行缩写 SPD（上海浦东发展银行）
+#              → 被替换为 "[Bank]"，属性名变为 "[Bank]"="slow"
+#
+# 结果是 XML 结构非法，产物 PPTX/DOCX 无法被 Office 与 python-pptx/python-docx
+# 打开——交付级致命缺陷（实测：平安信用卡 PPTX 12 个 slide XML 损坏）。
+#
+# 对策（保结构 + 保上下文）
+# --------------------------
+# 【不能简单按节点拆分】实测：把 XML 拆成「文本节点/属性值」逐段跑规则，
+# 姓名召回从 442 处掉到 63 处——因为部分检测通道（N-C 名单区域检测、
+# 上下文护栏）依赖**文档级上下文**，逐节点处理会失去跨节点视野而漏脱。
+#
+# 因此采用「哨兵保护」方案：
+#   ① 先把 XML 中的**标签名**与**属性名**替换为不可被规则命中的哨兵串；
+#   ② 对整份（已保护结构的）XML 跑一次完整脱敏 —— 上下文完整保留，
+#      文本节点与属性值照常脱敏；
+#   ③ 事后把哨兵还原为原始名称。
+# 这样既不破坏 XML 结构，又不损失任何召回能力。
+# ---------------------------------------------------------------------------
+
+_XML_TAG_RE = re.compile(r"<[^>]*>", re.S)
+_XML_ATTR_RE = re.compile(
+    r"""(\s*)([^\s=/>]+)(\s*=\s*)("[^"]*"|'[^']*')"""
+)
+# 哨兵：含控制字符，任何脱敏规则都不会命中（规则面向可见文本）
+_SENTINEL = "\x00WBX{}\x00"
+
+
+def _protect_xml_structure(content: str) -> Tuple[str, Dict[str, str]]:
+    """
+    把 XML 中的标签名与属性名替换为哨兵，返回 (保护后内容, {哨兵: 原名})。
+    属性值与文本节点原样保留。
+
+    例外：`xmlns:*` 命名空间声明**整体保护**（连同其值）——
+    命名空间 URI 是结构标识而非业务内容，若参与脱敏：
+      ① URI 中的银行缩写（如 urn:abc）会被误判为银行名而破坏 URI 合法性；
+      ② 破坏后 XML 无法解析。
+    """
+    mapping: Dict[str, str] = {}
+    counter = [0]
+
+    def _sentinel(original: str) -> str:
+        key = _SENTINEL.format(counter[0])
+        counter[0] += 1
+        mapping[key] = original
+        return key
+
+    out: List[str] = []
+    pos = 0
+    for m in _XML_TAG_RE.finditer(content):
+        out.append(content[pos:m.start()])
+        tag = m.group(0)
+        # 标签名：<name ...> 或 </name>
+        tm = re.match(r"</?([^\s/>]+)", tag)
+        if tm:
+            name = tm.group(1)
+            out.append(tag[:tm.start(1)] + _sentinel(name))
+            rest = tag[tm.end(1):]
+        else:
+            rest = tag
+        # 属性名（xmlns 声明整体保护）
+        def _attr_sub(am: "re.Match") -> str:
+            lead, attr_name, eq, quoted = am.group(1), am.group(2), am.group(3), am.group(4)
+            if attr_name == "xmlns" or attr_name.startswith("xmlns:"):
+                # 命名空间声明：名称与值整体保护
+                return f"{lead}{_sentinel(am.group(0).strip())}"
+            return f"{lead}{_sentinel(attr_name)}{eq}{quoted}"
+
+        rest = _XML_ATTR_RE.sub(_attr_sub, rest)
+        out.append(rest)
+        pos = m.end()
+    out.append(content[pos:])
+    return "".join(out), mapping
+
+
+def apply_redactions_xml_aware(content: str) -> Tuple[str, Dict[str, int]]:
+    """
+    XML 感知的整文件脱敏：
+      - 标签名与属性名：保护（哨兵），不参与替换，保证 XML 结构合法
+      - 文本节点与属性值：正常脱敏，保留文档级上下文（不拆节点）
+
+    返回 (脱敏后的 XML, 分类计数)。
+    """
+    counts: Dict[str, int] = {}
+    if not content or not isinstance(content, str):
+        return content, counts
+
+    # 快速判定：不含 '<' 时按纯文本处理
+    if "<" not in content:
+        return apply_redactions_counted(content)
+
+    protected, mapping = _protect_xml_structure(content)
+    redacted, counts = apply_redactions_counted(protected)
+    for key, original in mapping.items():
+        redacted = redacted.replace(key, original)
+    return redacted, counts
+
+
+# ---------------------------------------------------------------------------
 # R-⑬（v1.3.7，响应 Issue #13-①）：输出文件名脱敏（元数据泄漏治理）
 #
 # 背景：批量入口 pipeline.py 已对输出 stem 走规则脱敏 + 日期戳处理，但单文件

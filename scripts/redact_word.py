@@ -34,6 +34,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from common_rules import apply_redactions, protect_iso_datetimes, restore_iso_datetimes, find_libreoffice, redact_filename_stem, load_agent_decisions
+from common_rules import apply_redactions_xml_aware
 from entity_detector import build_llm_detector
 from workdir import work_dir
 import degradation
@@ -497,7 +498,9 @@ def _process_xml_file(path: Path, label: str = "") -> None:
         tokens = []
         if path.name == "core.xml":
             content, tokens = protect_iso_datetimes(content)
-        redacted = apply_redactions(content)
+        # P0：XML 感知——只替换文本节点，标签与属性原样保留。
+        # 否则 XML 属性名可能命中脱敏规则，产出非法 XML、损坏文档。
+        redacted, _c = apply_redactions_xml_aware(content)
         if tokens:
             redacted = restore_iso_datetimes(redacted, tokens)
         if redacted != content:
@@ -1567,11 +1570,57 @@ def _convert_doc_via_antiword(input_path: str, tmp_dir: Path) -> Optional[Path]:
     return out
 
 
+def _convert_doc_via_ole_python(input_path: str, tmp_dir: Path) -> Optional[Path]:
+    """L2.5：纯 Python 解析 OLE2/FIB 片段表 → 重建 .docx（内网离线兜底）。
+
+    ⚠️ 本级**丢失全部格式与表格结构**，仅保留正文文字，
+       调用方必须据此标记 degraded_level 并提示人工复核。
+
+    【为什么需要这一级】
+    LibreOffice 在内网离线环境 / 受限沙箱中常因 profile 不可写而
+    DeploymentException；textutil / antiword 又依赖外部二进制。
+    本级无外部进程、无临时目录依赖，是「一个 .doc 都不能脱敏」的最后防线。
+    """
+    try:
+        import docx as _docx
+    except ImportError:
+        print("  [降级] python-docx 不可用，无法重建 .docx")
+        return None
+    try:
+        from doc_ole_text import extract_doc_text, is_ole2
+    except ImportError:
+        print("  [降级] doc_ole_text 模块不可用")
+        return None
+    path = Path(input_path)
+    try:
+        if not is_ole2(path):
+            return None
+        text = extract_doc_text(path)
+    except Exception as exc:  # pragma: no cover - 防御
+        print(f"  [降级] 纯 Python 解析 .doc 异常: {type(exc).__name__}: {exc}")
+        return None
+    if not text.strip():
+        print("  [降级] 纯 Python 解析 .doc 未提取到正文")
+        return None
+    try:
+        document = _docx.Document()
+        for para in [p.strip() for p in text.split("\n")]:
+            if para:
+                document.add_paragraph(para)
+        out = tmp_dir / "ole_python_rebuilt.docx"
+        document.save(str(out))
+    except Exception as exc:  # pragma: no cover - 防御
+        print(f"  [降级] python-docx 重建失败: {type(exc).__name__}: {exc}")
+        return None
+    return out
+
+
 # 备用转换链：按保真度从高到低逐级尝试
 _DOC_CONVERTERS = (
     ("LibreOffice", _convert_doc_via_libreoffice),
     ("textutil", _convert_doc_via_textutil),
     ("antiword", _convert_doc_via_antiword),
+    ("ole-python", _convert_doc_via_ole_python),
 )
 
 
@@ -1606,13 +1655,13 @@ def redact_doc_to_docx(input_path: str, output_docx: str, detector=None) -> dict
             # 改为终止处理并强制列入人工检查清单。
             _mark_manual_check(
                 Path(input_path).name,
-                ".doc 转换全链失败（LibreOffice / textutil / antiword 均不可用或失败），"
+                ".doc 转换全链失败（LibreOffice / textutil / antiword / 纯 Python 解析均不可用或失败），"
                 "文件未脱敏。请安装 LibreOffice "
                 "(https://www.libreoffice.org/) 后重跑，或先在 Word/WPS 中"
                 "另存为 .docx 再处理。处理完成前该文件须按未脱敏文件管理。",
             )
             raise RuntimeError(
-                ".doc 转换全链失败（已尝试 LibreOffice / textutil / antiword），"
+                ".doc 转换全链失败（已尝试 LibreOffice / textutil / antiword / 纯 Python 解析），"
                 ".doc 文件无法脱敏（已拒绝生成输出文件）。"
                 "请安装 LibreOffice 或将文件另存为 .docx 后重试。"
             )
