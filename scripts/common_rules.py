@@ -261,6 +261,53 @@ _FULL_NAME_SET_CACHE: Optional[set] = None
 _D16_NON_NAME_ENTRIES = frozenset({"姓名"})
 
 
+def _get_extra_name_list(cfg: Optional[Dict[str, Any]] = None) -> List[str]:
+    """返回 D-5 补充名单条目（内联 + 外置文件合并）。
+
+    【为什么也要外置】
+    `config.json` 的 `extra_name_list` 是**人工确认真实姓名**清单
+    （Issue #60 D-5：名字位生僻字、字频闸门救不回的漏脱修复），
+    同样是客户 PII——分发包不能携带。
+    与 `full_name_list` 同构，支持：
+      - `extra_name_list_file`：每行一个姓名的外部文本文件；
+      - `AIKIT_EXTRA_NAME_LIST`：环境变量优先级最高。
+
+    合并语义：内联 ∪ 外置（去重保序）；外置缺失时静默回退内联，
+    保证既有行为完全不变。
+    """
+    if cfg is None:
+        cfg = _load_config()
+
+    names: List[str] = []
+    seen = set()
+
+    for n in (cfg.get("extra_name_list") or []):
+        if isinstance(n, str) and n and n not in seen:
+            seen.add(n)
+            names.append(n)
+
+    rel = str(cfg.get("extra_name_list_file") or "").strip()
+    env_file = os.environ.get("AIKIT_EXTRA_NAME_LIST", "").strip()
+    if env_file:
+        rel = env_file
+    if rel:
+        for p in _resolve_data_paths(rel):
+            if not p.exists():
+                continue
+            try:
+                text = p.read_text(encoding="utf-8")
+            except Exception:
+                continue
+            for line in text.splitlines():
+                n = line.strip()
+                if n and not n.startswith("#") and n not in seen:
+                    seen.add(n)
+                    names.append(n)
+            break
+
+    return names
+
+
 def _get_full_name_list(cfg: Optional[Dict[str, Any]] = None) -> List[str]:
     """返回 D16 全名库条目列表（内联 + 外置文件合并）。
 
@@ -293,8 +340,10 @@ def _get_full_name_list(cfg: Optional[Dict[str, Any]] = None) -> List[str]:
     # D-5 补充名单（Issue #60 §一 实测漏脱的低频生僻字姓名）：
     # 这些姓名的名字位字在语料字频中为 0，无法由字频闸门救回，
     # 但它们是**确知的真实人名**——按精确全名处理，槽位内外一律脱敏。
-    for n in (cfg.get("extra_name_list") or []):
-        if isinstance(n, str) and n and n not in seen:
+    # 【外置支持】与 full_name_list 同构：extra_name_list_file /
+    #   AIKIT_EXTRA_NAME_LIST 指向外部确认真名清单，内网可注入本行名单。
+    for n in _get_extra_name_list(cfg):
+        if n not in seen:
             seen.add(n)
             names.append(n)
 
@@ -467,16 +516,42 @@ def _get_name_char_freq(cfg: Optional[Dict] = None) -> Dict[str, int]:
     统计 full_name_list 中每个名字位（name[1:]，跳过姓位）的字频。
     数据源完全自洽——不依赖 jieba、不依赖外部词表。
 
-    返回 {字: 字频}；全名库缺失时返回空 dict（调用方须降级到全池）。
+    【字频表外置支持】（内网分发 PII 治理）
+    `full_name_list` 是真实自然人姓名清单，内网分发包不能携带。
+    但名字位字频（单字出现次数）是从中派生的**聚合统计量**，
+    不含姓名组合，无法反推具体人名（名字位字池 1278 字，
+    2 字组合空间约 163 万，单字频次无法定位）。
+
+    因此新增配置键 `name_char_freq_map`：
+      - 内网分发包中 `full_name_list` 置空（去 PII），
+        字频改由该键提供 —— 闸门行为与原始完全一致，召回不掉。
+      - 存在该键时优先使用；不存在则回退到从 full_name_list 自举
+        （上游仓库行为不变，向后兼容）。
+
+    返回 {字: 字频}；全名库缺失且无字频表时返回空 dict（调用方须降级到全池）。
     """
     if cfg is None:
         cfg = _load_config()
+
+    # 优先读外置字频表（内网分发包：人名库已剥离，字频由字频表提供）
+    ext = cfg.get("name_char_freq_map")
+    if isinstance(ext, dict) and ext:
+        freq: Dict[str, int] = {}
+        for ch, f in ext.items():
+            if isinstance(ch, str) and len(ch) == 1:
+                try:
+                    freq[ch] = int(f)
+                except (TypeError, ValueError):
+                    continue
+        if freq:
+            return freq
+
     names = _get_full_name_list(cfg)
     key = f"{len(names)}:{hash(tuple(names[:64]))}"
     cached = _NAME_CHAR_FREQ_CACHE.get(key)
     if cached is not None:
         return cached
-    freq: Dict[str, int] = {}
+    freq = {}
     for name in names:
         for ch in name[1:]:
             freq[ch] = freq.get(ch, 0) + 1
@@ -1927,11 +2002,59 @@ def _apply_local_phone_pass(text: str, counts: Dict[str, int] = None) -> str:
 # 正则规则构建（从 config.json 动态加载，支持扩展）
 # ---------------------------------------------------------------------------
 
+def _get_bank_names(cfg: Optional[Dict[str, Any]] = None) -> List[str]:
+    """返回银行名称目标清单（内联 + 外置文件合并）。
+
+    【为什么需要外置】
+    `config.json` 的 `bank_names` 是**待脱敏的目标银行名单**（不是检测词库，
+    命中的会被遮盖）。仓库里内联的条目来自历史项目的实际客户样本，
+    对内网分发而言属于「把某家客户的机构口径带给别人」，不合适。
+
+    因此支持 `bank_names_file`：指向一个**每行一个银行名**的外部文本文件，
+    内网部署方填入本行及需要覆盖的目标机构即可。
+    合并语义：内联 ∪ 外置（外置优先，去重保序）；外置缺失时静默回退内联，
+    保证既有行为完全不变。
+
+    环境变量 `AIKIT_BANK_NAMES` 优先级最高，与 `AIKIT_FULL_NAME_LIST` 同构。
+    """
+    if cfg is None:
+        cfg = _load_config()
+
+    names: List[str] = []
+    seen = set()
+
+    for b in (cfg.get("bank_names") or []):
+        if isinstance(b, str) and b and b not in seen:
+            seen.add(b)
+            names.append(b)
+
+    rel = str(cfg.get("bank_names_file") or "").strip()
+    env_file = os.environ.get("AIKIT_BANK_NAMES", "").strip()
+    if env_file:
+        rel = env_file
+    if rel:
+        for p in _resolve_data_paths(rel):
+            if not p.exists():
+                continue
+            try:
+                text = p.read_text(encoding="utf-8")
+            except Exception:
+                continue
+            for line in text.splitlines():
+                b = line.strip()
+                if b and not b.startswith("#") and b not in seen:
+                    seen.add(b)
+                    names.append(b)
+            break
+
+    return names
+
+
 def _build_patterns() -> List[Tuple[re.Pattern, str]]:
     global _PATTERNS_PRE, _PATTERNS_NAME
     cfg = _load_config()
     rep = cfg.get("replacement", {})
-    bank_names: List[str] = cfg.get("bank_names", [])
+    bank_names: List[str] = _get_bank_names(cfg)
     org_suffixes: List[str] = cfg.get("org_suffixes", [])
     # R-㉛（v1.3.9，响应 Issue #15-C12，赵辉）：日期脱敏口径
     # full（默认）：全掩码 YYYY年MM月DD日
@@ -2912,13 +3035,15 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
     # - 长名优先排序（防止"欧阳"截断"欧阳娜娜"）
     # - 边界：仅排除 ASCII/数字（允许中文连接符如"和/在/是/等"）
     # - 执行顺序：精确匹配 → 字符池规则
-    _full_name_list: List[str] = list(cfg.get("full_name_list") or [])
-    # D-5 补充名单（Issue #60 §一 实测漏脱的低频生僻字姓名）：
-    # 名字位字在语料字频中为 0，字频闸门救不回，但它们是**确知的真实人名**
-    # ——并入精确全名层后，槽位内外一律按精确匹配脱敏。
-    for _n in (cfg.get("extra_name_list") or []):
-        if isinstance(_n, str) and _n and _n not in _full_name_list:
-            _full_name_list.append(_n)
+    #
+    # 【必须走 _get_full_name_list() 而非 cfg.get("full_name_list")】
+    #   外置花名册（full_name_list_file / AIKIT_FULL_NAME_LIST）是内网投产时
+    #   **精确匹配层的唯一名单来源**（分发包已剥离内联人名库）。
+    #   若此处只读内联列表，外置花名册在 D16 直配层完全失效 ——
+    #   实测「袁伟杰」既不进 D16 正则、也匹配不到，等于花名册形同虚设。
+    #   _get_full_name_list() 返回内联 ∪ extra_name_list ∪ 外置 的合并结果，
+    #   语义向后兼容（含 Issue #60 的 D-5 补充名单）。
+    _full_name_list: List[str] = _get_full_name_list(cfg)
     # D16 库净化：剔除「字段标签型」条目。
     # 实测污染样本：「姓名」被当作人名全名收录，导致「请填写姓名」→「请填写XXX」。
     # 这类条目不是人名，是文档字段名；用显式清单过滤而不是改数据文件，
@@ -5216,7 +5341,7 @@ def _get_extra_name_re() -> Optional[re.Pattern]:
     if _EXTRA_NAME_RE_CACHE is not None:
         return _EXTRA_NAME_RE_CACHE
     cfg = get_config()
-    names = [n for n in (cfg.get("extra_name_list") or [])
+    names = [n for n in _get_extra_name_list(cfg)
              if isinstance(n, str) and len(n) >= 2]
     if not names:
         _EXTRA_NAME_RE_CACHE = None
