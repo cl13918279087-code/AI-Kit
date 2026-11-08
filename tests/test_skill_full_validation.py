@@ -165,13 +165,21 @@ def test_l1_03_disabled_types_not_redacted():
         组织名 ORG 由 config.org_suffixes 驱动，默认非空 → 启用）。
       README / 实施手册中的「固话 / ORG 已禁用」为**陈旧表述**，
       已在本轮测试中同步修正（缺陷 D-07，文档与实现不一致，P2）。
+
+      【批次二补充（2026-11-08）】D-4 机构名通道语义拆分后，**通用机构词**
+      （`财务部`/`运营部`/`科技部`/`运营中心` 等 15 个）按人工标准版口径
+      **整段保留**，不再走 ORG 整段脱敏；ORG 通道仍启用，仅对**非通用**后缀
+      命中生效（如 `营业部` → `XXXX`）。原断言用「财务部」作为 ORG 启用证据，
+      已过时，随 D-8 机构清单一并更正。
     """
     # 银行卡：禁用 → 明文保留
     assert "6222021234567890" in cr.apply_redactions("银行卡6222021234567890")
     # 固话：启用 → 全遮
     assert "010-12345678" not in cr.apply_redactions("固话010-12345678")
-    # 组织名 ORG：启用（后缀命中）
-    assert cr.apply_redactions("财务部") == "XXXX"
+    # 组织名 ORG：启用（非通用后缀命中 → 整段脱敏）
+    assert cr.apply_redactions("某某支行营业部") == "某某支行XXXX"
+    # 通用机构词：按 D-4/D-8 口径整段保留
+    assert cr.apply_redactions("财务部") == "财务部"
 
 
 def test_l1_04_count_redactions_no_exception():

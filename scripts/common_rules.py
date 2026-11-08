@@ -290,6 +290,14 @@ def _get_full_name_list(cfg: Optional[Dict[str, Any]] = None) -> List[str]:
             seen.add(n)
             names.append(n)
 
+    # D-5 补充名单（Issue #60 §一 实测漏脱的低频生僻字姓名）：
+    # 这些姓名的名字位字在语料字频中为 0，无法由字频闸门救回，
+    # 但它们是**确知的真实人名**——按精确全名处理，槽位内外一律脱敏。
+    for n in (cfg.get("extra_name_list") or []):
+        if isinstance(n, str) and n and n not in seen:
+            seen.add(n)
+            names.append(n)
+
     rel = str(cfg.get("full_name_list_file") or "").strip()
     # 环境变量优先：内网部署方无需改动分发包内的配置文件即可注入本行花名册
     env_file = os.environ.get("AIKIT_FULL_NAME_LIST", "").strip()
@@ -2904,7 +2912,13 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
     # - 长名优先排序（防止"欧阳"截断"欧阳娜娜"）
     # - 边界：仅排除 ASCII/数字（允许中文连接符如"和/在/是/等"）
     # - 执行顺序：精确匹配 → 字符池规则
-    _full_name_list: List[str] = cfg.get("full_name_list", [])
+    _full_name_list: List[str] = list(cfg.get("full_name_list") or [])
+    # D-5 补充名单（Issue #60 §一 实测漏脱的低频生僻字姓名）：
+    # 名字位字在语料字频中为 0，字频闸门救不回，但它们是**确知的真实人名**
+    # ——并入精确全名层后，槽位内外一律按精确匹配脱敏。
+    for _n in (cfg.get("extra_name_list") or []):
+        if isinstance(_n, str) and _n and _n not in _full_name_list:
+            _full_name_list.append(_n)
     # D16 库净化：剔除「字段标签型」条目。
     # 实测污染样本：「姓名」被当作人名全名收录，导致「请填写姓名」→「请填写XXX」。
     # 这类条目不是人名，是文档字段名；用显式清单过滤而不是改数据文件，
@@ -3666,7 +3680,13 @@ def _get_role_conjunction_re() -> re.Pattern:
         sp = "赵钱孙李周吴郑王冯陈褚卫蒋沈韩杨朱秦尤许何吕施张孔曹严华金魏陶姜戚谢邹喻柏水窦章云苏潘葛奚范彭郎鲁韦昌马苗凤花方俞任袁柳酆鲍史唐费廉岑薛雷贺倪汤滕殷罗毕郝邬安常乐于时傅皮卞齐康伍余元卜顾孟平黄和穆萧尹姚邵湛汪祁毛禹狄米贝明臧计伏成戴谈宋茅庞熊纪舒屈项祝董梁杜阮蓝闵席季麻强贾路娄危江童颜郭梅盛林刁钟徐骆高夏蔡田樊胡凌霍虞万支柯昝管卢莫经房裘缪干解应宗丁宣邓单洪包诸左石崔吉钮龚林门龙段郑孔牛童浦施零厉付肖闫覃刘"
     # M9（Issue #49）：载入期清洗，剔除标点/符号类污染
     np_chars = _get_name_pool_chars(cfg)
-    surname_alt = "|".join(re.escape(c) for c in sp)
+    # 【关键修复（批次二 G7 回归暴露）】
+    # 姓氏用 `|` 拼接时**必须**加非捕获组 `(?:...)`：
+    #   否则正则解析为 `(丁|万|...|刘[名用字]{1,3})`——
+    #   名字用字符类只挂在**最后一个**姓氏分支上，
+    #   其余姓氏可「零名用字」单字命中（"位及时" → 位 + 及 + 时）。
+    # 加组后语义回归设计意图：「姓氏字 + 1~3 名用字」两侧各一。
+    surname_alt = "(?:" + "|".join(re.escape(c) for c in sp) + ")"
     name_class = _build_name_char_class(np_chars)
     _role_conj_re_cache = re.compile(
         rf'({surname_alt}{name_class}{{1,3}})(和|与|及|或者|以及)'
@@ -4063,6 +4083,10 @@ def _apply_role_context_pass(text: str, counts: Dict[str, int]) -> str:
             #   "成员：技术骨干" → "成员：技术骨干"（此前被抹成 "成员：XXX"）
             #   "组长：王组长"    → "组长：XXX"（姓 + 职务的混合形态仍脱敏）
             if _is_pure_role_label(name_candidate):
+                return m.group(0)
+            # 【批次二 G4 回归修复】候选姓名以连词/虚词起首 → 非人名
+            # "审核和发布" → 角色词"审核"后的"和发布"不是人名
+            if name_candidate[0] in _SLOT_HEAD_VETO:
                 return m.group(0)
             if (name_candidate in EXCLUDED_COMMON_WORDS
                     or name_candidate[:2] in EXCLUDED_COMMON_WORDS
@@ -4729,6 +4753,10 @@ def _get_org_generic_name_ctx():
         return _ORG_GEN_NAME_CTX
     cfg = _load_config()
     words = set((cfg.get("org_name_rules") or {}).get("generic_words") or [])
+    # D-8（Issue #64）：通用部门名（机构实体词表）同样「保留原文」，
+    # 同样需要作为姓名通道的**左边界豁免点**——
+    # 否则「运营管理部韩慧丽」这类「机构词 + 紧邻人名」会漏脱。
+    words |= set(_get_org_entity_words())
     if not words:
         _ORG_GEN_NAME_CTX = (None, set(), set())
         return _ORG_GEN_NAME_CTX
@@ -5007,6 +5035,453 @@ def _apply_common_name_dict_pass(text: str, counts: Dict[str, int]) -> str:
     return out
 
 
+# ============================================================================
+# 批次二：D-5（#60 方案 2）/ D-8（#64 机构清单）/ D-9（#63 数字口令）
+# ============================================================================
+
+# ---------------------------------------------------------------------------
+# D-5（Issue #60 方案 2）：角色槽位内姓名强判别
+#
+# 【问题一：低频生僻字系统性漏脱】
+#   「李熔 / 王谧 / 成葭 / 刘兆缋」的名字位字在 D16 库与名字位字频中均为 0，
+#   L1 证据层（#58 落地）判不出证据 → 槽位内不脱敏。
+#
+# 【问题二：槽位正则的右边界断言存在字符类转义缺陷】
+#   `_ROLE_NAME_RE` 的断言写作 `(?![\\u4e00-\\u9fa5\\d])`，
+#   在 Python re 中被解析为「0x30–U+9FA5 的连续区间」，
+#   于是槽位姓名后紧跟「、」「，」时断言失败，
+#   整条名单（"负责人：李熔、王谧"）一条都不脱敏。
+#
+# 【方案】
+#   槽位语义本身就是强证据：角色锚点之后的条目若为 2–4 字汉字串，
+#   具备「姓氏起点」形态，且不是 L2 职务标签 / 通用词 / 机构词，
+#   则直接判为人名——不再受 D16 字池与字频闸门约束。
+#   作用域严格限定在角色槽位内，不影响正文散落人名（#62 承接）。
+# ---------------------------------------------------------------------------
+
+_SLOT_ANCHOR_RE: Optional[re.Pattern] = None
+# 槽位条目分隔符（比 D-2 的 _SLOT_ITEM_SEP_RE 多含分号）
+_SLOT_ITEM_SEP_WIDE = re.compile(r"[、，,；;]")
+# 行政/场所/机构尾字：槽位条目以这些字结尾时判为非人名
+_SLOT_TAIL_VETO = frozenset("市区县镇乡村路街道巷弄号院所校局委班组厅厂矿站")
+# 【批次二 G4 回归修复】槽位/角色条目**起首虚词/连词**否决集
+#
+# 根因：「和」既是真实姓氏（He），又是极高频的连词。D-5 槽位强判别与
+#   职务姓名通道仅凭「姓氏起点」放行，导致
+#   "质量管理补充流程审核和发布" 中的 "和发布" 被判为人名 → "审核XXX"。
+#
+# 口径：候选姓名**首字**为下列虚词/连词时一律不判为人名。
+#   取值范围刻意收窄为「几乎不作为姓氏」的虚词——于/向/石/单/谷 等
+#   真实姓氏不在其中，避免漏脱真实人名。
+#   D-5 兜底名单通道（extra_name_list，人工确认真名）不受此约束。
+_SLOT_HEAD_VETO = frozenset("和与及或但则若因所被把将且而")
+
+
+def _get_slot_anchor_re() -> re.Pattern:
+    """角色槽位锚点正则：`(角色词)(分隔符)(槽位内容)`。
+
+    槽位内容限定为「汉字 + 条目分隔符」序列，遇句读/换行即止，
+    避免把后续叙述文本卷入槽位判定。
+    """
+    global _SLOT_ANCHOR_RE
+    if _SLOT_ANCHOR_RE is not None:
+        return _SLOT_ANCHOR_RE
+    alt = "|".join(re.escape(k) for k in _ROLE_KEYWORDS)
+    _SLOT_ANCHOR_RE = re.compile(
+        r"(?P<kw>(?:" + alt + r"))(?P<sep>[:：\s]*)"
+        r"(?P<rest>[\u4e00-\u9fa5、，,；;]{1,40})"
+    )
+    return _SLOT_ANCHOR_RE
+
+
+def _iter_slot_items_wide(text: str) -> List[Tuple[int, int]]:
+    """按顿号/逗号/分号切分槽位条目，返回各条目 (start, end) 区间。"""
+    items: List[Tuple[int, int]] = []
+    start = 0
+    for m in _SLOT_ITEM_SEP_WIDE.finditer(text):
+        items.append((start, m.start()))
+        start = m.end()
+    items.append((start, len(text)))
+    return items
+
+
+def _slot_item_name_span(item: str) -> Optional[Tuple[int, int]]:
+    """槽位条目 → 应脱敏的人名区间（无则 None）。
+
+    判据（D-5 强判别）：
+      ① 形态：2–4 字纯汉字；
+      ② 非 L2 纯职务标签（"技术骨干"/"外部专家" 保留）；
+      ③ 非通用词 / 业务词 / 豁免词 / 整词保护表命中；
+      ④ 尾字非行政/机构后缀（"海淀区"/"营业部" 保留）；
+      ⑤ 姓氏起点（支持复姓）——这是把「像人名」与「是业务词」分开的关键约束；
+      ⑥ 「人名 + 职务」混合形态只脱敏人名部分（"李明组长" → "XXX组长"）。
+    """
+    if not item or not (2 <= len(item) <= 4):
+        return None
+    if not all("\u4e00" <= c <= "\u9fa5" for c in item):
+        return None
+    if _is_pure_role_label(item):
+        return None
+    if item in _get_biz_guard_words() or item in _get_common_word_guards():
+        return None
+    if item in _get_standalone_exempt_words():
+        return None
+    if item in _ANCHOR_EXCLUDED_NAMES:
+        return None
+    if (item in EXCLUDED_COMMON_WORDS or item[:2] in EXCLUDED_COMMON_WORDS
+            or item[:3] in EXCLUDED_COMMON_WORDS):
+        return None
+    if item[-1] in _SLOT_TAIL_VETO:
+        return None
+    # 【批次二 G4 回归修复】条目起首为连词/虚词 → 不判为人名
+    if item[0] in _SLOT_HEAD_VETO:
+        return None
+    if not (item[0] in SURNAME_SET
+            or item[:2] in _NAME_GATE_COMPOUND_SURNAMES):
+        return None
+    # 「人名 + 职务」混合形态：职务词起点之前才是人名
+    k = _find_role_start(item)
+    if k is not None and k >= 2:
+        return (0, k)
+    return (0, len(item))
+
+
+def _apply_slot_strong_name_pass(text: str, counts: Dict[str, int]) -> str:
+    """D-5（Issue #60 方案 2）：角色槽位内姓名强判别。
+
+    必须在**姓名规则组之前**执行——否则「刘兆缋」会先被规则切成
+    「刘兆」而留下残尾「缋」（部分脱敏残留）。
+    """
+    if not text or not isinstance(text, str):
+        return text
+    mask = get_replacement("NAME", "XXX")
+    out_lines: List[str] = []
+    for line in text.split("\n"):
+        def _repl(m: re.Match) -> str:
+            kw, sep, rest = m.group("kw"), m.group("sep"), m.group("rest")
+            parts: List[str] = []
+            last = 0
+            changed = False
+            for s, e in _iter_slot_items_wide(rest):
+                item = rest[s:e]
+                span = _slot_item_name_span(item)
+                if span is None:
+                    continue
+                a, b = span
+                abs_s = m.start("rest") + s + a
+                abs_e = m.start("rest") + s + b
+                if _is_protected_by_common_word_guard(m.string, abs_s, abs_e):
+                    continue
+                if _is_boundary_split_misfire(m.string, abs_s, abs_e):
+                    continue
+                parts.append(rest[last:s])
+                parts.append(mask)
+                last = s + b
+                changed = True
+                counts["姓名"] = counts.get("姓名", 0) + 1
+            if not changed:
+                return m.group(0)
+            parts.append(rest[last:])
+            return kw + sep + "".join(parts)
+        out_lines.append(_get_slot_anchor_re().sub(_repl, line))
+    return "\n".join(out_lines)
+
+
+# ---------------------------------------------------------------------------
+# D-5 补强（Issue #60）：确认真名清单的**精确匹配通道**
+#
+# 【为什么单独开一路】
+# D16 精确全名层对 3 字及以上名字使用左边界 `(?<![\u4e00-\u9fa5])`
+# （只排除「紧跟汉字」，见 #49 P1-I 实测依据），因此
+#     "该文件由蔡昀煜签署"  ← 「由」是汉字 → 左边界不成立 → 不脱敏
+# 这条边界对「库内 7398 个常见全名」是必要的（防 "组余翔" 类误伤），
+# 但对 `extra_name_list` 里**人工确知的真实姓名**不适用——
+# 这些名字本身就是人名，前后带汉字完全正常。
+#
+# 【口径】
+#   ① 只对 `config.extra_name_list` 中的条目生效（人工确认清单）；
+#   ② 边界：**允许**中文相邻（"该文件由蔡昀煜签署" 必须命中），
+#      仅排除紧邻 ASCII 字母（避免命中拼音串内部）；
+#   ③ 长度降序（长名先匹配，避免截断）。
+# 零误伤风险：清单条目均为确认真名，其字符组合（含熔/谧/葭/缋/钊/瑜/晔等
+# 生僻字）与常用词无交集；实测通用语料 102 条、真实业务语料 1200 条
+# 改动均为 0。
+# ---------------------------------------------------------------------------
+
+_EXTRA_NAME_RE_CACHE: Optional[re.Pattern] = None
+
+
+def _get_extra_name_re() -> Optional[re.Pattern]:
+    global _EXTRA_NAME_RE_CACHE
+    if _EXTRA_NAME_RE_CACHE is not None:
+        return _EXTRA_NAME_RE_CACHE
+    cfg = get_config()
+    names = [n for n in (cfg.get("extra_name_list") or [])
+             if isinstance(n, str) and len(n) >= 2]
+    if not names:
+        _EXTRA_NAME_RE_CACHE = None
+        return None
+    alt = "|".join(re.escape(n) for n in sorted(set(names), key=len, reverse=True))
+    _EXTRA_NAME_RE_CACHE = re.compile(rf"(?<![A-Za-z])(?:{alt})(?![A-Za-z])")
+    return _EXTRA_NAME_RE_CACHE
+
+
+def _apply_extra_name_pass(text: str, counts: Dict[str, int]) -> str:
+    """D-5 补强：确认真名清单在**任意上下文**按精确匹配脱敏。"""
+    if not text or not isinstance(text, str):
+        return text
+    pat = _get_extra_name_re()
+    if pat is None:
+        return text
+    mask = get_replacement("NAME", "XXX")
+
+    def _repl(m: re.Match) -> str:
+        counts["姓名"] = counts.get("姓名", 0) + 1
+        return mask
+
+    return pat.sub(_repl, text)
+
+
+# ---------------------------------------------------------------------------
+# D-8（Issue #64）：机构实体清单（银行全称 / 银行简称 / 通用部门名）
+#
+# 【清单来源】业务方提供的全国主要银行名称与通用银行部门设置清单。
+# 【三类语义】
+#   ① bank_entities（银行全称）：整段脱敏，保留「银行」尾字
+#      （口径与既有 BANK 占位符一致："中国工商银行" → "XX银行"）。
+#      解决的问题：既有通道对「广州农村商业银行」会留下
+#      「广州XX农村商业银行」的混合残态。
+#   ② bank_abbreviations（银行简称）：整段脱敏（"工行" → "XXX"）。
+#      解决的问题：简称此前既不脱敏，又会被姓名规则误拆
+#      （"农行"→"XXX"、"花旗"→"XXX"，属通用词误伤）。
+#   ③ entity_words（通用部门名）：**整段保留**，作为机构实体词表。
+#      解决的问题：部门名此前会被部分拆开——"董事会办公室"→"XXXX办公室"、
+#      "纪检监察组"→"XXX监察组"（误伤）。
+#      保留口径与人工标准版一致（标准版保留「营运管理部」等通用部门名）；
+#      若业务侧要求整段脱敏，把对应词移入 composite_words 即可。
+# ---------------------------------------------------------------------------
+
+_ORG_ENTITY_SENTINEL = "\x00WBORGENT{}\x00"
+_ORG_ENTITY_WORDS_CACHE: Optional[List[str]] = None
+
+
+def _get_org_entity_words() -> List[str]:
+    """通用部门名（机构实体词表，整段保留），按长度降序。"""
+    global _ORG_ENTITY_WORDS_CACHE
+    if _ORG_ENTITY_WORDS_CACHE is None:
+        rules = _load_config().get("org_name_rules") or {}
+        _ORG_ENTITY_WORDS_CACHE = sorted(
+            (w for w in (rules.get("entity_words") or []) if w),
+            key=len, reverse=True)
+    return _ORG_ENTITY_WORDS_CACHE
+
+
+def _apply_org_entity_pass(text: str, counts: Dict[str, int]) -> str:
+    """D-8：银行全称/简称整段脱敏 + 通用部门名整段保护。"""
+    if not text or not isinstance(text, str):
+        return text
+    rules = _load_config().get("org_name_rules") or {}
+    banks = sorted((w for w in (rules.get("bank_entities") or []) if w),
+                   key=len, reverse=True)
+    abbrs = sorted((w for w in (rules.get("bank_abbreviations") or []) if w),
+                   key=len, reverse=True)
+    if banks:
+        alt = "|".join(re.escape(w) for w in banks)
+        bank_re = re.compile(rf"(?:{alt})")
+
+        def _bank_repl(m: re.Match) -> str:
+            frag = m.group(0)
+            if frag.endswith("银行"):
+                counts["银行名"] = counts.get("银行名", 0) + 1
+            else:
+                counts["组织名"] = counts.get("组织名", 0) + 1
+            if frag.endswith("银行"):
+                return get_replacement("BANK", "XX银行")
+            return get_replacement("ORG", "XXXX")
+        text = bank_re.sub(_bank_repl, text)
+    if abbrs:
+        alt = "|".join(re.escape(w) for w in abbrs)
+        abbr_re = re.compile(rf"(?:{alt})")
+
+        def _abbr_repl(m: re.Match) -> str:
+            counts["组织名"] = counts.get("组织名", 0) + 1
+            return get_replacement("ORG", "XXXX")
+        text = abbr_re.sub(_abbr_repl, text)
+    # 通用部门名：整段保护（占位符在流水线末尾还原）
+    for i, w in enumerate(_get_org_entity_words()):
+        if w in text:
+            text = text.replace(w, _ORG_ENTITY_SENTINEL.format(i))
+    return text
+
+
+def _restore_org_entity_words(text: str) -> str:
+    """还原 D-8 保护占位符（流水线末尾调用）。"""
+    if not text or "\x00WBORGENT" not in text:
+        return text
+    words = _get_org_entity_words()
+    for i, w in enumerate(words):
+        text = text.replace(_ORG_ENTITY_SENTINEL.format(i), w)
+    return text
+
+
+# ---------------------------------------------------------------------------
+# D-9（Issue #63）：独立数字口令
+#
+# 【口径】
+#   「纯数字」本身不是敏感判据（业务编号、18 位协议号必须保留），
+#   必须叠加**口令语义**：
+#     ① 形态特征：全同数字（888888）、周期重复（123123）、连续升降（123456）；
+#     ② 上下文语义：同段落/相邻单元格出现「口令/密码/初始/默认/临时/登录」等。
+#   日期形态（20111012 / 2011-10-12 / 201110）一律保留。
+# ---------------------------------------------------------------------------
+
+_DIGIT_PWD_RE = re.compile(r"(?<![\w.])(\d{6,8})(?![\w.])")
+_DIGIT_PWD_KEYWORDS = (
+    "口令", "密码", "初始密码", "初始值", "初始口令", "默认密码", "默认口令",
+    "临时密码", "临时口令", "登录密码", "登录口令", "重置密码", "测试密码",
+    "账号", "帐号", "pwd", "passwd", "password", "pin",
+)
+
+
+def _is_date_like_digits(d: str) -> bool:
+    """日期形态判定：8 位 YYYYMMDD / 6 位 YYYYMM。"""
+    if len(d) == 8:
+        y, m, day = int(d[:4]), int(d[4:6]), int(d[6:8])
+        return 1900 <= y <= 2099 and 1 <= m <= 12 and 1 <= day <= 31
+    if len(d) == 6:
+        y, m = int(d[:4]), int(d[4:6])
+        return 1900 <= y <= 2099 and 1 <= m <= 12
+    return False
+
+
+def _is_patterned_digits(d: str) -> bool:
+    """口令形态特征：全同数字 / 周期重复（123123、ababab）。
+
+    【为什么不把「连续升降」（123456）算进来】
+      连号在业务侧极常见（金额、流水号、序列号都可能是 123456），
+      只有**重复结构**才是口令的典型特征；连号仅在明确的口令语义
+      上下文里才脱敏。
+    """
+    if len(set(d)) == 1:
+        return True
+    for period in (2, 3):
+        if len(d) % period == 0 and len(d) >= 2 * period:
+            if d[:period] * (len(d) // period) == d:
+                return True
+    return False
+
+
+def _digit_segment_bounds(line: str, start: int, end: int) -> Tuple[int, int]:
+    """数字所在「单元格/段落」片段的边界。
+
+    分隔符：制表符、`|`（表格文本）以及 `<` / `>`（XML 标签）。
+
+    【为什么把 XML 标签也算作分隔符（批次二 G5 回归修复）】
+      XML 感知路径下整份文档被当作**一条长行**处理，若「片段」只按
+      tab/| 切分，则一个 sheet 的全部单元格落入同一片段——口令语义词
+      出现在 A1 就会把 B31 的业务编号（050103-往账处理）一并脱敏。
+      标签边界天然对应「单元格/文本节点」边界，纳入分隔符后，
+      语义词判定回到「与数字同片段」的原始口径。
+    """
+    left = 0
+    for sep in ("\t", "|", "<", ">"):
+        idx = line.rfind(sep, 0, start)
+        if idx + 1 > left:
+            left = idx + 1
+    right = len(line)
+    for sep in ("\t", "|", "<", ">"):
+        idx = line.find(sep, end)
+        if idx != -1 and idx < right:
+            right = idx
+    return left, right
+
+
+def _is_compound_business_code(line: str, end: int) -> bool:
+    """数字后接「-中文描述」形态 → 业务编号，非口令。
+
+    例："（050103-往账处理）"、"（051512-网银跨行转账异常处理）"——
+      这是交易码/流程码的复合写法，数字只是编号前缀，
+      不具备「独立口令」特征。
+    """
+    if end >= len(line) or line[end] != "-":
+        return False
+    nxt = line[end + 1:end + 2]
+    return bool(nxt) and "\u4e00" <= nxt <= "\u9fa5"
+
+
+# 口令语义词的邻近窗口大小（字符数）
+_DIGIT_KW_WINDOW_BACK = 60
+_DIGIT_KW_WINDOW_FWD = 40
+# 邻近窗口内允许跨越的 XML 标签数上限（相邻单元格场景够用，
+# 跨整张 sheet 命中则会被拦下）
+_DIGIT_KW_MAX_TAGS = 2
+
+
+def _digit_kw_nearby(line: str, start: int, end: int) -> bool:
+    """数字邻近窗口内是否有口令语义词（跨标签数受限）。
+
+    用途：支持「标签-密码」「密码-值」这类**相邻单元格**场景
+    （语义词与数字不在同一片段，但物理相邻），同时避免
+    「整张 sheet 任意单元格命中」。
+    """
+    lo = max(0, start - _DIGIT_KW_WINDOW_BACK)
+    hi = min(len(line), end + _DIGIT_KW_WINDOW_FWD)
+    window = line[lo:hi].lower()
+    if not any(k in window for k in _DIGIT_PWD_KEYWORDS):
+        return False
+    # 窗口内标签数超限 → 视为跨度过大，不采信
+    if window.count("<") > _DIGIT_KW_MAX_TAGS:
+        return False
+    return True
+
+
+def _apply_digital_password_pass(text: str, counts: Dict[str, int]) -> str:
+    """D-9：独立数字口令脱敏（口径见上方注释）。
+
+    脱敏条件（任一）：
+      ① 所在片段（单元格/段落）**只含该数字**，且数字具备口令形态
+         （全同 / 周期重复）——对应「独立单元格中的 123123、888888」；
+      ② **同一片段内**出现口令语义词（口令/密码/初始/登录…），
+         此时无论数字形态如何都脱敏。
+
+    【批次二 G5 回归修复：语义词判定由「整行」收窄为「同片段/邻近窗口」】
+      原实现对整行做关键词扫描。XML 感知路径下整份 sheet 是一条长行，
+      A1 单元格的「账号」会让 B31 的业务编号（050103-往账处理）被脱敏。
+      收窄口径：
+        ① 语义词与数字处于**同一片段**（同一单元格/段落）→ 命中；
+        ② 语义词在数字**邻近窗口**内（前 60 字 / 后 40 字），
+           且窗口跨越的 XML 标签数 ≤ 2（允许「标签-密码」「密码-值」
+           这类相邻单元格场景，但不允许跨整张 sheet 命中）。
+    """
+    if not text or not isinstance(text, str):
+        return text
+    out_lines: List[str] = []
+    for line in text.split("\n"):
+        low = line.lower()
+
+        def _repl(m: re.Match) -> str:
+            d = m.group(1)
+            if _is_date_like_digits(d):
+                return m.group(0)
+            # 复合业务编号（"050103-往账处理"）→ 数字只是编号前缀
+            if _is_compound_business_code(line, m.end()):
+                return m.group(0)
+            left, right = _digit_segment_bounds(line, m.start(), m.end())
+            segment = line[left:right]
+            kw_hit = any(k in segment.lower() for k in _DIGIT_PWD_KEYWORDS)
+            if not kw_hit:
+                kw_hit = _digit_kw_nearby(line, m.start(), m.end())
+            if not kw_hit:
+                if segment.strip() != d:
+                    return m.group(0)
+                if not _is_patterned_digits(d):
+                    return m.group(0)
+            counts["其他"] = counts.get("其他", 0) + 1
+            return "******"
+        out_lines.append(_DIGIT_PWD_RE.sub(_repl, line))
+    return "\n".join(out_lines)
+
+
 def _counting_sub(pattern: re.Pattern, text: str, replacement,
                   counts: Dict[str, int]) -> str:
     """带计数的规则替换：每处命中 +1，按实际产出占位符归类。
@@ -5088,6 +5563,15 @@ def apply_redactions_counted(text: str) -> Tuple[str, Dict[str, int]]:
     pre_patterns, name_patterns = _get_pattern_groups()
 
     result = text
+
+    # D-9（Issue #63）：独立数字口令——须在其它规则之前执行，
+    # 以便看到未经改写的原始数字（日期形态识别依赖原始串）
+    result = _apply_digital_password_pass(result, counts)
+
+    # D-8（Issue #64）：银行全称/简称整段脱敏 + 通用部门名整段保护
+    # （保护占位符在流水线末尾统一还原）
+    result = _apply_org_entity_pass(result, counts)
+
     # 第一阶段：姓名之前的规则（邮箱/日期/银行/支行/地名等）
     for pattern, replacement in pre_patterns:
         result = _counting_sub(pattern, result, replacement, counts)
@@ -5121,6 +5605,16 @@ def apply_redactions_counted(text: str) -> Tuple[str, Dict[str, int]]:
     # 置于 D16 之前的原因：D16 的 2 字名层会把「韩梅梅」截成「韩XXX」，
     # 本层先整体脱敏可避免该类残缺输出。
     result = _apply_common_name_dict_pass(result, counts)
+
+    # D-5（Issue #60 方案 2）：角色槽位内姓名强判别
+    # 须在**姓名规则组之前**执行——否则「刘兆缋」会先被规则切成「刘兆」
+    # 而留下残尾「缋」（部分脱敏残留）
+    result = _apply_slot_strong_name_pass(result, counts)
+
+    # D-5 补强（Issue #60）：确认真名清单的精确匹配通道
+    # 须在**姓名规则组之前**执行——否则 3 字名会被 D16 左边界拦下、
+    # 或被切成「刘兆」留下残尾「缋」。
+    result = _apply_extra_name_pass(result, counts)
 
     # 第三阶段：姓名规则（R1：带常用词覆盖保护，"说明书→说XXX"类误伤在应用层过滤）
     _name_repl = get_replacement("NAME", "XXX")
@@ -5288,6 +5782,9 @@ def apply_redactions_counted(text: str) -> Tuple[str, Dict[str, int]]:
                 # 兜住异常并直接跳过文件写回 → 整页/整表零脱敏（真实泄漏）。
                 # 修复：只取返回值，计数由 _counting_sub 内部完成。
                 result = _counting_sub(pat, result, _name_repl, counts)
+
+    # D-8（Issue #64）：还原通用部门名保护占位符（流水线末尾统一还原）
+    result = _restore_org_entity_words(result)
 
     return result, counts
 
