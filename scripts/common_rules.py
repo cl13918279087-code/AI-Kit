@@ -16,6 +16,7 @@ import re
 import json
 import os
 import shutil
+import threading
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict, Any
 
@@ -1931,7 +1932,15 @@ def _apply_address_pass(text: str, stats: Dict[str, int] = None) -> str:
             continue
 
         out.append(text[last:i])
-        out.append("XX" + crossed_admin + suf)
+        # D-11 补强（Issue #63 批次四）：机构链口径——类型后缀链原样保留，
+        #   脱敏只作用于「地名性前缀」。
+        #   「区」例外：可跨后缀场景下的「区」多为片区名的一部分
+        #   （「自贸区分行」「自贸区分行营业部」），与前缀同属一个地名单元，
+        #   随前缀一并遮蔽（标准版口径为 XX分行 / XX分行营业部，
+        #   实测语料中不存在「XX区分行」形态）；省/市/县属行政层级，
+        #   保留可见（XX县支行）。
+        admin_visible = "" if crossed_admin == "区" else crossed_admin
+        out.append("XX" + admin_visible + suf)
         consumed_until = s_end
         last = s_end
         replaced = True
@@ -2428,6 +2437,12 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
             #   否则机构链被从中间切开（深圳高新北支行网点 → 深圳XX高新北支行网点）。
             #   让位后由地址通道整体收拢 → XX支行网点（保留机构类型后缀）。
             if _in_institution_chain(m.string, m.end()):
+                return m.group(0)
+            # D-11（Issue #63 验收项）：地名整词保护表命中 → 保留原文。
+            #   「长江」作为「江苏长江商业银行」的品牌词被本规则改写为「长江XX」，
+            #   但在普通词「长江大桥」中它只是地名通名，改写会造成
+            #   「长XXX桥」这类误伤（既有缺陷，本次一并修复）。
+            if _is_protected_by_place_guard(m.string, m.start(), m.end()):
                 return m.group(0)
             return brand[:2] + "XX"
         patterns.append((_BANK_BRAND_RE, _bank_brand_repl))
@@ -2961,8 +2976,18 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
     _org_composite_words = set(w for w in (_org_rules.get("composite_words") or []))
     if org_suffixes:
         suffix_alt = '|'.join(re.escape(s) for s in org_suffixes)
+        # D-11 补强（Issue #63 批次四）：「营业部」不再整词替换为 XXXX。
+        #   人工标准版口径：机构链 = [地名性前缀] + [机构类型后缀链]，
+        #   脱敏只作用于前缀，类型后缀链原样保留——
+        #     「自贸区分行营业部」→ XX分行营业部、「总行营业部」→ 总行营业部、
+        #     「鼓楼支行营业部」→ XX支行营业部。
+        #   若在此整词替换「营业部」，会得到「总行XXXX / XX区分行XXXX」等
+        #   混合残态（G3 文本级 over 的最大单一来源，47 处）。
+        #   注：「营业部」若独立出现（前后均非汉字）仍由 suffix_alt 分支兜底，
+        #   而 org_suffixes 不含「营业部」，故独立形态不再被本通道吞掉——
+        #   实测源语料中「营业部」从不独立出现。
         _ORG_NAME_RE = re.compile(
-            rf'(?:营业部|科技部|运营部|管理部|董事会|监事会|管委会|事业部)|'
+            rf'(?:科技部|运营部|管理部|董事会|监事会|管委会|事业部)|'
             rf'(?<![一-龥])(?:{suffix_alt})(?![一-龥])|'
             rf'(?<![一-龥])[一-龥]{{2}}(?:部|科|中心|管委会|办公室)(?![一-龥])'
         )
@@ -5647,6 +5672,148 @@ def _restore_org_entity_words(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# D-11 补强（Issue #63 批次四）：「地名性前缀 vs 专名网点」判别
+#
+# 【问题】人工标准版对机构名的脱敏存在**语境判别**，同一名称在两种语境
+#   下处理相反——「洪山支行」在机构清单里被遮蔽（XX支行），在叙述句里
+#   保留原文。因此判别必须按**结构**驱动，而非按词表驱动：
+#     · 机构清单/枚举语境 → 前缀遮蔽
+#         「叫号机：由总行营业部、三山支行、福新支行、洪山支行、永兴支行
+#           进行演练」→ 总行营业部、XX支行、XX支行、XX支行、XX支行
+#     · 散文叙述语境   → 专名网点保留原文
+#         「（3）由三山支行负责配合发起定期借记往账演练操作」
+#         「本轮补录由洪山支行和晋江支行配合执行」
+#         「由台江支行营业部配合发起开立银行承兑汇票的演练」
+#         「模拟操作指定福新支行、科技支行、温泉支行执行」
+#
+# 【口径】三步判别（仅对**精确命中专名网点**的机构名生效）：
+#   ① 精确匹配 named_org_keep（如「三山」「台江」）→ 进入保留候选；
+#   ② 更长前缀含地名性词（geo_org_prefixes，如「福州三山支行」）→ 仍遮蔽；
+#   ③ 清单语境 → 仍遮蔽。清单语境三判据（任一成立）：
+#        · 顿号机构链成员 ≥4（如「叫号机」行 5 个）；
+#        · 顿号机构链中存在**非专名**成员（如「总行营业部」「福清分行营业部」
+#          ——链中出现行政区/通用机构成员即说明这是机构清单）；
+#        · 位于清单标记域（参演机构/演练网点/参演网点…）之前。
+#      三判据均不成立 → 判定为叙述语境 → **保留原文**。
+#
+# 【实现】保留以哨兵占位（与 D-8 机构实体保护同一机制）：哨兵串不可被
+#   任何正则命中，故下游姓名/地址通道无法再切分该机构名——
+#   这同时解决了「洪山支行」被姓名通道误吞成「XXX支行」的问题。
+#   哨兵在流水线末尾统一还原。
+# ---------------------------------------------------------------------------
+
+_ORG_KEEP_SENTINEL = "\ue000{}\ue001"
+# 机构类型后缀链（可多级连写，如「支行营业部」「分行营业部」）
+_ORG_TYPE_CHAIN_RE = re.compile(r"(?:分行|支行|营业部|分理处|网点)+")
+_ORG_NAMED_RULES_CACHE: Optional[Tuple[List[str], List[str], List[str]]] = None
+# 哨兵 ↔ 原文映射（按线程隔离，保证并发一致性）
+_ORG_KEEP_STATE = threading.local()
+
+
+def _get_org_named_rules() -> Tuple[List[str], List[str], List[str]]:
+    """(专名网点保留词, 地名性前缀词, 清单标记词)。"""
+    global _ORG_NAMED_RULES_CACHE
+    if _ORG_NAMED_RULES_CACHE is None:
+        cfg = _load_config()
+        rules = cfg.get("place_rules") or {}
+        keep = sorted((w for w in (rules.get("named_org_keep") or []) if w),
+                      key=len, reverse=True)
+        org_rules = cfg.get("org_name_rules") or {}
+        geo = sorted(set(rules.get("geo_org_prefixes") or [])
+                     | set(org_rules.get("admin_divisions") or []),
+                     key=len, reverse=True)
+        markers = [w for w in (rules.get("org_list_markers") or []) if w]
+        _ORG_NAMED_RULES_CACHE = (keep, geo, markers)
+    return _ORG_NAMED_RULES_CACHE
+
+
+def _apply_named_org_keep_pass(text: str, counts: Dict[str, int] = None) -> str:
+    """D-11 补强：专名网点在**非清单语境**保留原文（哨兵保护）。"""
+    if not text or not isinstance(text, str):
+        return text
+    keep, geo, markers = _get_org_named_rules()
+    if not keep:
+        return text
+
+    # ① 机构名实例：[起点, 终点, 前缀原文, 类型链]
+    insts: List[List[Any]] = []
+    for m in _ORG_TYPE_CHAIN_RE.finditer(text):
+        cs, ce = m.span()
+        i = cs
+        while i > 0 and "一" <= text[i - 1] <= "鿿":
+            i -= 1
+        insts.append([i, ce, text[i:cs], text[cs:ce]])
+    if not insts:
+        return text
+
+    # ② 顿号机构链：以「、」直接相连的机构名归为同一链
+    chain_id = list(range(len(insts)))
+    for k in range(len(insts) - 1):
+        if text[insts[k][1]:insts[k + 1][0]].strip() == "、":
+            chain_id[k + 1] = chain_id[k]
+    groups: Dict[int, List[int]] = {}
+    for k, cid in enumerate(chain_id):
+        groups.setdefault(cid, []).append(k)
+
+    # ③ 逐实例判定
+    is_named = [False] * len(insts)   # 是否精确命中专名网点
+    for k, (i, ce, praw, _chain) in enumerate(insts):
+        w = next((x for x in keep if len(praw) >= len(x) and praw.endswith(x)), None)
+        if w:
+            is_named[k] = True
+
+    protected: List[Tuple[int, int]] = []
+    for k, (i, ce, praw, _chain) in enumerate(insts):
+        if not is_named[k]:
+            continue
+        w = next(x for x in keep if len(praw) >= len(x) and praw.endswith(x))
+        # ② 更长前缀含地名性词 → 仍按遮蔽处理（「福州三山支行」）
+        head = praw[:-len(w)][-8:]
+        if any(g in head for g in geo):
+            continue
+        # ③ 清单语境
+        grp = groups[chain_id[k]]
+        if len(grp) >= 4:
+            continue
+        if any(not is_named[j] for j in grp):
+            continue
+        ctx = text[max(0, i - 60):i]
+        if any(mk in ctx for mk in markers):
+            continue
+        # 保护范围仅限「专名网点 + 类型链」，不含其左侧的叙述性前缀
+        #   （「本轮补录由洪山支行」→ 只保护「洪山支行」）
+        protected.append((i + len(praw) - len(w), ce))
+
+    if not protected:
+        return text
+
+    # ④ 哨兵替换（按位置倒序，避免下标漂移）；同一原文共用同一序号
+    table: List[str] = []
+    frag_index: Dict[str, int] = {}
+    out = text
+    for i, ce in sorted(protected, reverse=True):
+        frag = text[i:ce]
+        idx = frag_index.get(frag)
+        if idx is None:
+            idx = len(table)
+            frag_index[frag] = idx
+            table.append(frag)
+        out = out[:i] + _ORG_KEEP_SENTINEL.format(chr(0xE100 + idx)) + out[ce:]
+    _ORG_KEEP_STATE.table = table
+    return out
+
+
+def _restore_named_org_keep(text: str) -> str:
+    """还原 D-11 补强的专名网点保护占位符（流水线末尾调用）。"""
+    if not text or "\ue000" not in text:
+        return text
+    table = getattr(_ORG_KEEP_STATE, "table", None) or []
+    for i, frag in enumerate(table):
+        text = text.replace(_ORG_KEEP_SENTINEL.format(chr(0xE100 + i)), frag)
+    return text
+
+
+# ---------------------------------------------------------------------------
 # D-9（Issue #63）：独立数字口令
 #
 # 【口径】
@@ -5657,7 +5824,13 @@ def _restore_org_entity_words(text: str) -> str:
 #   日期形态（20111012 / 2011-10-12 / 201110）一律保留。
 # ---------------------------------------------------------------------------
 
-_DIGIT_PWD_RE = re.compile(r"(?<![\w.])(\d{6,8})(?![\w.])")
+# 【批次四修复（D-9 边界口径，原 Issue #63 复现残留）】
+#   原式用 `\w` 作边界，但 Python 3 的 `\w` 在 Unicode 模式下**匹配汉字**，
+#   于是「默认初始密码为888888」这类**中文紧邻**的独立口令完全匹配不上
+#   （实测 findall 结果为 []），形成真实漏脱。
+#   改为 ASCII 边界后：中文上下文可命中；而「字母/数字/小数点」串内部
+#   （如 Hxitsm01、18 位协议号）仍然不会命中。
+_DIGIT_PWD_RE = re.compile(r"(?<![0-9A-Za-z.])(\d{6,8})(?![0-9A-Za-z.])")
 _DIGIT_PWD_KEYWORDS = (
     "口令", "密码", "初始密码", "初始值", "初始口令", "默认密码", "默认口令",
     "临时密码", "临时口令", "登录密码", "登录口令", "重置密码", "测试密码",
@@ -5757,6 +5930,36 @@ def _digit_kw_nearby(line: str, start: int, end: int) -> bool:
     return True
 
 
+# 「标签-值」形态的**口令类**标签词。
+#
+# 【为什么不把「账号/帐号」算进来】
+#   账号是**业务标识**（与付款协议号、业务编号同类），不是口令；
+#   G3 实测：「账号：123123、206900、456456」中的人工标准版只遮盖了
+#   形态化的 123123/456456，**保留了非形态的 206900**。
+#   若把账号当成口令标签，整列账号都会被遮成 ******，属过度脱敏。
+#   故「账号」只保留在**邻近窗口**语义词表里（可触发形态化数字脱敏），
+#   不作为「标签-值」的触发标签。
+_DIGIT_FIELD_VALUE_KEYWORDS = (
+    "口令", "密码", "初始密码", "初始值", "初始口令", "默认密码", "默认口令",
+    "临时密码", "临时口令", "登录密码", "登录口令", "重置密码", "测试密码",
+    "pwd", "passwd", "password", "pin",
+)
+
+
+def _digit_is_field_value(line: str, start: int) -> bool:
+    """数字是否处于「口令标签-值」形态（口令类标签词紧邻其前，可隔分隔符）。
+
+    例：「初始密码：888888」「初始密码 888888」→ True；
+        「账号：123123、206900、456456」中的 206900 → False
+        （账号是业务标识；且其前是列表分隔符「、」，回退后仍是数字而非标签）。
+    """
+    i = start
+    while i > 0 and line[i - 1] in "：:＝=、,，/／ \t":
+        i -= 1
+    tail = line[max(0, i - 12):i]
+    return any(tail.endswith(k) for k in _DIGIT_FIELD_VALUE_KEYWORDS)
+
+
 def _apply_digital_password_pass(text: str, counts: Dict[str, int]) -> str:
     """D-9：独立数字口令脱敏（口径见上方注释）。
 
@@ -5790,18 +5993,379 @@ def _apply_digital_password_pass(text: str, counts: Dict[str, int]) -> str:
                 return m.group(0)
             left, right = _digit_segment_bounds(line, m.start(), m.end())
             segment = line[left:right]
-            kw_hit = any(k in segment.lower() for k in _DIGIT_PWD_KEYWORDS)
-            if not kw_hit:
-                kw_hit = _digit_kw_nearby(line, m.start(), m.end())
-            if not kw_hit:
-                if segment.strip() != d:
+            # 【批次四修复】口令判据由「语义词命中即脱敏」收紧为**双证据**：
+            #   ① 形态证据（全同 / 周期重复），或
+            #   ② 语义证据（邻近窗口内有口令语义词）**且**该数字是其
+            #      片段（单元格/段落）内的**唯一**数字。
+            # 【为什么必须收紧】
+            #   原口径在「账号：123123、206900、456456」这类**清单**里会把
+            #   远离形态特征的普通业务号一并脱敏（G3 实测 206900 → ******，
+            #   而人工标准版保留该业务号），属过度脱敏。
+            #   收紧后：清单中的 123123/456456（周期形态）照常脱敏，
+            #   206900（非形态）保留，与人工标准版一致。
+            kw_hit = _digit_kw_nearby(line, m.start(), m.end())
+            sole_in_segment = (segment.strip() == d)
+            patterned = _is_patterned_digits(d)
+            field_value = _digit_is_field_value(line, m.start())
+            if kw_hit:
+                if not (patterned or field_value):
                     return m.group(0)
-                if not _is_patterned_digits(d):
+            else:
+                if not (sole_in_segment and patterned):
                     return m.group(0)
             counts["其他"] = counts.get("其他", 0) + 1
             return "******"
         out_lines.append(_DIGIT_PWD_RE.sub(_repl, line))
     return "\n".join(out_lines)
+
+
+# ---------------------------------------------------------------------------
+# D-11（Issue #63）：地名 / 网点名 / 职场名
+#
+# 【问题】
+#   `config.replacement` 里早就有 `LOCATION: "XX"` 占位符，但规则体系中
+#   **没有任何一条规则产出它**——纯地名、网点名、职场名处于完全无覆盖状态：
+#       '八卦岭'      → '八卦岭'
+#       '地点：八卦岭职场501会议室。' → '地点：八卦岭职场501会议室。'
+#
+# 【为什么不走「行政区划通名（XX市/XX县）+ 地名通名（岭/江/山…）」的裸匹配】
+#   Issue #63 §3.1 风险提示已明确：地名的通名后缀极易与普通词碰撞
+#   （「翻山越岭」「长江大桥」），必须要求专名上下文或词典支持。
+#   因此本通道采用**词典驱动**（Issue #63 §3.1 通道 B「由使用方提供」）：
+#       place_rules.place_names —— 地名
+#       place_rules.site_names  —— 网点 / 场地 / 职场名
+#   词典来源：七组真实交付文件的人工标准版比对（真实漏脱片段取证）。
+#
+# 【与既有地址通道的分工】
+#   地址通道（_apply_address_pass）是**回溯式**的：从「市/路/支行/大厦…」等
+#   行政与道路后缀向左收集地名前缀（漳平支行 → XX支行）。
+#   它不认识「职场/场地/网点/园区/基地」这类**职场与场地后缀**，
+#   故本通道补齐该缺口，并按「前缀脱敏 + 后缀保留」的可回溯口径产出：
+#       八卦岭职场501会议室 → XX职场501会议室
+#       旭辉职场A栋六楼     → XX职场A栋六楼
+#
+# 【关键守卫：地名性前缀 vs 专名网点（Issue #63 §三 判别分歧）】
+#   同一个地名在不同上下文里的敏感性完全不同：
+#       '连江敖江支行'（网点名）→ 需脱敏
+#       '连江自来水'  （外部机构名）→ 保留（与人工标准版一致）
+#   故规则为：**后接 keep_after_words（机构行业词）→ 整体保留**，
+#   其余上下文按地名脱敏。地名整词保护表 place_guards 额外兜底
+#   （如「长江大桥」——地名通名与普通词碰撞的高发区）。
+# ---------------------------------------------------------------------------
+
+_PLACE_RULES_CACHE: Optional[Dict[str, Any]] = None
+
+
+def _get_place_rules() -> Dict[str, Any]:
+    """D-11 词典（config.json → place_rules），带缓存。"""
+    global _PLACE_RULES_CACHE
+    if _PLACE_RULES_CACHE is None:
+        rules = (_load_config().get("place_rules") or {})
+        names = [w for w in (list(rules.get("place_names") or [])
+                             + list(rules.get("site_names") or []))
+                 if isinstance(w, str) and w]
+        _PLACE_RULES_CACHE = {
+            "names": sorted(set(names), key=len, reverse=True),
+            "net_suffixes": tuple(sorted(
+                {w for w in (rules.get("net_suffixes") or []) if w},
+                key=len, reverse=True)),
+            "keep_after": tuple(sorted(
+                {w for w in (rules.get("keep_after_words") or []) if w},
+                key=len, reverse=True)),
+            "guards": tuple(sorted(
+                {w for w in (rules.get("place_guards") or []) if w},
+                key=len, reverse=True)),
+        }
+    return _PLACE_RULES_CACHE
+
+
+def _is_protected_by_place_guard(text: str, start: int, end: int) -> bool:
+    """D-11 地名整词保护表（**相交**语义）。
+
+    【为什么用相交而不是「包含」语义】
+      保护词（如「长江大桥」）比命中片段（如品牌规则命中的「长江」）更长，
+      命中片段只是保护词的一部分——「包含」语义要求保护词完整覆盖命中片段，
+      这里恰好成立；但对姓名类命中片段（如「江大」⊂「长江大桥」）同样成立。
+      本函数统一按**相交**判定，语义更保守：只要命中片段落在任一保护词
+      的出现区间内，即判定为「普通词/地名通名组合」，不脱敏。
+
+    【真名安全】
+      保护词表由人工维护且均为地名/普通词，与 D16 全名库、金标无交集。
+    """
+    for w in _get_place_rules()["guards"]:
+        lo = max(0, start - len(w))
+        idx = text.find(w, lo)
+        while idx >= 0 and idx <= end:
+            if idx < end and start < idx + len(w):
+                return True
+            idx = text.find(w, idx + 1)
+    return False
+
+
+def _is_place_word_in_name_form(text: str, start: int, end: int, word: str) -> bool:
+    """D-11 人名形态守卫：词典词是否处于「姓 + 词 + 名」的姓名片段中。
+
+    【为什么需要】
+      D-11 词典词（旭辉 / 连江 / 深圳 / 张江 / 漳平…）本身全部由**名字用字**
+      组成，与人名用字高度同形。若不区分「地名用法」与「姓名用法」，
+      本通道（执行于姓名通道之前）会把姓名里的词先切掉：
+          '负责人：龚旭辉' → '负责人：龚XX'   （标准版为 '负责人：XXX'）
+      真名因此丢失，且占位符形态与标准版不一致。
+
+    【判据（三者同时满足才判为姓名）】
+      ① 词典词**全部字符**都在名字用字池（否则不可能是姓名片段）；
+      ② 紧**前**一个字是姓氏（姓名片段的姓氏位）；
+      ③ 紧**后**一个字是名字用字，或该词已到串尾/非汉字边界
+         （姓名片段的名位或结束）。
+
+    【为什么 ③ 不要求「后一个字是名字用字」才算数】
+      「负责人：龚旭辉」中「旭辉」已是姓名的后两字（后接串尾），
+      属典型姓名片段；而「旭辉职场A栋六楼」中「旭辉」后接「职」（非名字用字）
+      是场地名用法——两者靠 ③ 区分。
+
+    【真名安全】
+      本守卫只会让**人名**保留原文（后续姓名通道仍会脱敏），
+      不放行任何地名/机构名，故不引入漏脱。
+    """
+    if not word or start <= 0:
+        return False
+    name_pool = _get_name_pool_set()
+    if any(ch not in name_pool for ch in word):
+        return False
+    prev_ch = text[start - 1]
+    if prev_ch not in SURNAME_SET:
+        return False
+    if end < len(text):
+        nxt = text[end]
+        if nxt in name_pool:
+            return True
+        # 后接非名字用字 → 不是姓+词的姓名片段（如「旭辉职场」）
+        return False
+    # 到串尾 → 「姓 + 词」即完整姓名
+    return True
+
+
+def _apply_place_site_pass(text: str, counts: Dict[str, int]) -> str:
+    """D-11：地名 / 网点名 / 职场名脱敏（词典驱动，前缀脱敏 + 后缀保留）。"""
+    if not text or not isinstance(text, str):
+        return text
+    rules = _get_place_rules()
+    names = rules["names"]
+    if not names:
+        return text
+    keep_after = rules["keep_after"]
+    mask = get_replacement("LOCATION", "XX")
+    out = text
+    for name in names:
+        idx = 0
+        while True:
+            i = out.find(name, idx)
+            if i < 0:
+                break
+            j = i + len(name)
+            idx = j
+            # ⓿ 银行判定链锁定区间（Issue #53 §3.4 通道互斥）：机构链归银行链所有，
+            #   其内部地名**不得**再被本通道改写（「中国银行深圳分行」→ 应为
+            #   「XX银行深圳分行」，而非「XX银行XX分行」）。
+            #   区间随替换实时重算（文本长度会变）。
+            locked_spans = _bank_chain_locked_spans(out)
+            if locked_spans and _is_in_locked_span(locked_spans, i, j):
+                continue
+            # ① 地名整词保护表（长江大桥 等）
+            if _is_protected_by_place_guard(out, i, j):
+                continue
+            # ② 机构名前缀形态（连江自来水）→ 整体保留
+            if keep_after and out.startswith(keep_after, j):
+                continue
+            # ③ 前接占位符字母（已脱敏区域）→ 跳过，保证幂等
+            if i > 0 and out[i - 1] in "Xx":
+                continue
+            # ④ 人名形态守卫：「姓 + 词典词」构成姓名时，本通道必须让位给姓名通道。
+            #   词典词（如「旭辉」「连江」「深圳」）本身全部由名字用字组成，
+            #   与人名用字高度同形；实测「负责人：龚旭辉」被本通道切成
+            #   「负责人：龚XX」——既非标准版的「XXX」，也丢失了真名。
+            #   判据：词典词**全部字符都在名字用字池**、且**紧前一个字是姓氏**、
+            #   且**紧后一个字也在名字用字池或为串尾** → 判为姓名片段，跳过。
+            if _is_place_word_in_name_form(out, i, j, name):
+                continue
+            # ⑤ 紧邻占位符吸收：银行品牌规则已把「深圳」改写成「深圳XX」
+            #    （保留地名前两字 + XX），本通道再脱敏会得到「XXXX」——
+            #    占位符长度与人工标准版（XX）不一致。此处把紧邻的占位符
+            #    一并吸收为单个 LOCATION 占位符（深圳XX → XX）。
+            absorb = 0
+            while out[j + absorb:j + absorb + 1] == "X":
+                absorb += 1
+            if absorb:
+                out = out[:i] + mask + out[j + absorb:]
+                counts["地址"] = counts.get("地址", 0) + 1
+                idx = i + len(mask)
+                continue
+            out = out[:i] + mask + out[j:]
+            counts["地址"] = counts.get("地址", 0) + 1
+            idx = i + len(mask)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# D-12（Issue #63）：企业 / 机构全称整段脱敏
+#
+# 【问题】
+#   组织名通道只覆盖 org_suffixes 的 14 项后缀（部/中心/办公室/处/科/室/所/
+#   站/小组/科室/事业部/职能部门/分室/中心组），**不含「公司/有限公司」**，
+#   导致企业全称完全漏脱：
+#       '漳平市泽源水电开发有限公司' → '漳平市泽源水电开发有限公司'
+#
+# 【口径：行政区划 + 企业字号 + 组织形式 整段匹配】
+#   只在**行政区划锚点**（org_name_rules.admin_divisions）之后匹配，
+#   因此「某金融科技公司」「顶级咨询公司」「母公司的CFO」这类
+#   **无行政区划前缀**的泛称写法不受影响（通用语料误伤增量 0）。
+#
+# 【为什么必须整段脱敏】
+#   局部替换会产生「XX市XX」这类混合残态（既残留行政区划、又残留字号），
+#   人工标准版的做法是整段替换（XXX），本通道与之对齐。
+# ---------------------------------------------------------------------------
+
+_FULL_ORG_RE_CACHE: Optional[List[Tuple[str, re.Pattern]]] = None
+
+
+def _get_full_org_res() -> List[Tuple[str, re.Pattern]]:
+    """D-12：行政区划 × 组织形式后缀的整段匹配正则（按锚点长度降序）。"""
+    global _FULL_ORG_RE_CACHE
+    if _FULL_ORG_RE_CACHE is None:
+        rules = (_load_config().get("org_name_rules") or {})
+        admins = sorted({w for w in (rules.get("admin_divisions") or [])
+                         if isinstance(w, str) and w}, key=len, reverse=True)
+        suffixes = sorted({w for w in (rules.get("full_org_suffixes") or [])
+                           if isinstance(w, str) and w}, key=len, reverse=True)
+        res: List[Tuple[str, re.Pattern]] = []
+        for admin in admins:
+            if not suffixes:
+                break
+            suf_alt = "|".join(re.escape(s) for s in suffixes)
+            # 字号 2–10 个汉字；后缀按长度降序（股份有限公司 先于 有限公司）
+            res.append((admin, re.compile(
+                rf"{re.escape(admin)}[一-龥]{{2,10}}(?:{suf_alt})")))
+        _FULL_ORG_RE_CACHE = res
+    return _FULL_ORG_RE_CACHE
+
+
+def _apply_full_org_name_pass(text: str, counts: Dict[str, int]) -> str:
+    """D-12：企业 / 机构全称整段脱敏（产出 ORG 占位符）。"""
+    if not text or not isinstance(text, str):
+        return text
+    res = _get_full_org_res()
+    if not res:
+        return text
+    mask = get_replacement("ORG", "XXXX")
+    out = text
+
+    def _repl(m: re.Match) -> str:
+        frag = m.group(0)
+        if _is_protected_by_place_guard(m.string, m.start(), m.end()):
+            return frag
+        # 幂等：已是占位符的区域不再处理
+        if "X" in frag:
+            return frag
+        counts["组织名"] = counts.get("组织名", 0) + 1
+        return mask
+
+    for _admin, pat in res:
+        out = pat.sub(_repl, out)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# D-8 派生（Issue #64）：机构简称派生
+#
+# 【问题】
+#   机构全称清单（bank_entities）只覆盖银行全称；现实中大量文档以
+#   **简称 + 机构通名**的形态出现（平安科技 / 平安金服 / 平安信用卡），
+#   这些简称对定位具体机构同样敏感，却完全漏脱。
+#
+# 【口径】
+#   ① abbreviation_derivations：「简称 + 指定机构通名」→ **只脱敏简称**、
+#      保留通名（平安科技 → XX科技），与人工标准版一致；
+#   ② standalone_abbreviations：独立出现的部门/机构简称 → 整词脱敏
+#      （计财 → XXX）；但**后接部门通名**时属部门名、保留
+#      （「营运计财部」是 generic_words 里的通用机构词，不脱敏）。
+# ---------------------------------------------------------------------------
+
+_ORG_ABBREV_CACHE: Optional[Dict[str, Any]] = None
+
+
+def _get_org_abbrev_rules() -> Dict[str, Any]:
+    global _ORG_ABBREV_CACHE
+    if _ORG_ABBREV_CACHE is None:
+        rules = (_load_config().get("org_name_rules") or {})
+        derivations = rules.get("abbreviation_derivations") or {}
+        norm: Dict[str, List[str]] = {}
+        for abbr, sufs in derivations.items():
+            if not isinstance(abbr, str) or not abbr:
+                continue
+            norm[abbr] = sorted({s for s in (sufs or []) if isinstance(s, str) and s},
+                                 key=len, reverse=True)
+        _ORG_ABBREV_CACHE = {
+            "derivations": norm,
+            "standalone": sorted({w for w in (rules.get("standalone_abbreviations") or [])
+                                  if isinstance(w, str) and w}, key=len, reverse=True),
+        }
+    return _ORG_ABBREV_CACHE
+
+
+def _apply_org_abbrev_pass(text: str, counts: Dict[str, int]) -> str:
+    """D-8 派生：机构简称脱敏（简称 + 通名 / 独立简称）。"""
+    if not text or not isinstance(text, str):
+        return text
+    rules = _get_org_abbrev_rules()
+    derivations = rules["derivations"]
+    standalone = rules["standalone"]
+    if not derivations and not standalone:
+        return text
+    mask = get_replacement("ORG", "XXXX")
+    out = text
+
+    # ① 简称 + 指定机构通名 → 只脱敏简称
+    for abbr, sufs in sorted(derivations.items(), key=lambda kv: -len(kv[0])):
+        for suf in sufs:
+            token = abbr + suf
+            idx = 0
+            while True:
+                i = out.find(token, idx)
+                if i < 0:
+                    break
+                idx = i + len(token)
+                if _is_protected_by_place_guard(out, i, i + len(token)):
+                    continue
+                if i > 0 and (out[i - 1] in "Xx"
+                              or re.match(r"[0-9A-Za-z]", out[i - 1])):
+                    continue
+                out = out[:i] + mask + out[i + len(abbr):]
+                counts["组织名"] = counts.get("组织名", 0) + 1
+                idx = i + len(mask)
+
+    # ② 独立简称
+    for abbr in standalone:
+        idx = 0
+        while True:
+            i = out.find(abbr, idx)
+            if i < 0:
+                break
+            j = i + len(abbr)
+            idx = j
+            if _is_protected_by_place_guard(out, i, j):
+                continue
+            # 后接部门通名 → 属通用部门名（营运计财部），保留
+            if j < len(out) and out[j] in "部处科室所":
+                continue
+            if i > 0 and (out[i - 1] in "Xx"
+                          or re.match(r"[0-9A-Za-z]", out[i - 1])):
+                continue
+            if j < len(out) and re.match(r"[0-9A-Za-z]", out[j]):
+                continue
+            out = out[:i] + mask + out[j:]
+            counts["组织名"] = counts.get("组织名", 0) + 1
+            idx = i + len(mask)
+    return out
 
 
 def _counting_sub(pattern: re.Pattern, text: str, replacement,
@@ -5894,9 +6458,22 @@ def apply_redactions_counted(text: str) -> Tuple[str, Dict[str, int]]:
     # （保护占位符在流水线末尾统一还原）
     result = _apply_org_entity_pass(result, counts)
 
+    # D-11 补强（Issue #63 批次四）：专名网点「非清单语境保留」
+    # 【时机】须在**所有会切分机构名的通道之前**——组织名通道（营业部/
+    #   部/中心）、地址通道（回溯式收拢）、姓名通道（专名误吞为 XXX）
+    #   都会把机构名切碎，故先以哨兵整体占位，末尾统一还原。
+    result = _apply_named_org_keep_pass(result, counts)
+
     # 第一阶段：姓名之前的规则（邮箱/日期/银行/支行/地名等）
     for pattern, replacement in pre_patterns:
         result = _counting_sub(pattern, result, replacement, counts)
+
+    # D-12（Issue #63）：企业 / 机构全称整段脱敏
+    # 【时机】须在**银行名规则之后**（避免与银行全称抢口径，如
+    #   「福建海峡银行股份有限公司」应由银行通道处理为「XX银行」），
+    #   且须在**地址通道之前**（否则行政区划前缀被地址通道先吃掉，
+    #   企业全称将退化为「XX市XX」混合残态）。
+    result = _apply_full_org_name_pass(result, counts)
 
     # R-⑮（v1.3.7，Issue #13-③）：无区号 7–8 位本地号码（上下文限定）
     # 须在地址通道之前执行——否则"电话：87517381"等可能被其它规则先行切分
@@ -5905,6 +6482,17 @@ def apply_redactions_counted(text: str) -> Tuple[str, Dict[str, int]]:
     # 第二阶段：回溯式地址脱敏通道（省/市/县/区/街道/路/楼盘/大厦/支行/门牌）
     # 必须在姓名规则之前执行，防止"金水/花园"等地址成分被姓名规则误吞
     result = _apply_address_pass(result, stats=counts)
+
+    # D-11（Issue #63）：地名 / 网点名 / 职场名脱敏（词典驱动）
+    # 【时机】须在**姓名规则之前**——否则「连江」会被姓名通道误判成人名
+    #   （实测 '连江' → 'XXX'），既造成分类错误又与人工标准版不符；
+    #   同时在**地址通道之后**——地址通道已按回溯口径处理了
+    #   「地名 + 支行/分行/营业部」等网点名（漳平支行 → XX支行）。
+    result = _apply_place_site_pass(result, counts)
+
+    # D-8 派生（Issue #64）：机构简称脱敏（平安科技 → XX科技）
+    # 须在**姓名规则之前**——否则简称会被姓名通道先行误拆。
+    result = _apply_org_abbrev_pass(result, counts)
 
     # 第三阶段（0）：职务与称谓式人名通道（Issue #52）
     # 须在通用姓名规则**之前**执行——"李工/陈总/张经理"等组合形态若先被
@@ -6113,6 +6701,9 @@ def apply_redactions_counted(text: str) -> Tuple[str, Dict[str, int]]:
     # D-8（Issue #64）：还原通用部门名保护占位符（流水线末尾统一还原）
     result = _restore_org_entity_words(result)
 
+    # D-11 补强（Issue #63 批次四）：还原专名网点保护占位符
+    result = _restore_named_org_keep(result)
+
     return result, counts
 
 
@@ -6311,6 +6902,9 @@ def reset_patterns() -> None:
     global _ROLE_LABEL_PATTERNS
     global _ROLE_SUFFIX_SORTED
     global _ORG_GEN_NAME_CTX
+    global _PLACE_RULES_CACHE
+    global _FULL_ORG_RE_CACHE
+    global _ORG_ABBREV_CACHE
 
     _PATTERNS = None
     _FULL_NAME_SET_CACHE = None
@@ -6337,6 +6931,12 @@ def reset_patterns() -> None:
     _ROLE_LABEL_PATTERNS = None
     _ROLE_SUFFIX_SORTED = None
     _ORG_GEN_NAME_CTX = None
+    # 【批次四新增】D-11 地名/网点词典、D-12 企业全称正则、D-8 简称派生规则
+    # 均为**配置派生缓存**，必须一并清空——否则「切到假配置再切回真配置」
+    # 后，真配置里的地名/机构词再也加载不到（与本函数文档中的历史缺陷同类）。
+    _PLACE_RULES_CACHE = None
+    _FULL_ORG_RE_CACHE = None
+    _ORG_ABBREV_CACHE = None
 
 
 # ---------------------------------------------------------------------------

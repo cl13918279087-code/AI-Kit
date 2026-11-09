@@ -62,6 +62,10 @@ _INTENT_PLACEHOLDER_RE = re.compile(r"[XYMD0-9%\.\-/]+")
 _ORG_SUFFIX_RE = re.compile(
     r"(营业部|科技部|运营部|管理部|董事会|监事会|管委会|事业部|信息科技部|合规部)"
 )
+# 机构类型后缀链（Issue #63 批次四 D-11 补强）：机构链 =
+#   [地名性前缀] + [类型后缀链]，脱敏只作用于前缀，类型后缀链保留
+#   （标准版口径：自贸区分行营业部 → XX分行营业部、总行营业部 → 原样）
+_ORG_CHAIN_SUFFIX_RE = re.compile(r"(?:支行|分行|营业部|分理处)")
 _PLACEHOLDER_NAMES = ("张三", "李四")
 # 占位符字符（脱敏产物中的 X/Y/M/D 等）
 _PLACEHOLDER_TOKEN_RE = re.compile(r"[XYMD]{2,}")
@@ -90,6 +94,28 @@ def _is_date_intent(seg: str, old: str, rep: str) -> bool:
         return False
     return ("年" in seg or "月" in seg or "日" in seg
             or "-" in seg or "/" in seg)
+
+
+def _is_org_chain_intent(seg: str, old: str, rep: str) -> bool:
+    """判断一处差异是否属于「机构链脱敏」（设计意图）。
+
+    Issue #63 批次四 D-11 补强后，机构链口径为
+    「[地名性前缀] + [机构类型后缀链]」，脱敏只作用于前缀，
+    类型后缀链（支行/分行/营业部/分理处）保留：
+        「自贸区分行营业部」→「XX分行营业部」
+        「福清分行营业部」→「XX分行营业部」
+    差异段形态为 old=地名性前缀、rep=XX，且该前缀在原句中
+    **紧邻**机构类型后缀 —— 满足即视为设计意图。
+    """
+    if rep.strip() != "XX":
+        return False
+    key = old.strip()
+    if not key:
+        return False
+    m = re.search(re.escape(key), seg)
+    if not m:
+        return False
+    return bool(_ORG_CHAIN_SUFFIX_RE.match(seg[m.end():m.end() + 6]))
 
 
 def load_assets(root: Optional[str] = None) -> Dict[str, Any]:
@@ -221,6 +247,9 @@ def _compute_metrics_uncached(root: Optional[str] = None,
             if any(p in old for p in _PLACEHOLDER_NAMES):
                 continue
             if _ORG_SUFFIX_RE.fullmatch(old.strip()) and rep.strip() == "XXXX":
+                continue
+            # 机构链脱敏（Issue #63 批次四）：前缀 → XX，类型后缀链保留
+            if _is_org_chain_intent(seg, old, rep):
                 continue
             if _is_date_intent(seg, old, rep):
                 continue

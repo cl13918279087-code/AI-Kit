@@ -169,17 +169,26 @@ def test_l1_03_disabled_types_not_redacted():
       【批次二补充（2026-11-08）】D-4 机构名通道语义拆分后，**通用机构词**
       （`财务部`/`运营部`/`科技部`/`运营中心` 等 15 个）按人工标准版口径
       **整段保留**，不再走 ORG 整段脱敏；ORG 通道仍启用，仅对**非通用**后缀
-      命中生效（如 `营业部` → `XXXX`）。原断言用「财务部」作为 ORG 启用证据，
-      已过时，随 D-8 机构清单一并更正。
+      命中生效。原断言用「财务部」作为 ORG 启用证据，已过时，随 D-8 机构
+      清单一并更正。
+
+      【批次四补充（2026-11-09）】D-11 补强后「营业部」不再整词替换为
+      XXXX——它是**机构类型后缀**，按人工标准版口径随机构链保留
+      （`XX分行营业部`/`总行营业部`）。故 ORG 启用证据改用「事业部」，
+      机构链口径另立断言。
     """
     # 银行卡：禁用 → 明文保留
     assert "6222021234567890" in cr.apply_redactions("银行卡6222021234567890")
     # 固话：启用 → 全遮
     assert "010-12345678" not in cr.apply_redactions("固话010-12345678")
     # 组织名 ORG：启用（非通用后缀命中 → 整段脱敏）
-    assert cr.apply_redactions("某某支行营业部") == "某某支行XXXX"
+    assert cr.apply_redactions("某某事业部") == "某某XXXX"
     # 通用机构词：按 D-4/D-8 口径整段保留
     assert cr.apply_redactions("财务部") == "财务部"
+    # 机构链口径（D-11 补强，Issue #63 批次四）：机构类型后缀链保留，
+    # 仅脱敏地名性前缀 → 与人工标准版一致
+    assert cr.apply_redactions("自贸区分行营业部") == "XX分行营业部"
+    assert cr.apply_redactions("总行营业部") == "总行营业部"
 
 
 def test_l1_04_count_redactions_no_exception():
