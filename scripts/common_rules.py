@@ -2992,14 +2992,24 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
             rf'(?<![一-龥])[一-龥]{{2}}(?:部|科|中心|管委会|办公室)(?![一-龥])'
         )
 
-        # 前缀成词表：先于通用组织名规则执行，整段替换（不产生残尾）
-        if _org_composite_words:
+        # 前缀成词表 + D-7 机构实体白名单：先于通用组织名规则执行，整段替换
+        # （不产生残尾）
+        #   · `composite_words`（D-4 前缀成词）：整段脱敏（Issue #61 §四 验收 1）；
+        #   · `entity_whitelist`（D-7 业务侧机构实体白名单）：整段脱敏——
+        #     即 #64 §四 验收第 1 条所要求的「营运管理部」类机构实体口径。
+        _org_entity_words = set(_org_composite_words)
+        _d7_layer = _org_rules.get("org_entity_layer") or {}
+        if _d7_layer.get("enable"):
+            _org_entity_words |= {
+                w for w in (_d7_layer.get("entity_whitelist") or []) if w}
+        if _org_entity_words:
             _composite_alt = '|'.join(
-                re.escape(w) for w in sorted(_org_composite_words, key=len, reverse=True))
+                re.escape(w) for w in sorted(_org_entity_words, key=len, reverse=True))
             _ORG_COMPOSITE_RE = re.compile(rf'(?:{_composite_alt})')
 
             def _org_composite_repl(m):
-                """前缀成词机构实体：整段脱敏（Issue #61 §四 验收 1）。"""
+                """前缀成词 / 白名单机构实体：整段脱敏（Issue #61 §四 验收 1、
+                Issue #64 §四 验收 1）。"""
                 return rep.get("ORG", "XXXX")
 
             patterns.append((_ORG_COMPOSITE_RE, _org_composite_repl))
@@ -3019,9 +3029,19 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
             【G4-S 兜底】
               其余前缀成词情形（如保护表中的更长词）仍按 Issue #53 §3.2
               整词保留。
+
+            【D-7 机构实体层（Issue #64）】
+              命中片段若落在某个「通名 + 后缀」组合式机构实体上
+              （如「零售部」「贸金部」「计划财务部」），一律**保留**：
+                · 「零售部」这类通用部门名在人工标准版中一律保留，
+                  整段遮盖属过度脱敏（G3 文本级 over 的机构类来源）；
+                · 「计划财务部」若被切成「计划财务 + 管理部」，
+                  则产生「混合残态」，与 D-7 的立意相反。
             """
             frag = m.group(0)
             if frag in _org_generic_words:
+                return frag
+            if _is_org_layer_combo_span(m.string, m.start(), m.end()):
                 return frag
             if _is_protected_by_common_word_guard(m.string, m.start(), m.end(),
                                                   strict_longer=True):
@@ -5108,8 +5128,19 @@ def _get_org_generic_name_ctx():
         _ORG_GEN_NAME_CTX = (None, set(), set())
         return _ORG_GEN_NAME_CTX
     # 定长回顾：匹配片段**只含姓名**，机构词不在匹配范围内
-    lb = "|".join(f"(?<={re.escape(w)})"
-                  for w in sorted(words, key=len, reverse=True))
+    lb_list = [f"(?<={re.escape(w)})"
+               for w in sorted(words, key=len, reverse=True)]
+    # D-7（Issue #64）：白名单机构实体被整段脱敏后，其**脱敏形态**
+    #   （哨兵 + ORG 占位符 + 哨兵）同样充当人名边界豁免点——
+    #   否则「郑侃营运管理部钱媛」中的「钱媛」会因紧邻 ASCII 占位符
+    #   而失去左边界 → 人名漏脱（实测 G3 语料 34 处「营运管理部 + 人名」）。
+    d7_rules = _get_org_entity_layer_rules()
+    if d7_rules.get("enable") and (d7_rules.get("entity_whitelist") or []):
+        _d7_anchor = (_ORG_LAYER_MASK_OPEN
+                      + re.escape(get_replacement("ORG", "XXXX"))
+                      + _ORG_LAYER_MASK_CLOSE)
+        lb_list.append(f"(?<={_d7_anchor})")
+    lb = "|".join(lb_list)
     pattern = re.compile(rf'(?:{lb})(?P<name>[\u4e00-\u9fa5]{{2,3}})')
     _ORG_GEN_NAME_CTX = (pattern, get_full_name_set(), _get_common_name_dict())
     return _ORG_GEN_NAME_CTX
@@ -5669,6 +5700,158 @@ def _restore_org_entity_words(text: str) -> str:
     for i, w in enumerate(words):
         text = text.replace(_ORG_ENTITY_SENTINEL.format(i), w)
     return text
+
+
+# ---------------------------------------------------------------------------
+# D-7（Issue #64，2026-11-09）：L3 机构实体层（org_stems × org_suffixes 组合式）
+#
+# 【问题】机构名通道此前只有两层语义：
+#   · `generic_words`（独立通用词）→ **保留**原文；
+#   · `composite_words`（前缀成词）→ **整段脱敏**。
+# 「通名 + 后缀」组合（如「零售部」「贸金部」「营运管理部」）既不在两张表里，
+# 只能落到通用机构名正则的兜底分支：
+#     (?<![一-龥])[一-龥]{2}(?:部|科|中心|管委会|办公室)(?![一-龥])
+# 于是两种错误同时存在：
+#   ① 通用部门名被整段脱敏——「零售部 / 贸金部 / 特资部 / 金市部 / 公司部」
+#      在人工标准版中**一律保留**（实测 G3 语料各 1 处，我方全遮）→ 过度脱敏；
+#   ② 真实机构实体只能按通用词保留——「营运管理部」无法按业务需要整段脱敏，
+#      口径无法切换（#64 验收第 1 条长期无法满足的根因）。
+#
+# 【方案】引入 L3 机构实体层：**组合式生成** + 白名单决策
+#   · `org_stems`（通名）× `org_suffixes`（后缀）→ 候选机构实体组合；
+#   · 组合命中且在 `entity_whitelist`（业务侧机构实体白名单）内
+#     → **整段脱敏**（杜绝「营运XXXX」这类混合态）；
+#   · 组合命中但不在白名单 → **整段保留**（回退批次一通用词口径），
+#     并以哨兵整体占位，防止下游通用机构名正则把它切开成混合态；
+#   · `composite_words`（D-4 前缀成词层）同样属「整段脱敏」，一并由本层接管，
+#     保证「信息科技部」在两层之间**只有一种口径**。
+#
+# 【与通用词层互斥】实体层先于通用词层执行：命中即以哨兵占位，
+#   通用词层再也看不到同一段文本 → 同一条文本不可能同时命中两种口径。
+#
+# 【哨兵】私用区码位（与 D-11 补强同源，避免被英文/数字通道吞掉）：
+#   保留哨兵 \ue002…\ue003（原文）、脱敏哨兵 \ue004…\ue005（ORG 占位符）。
+#   哨兵在流水线末尾统一还原，还原后即为最终文本。
+# ---------------------------------------------------------------------------
+
+_ORG_LAYER_KEEP_OPEN = "\ue002"
+_ORG_LAYER_KEEP_CLOSE = "\ue003"
+# 组合正则缓存（通名 × 后缀 组合式生成）
+_ORG_LAYER_COMBO_RE: Optional[re.Pattern] = None
+_ORG_LAYER_COMBO_MAXLEN = 0
+_ORG_LAYER_COMBO_CFG_ID = 0
+
+
+def _get_org_entity_layer_rules() -> Dict[str, Any]:
+    """D-7 配置块（org_stems / org_suffixes / entity_whitelist）。"""
+    rules = (_load_config().get("org_name_rules") or {})
+    return rules.get("org_entity_layer") or {}
+
+
+def _get_org_entity_layer_sets() -> Tuple[set, set]:
+    """返回 (整段脱敏集合, 整段保留集合)。
+
+    · 整段脱敏集合 = `entity_whitelist` ∪ `composite_words`
+      （业务侧机构实体白名单 + D-4 前缀成词层）；
+    · 整段保留集合 = 由 `org_stems` × `org_suffixes` 组合生成、
+      且不在脱敏集合中的候选机构实体。
+    """
+    rules = _get_org_entity_layer_rules()
+    stems = {w for w in (rules.get("org_stems") or []) if w}
+    sufs = {w for w in (rules.get("org_suffixes") or []) if w}
+    wl = {w for w in (rules.get("entity_whitelist") or []) if w}
+    # D-4 前缀成词层（composite_words）同属「整段脱敏」口径，由本层一并接管，
+    # 保证同一文本在两层之间只有一种口径。
+    parent = (_load_config().get("org_name_rules") or {})
+    composite = {w for w in (parent.get("composite_words") or []) if w}
+    combos = {s + x for s in stems for x in sufs}
+    mask_set = wl | composite
+    return mask_set, (combos - mask_set)
+
+
+def _get_org_layer_combo_re() -> Optional[re.Pattern]:
+    """D-7 组合正则（通名 × 后缀）。
+
+    缓存与配置对象绑定（id 变化即重建），以便测试通过
+    `AIKIT_CONFIG_PATH` 切换配置时口径即时生效。
+    """
+    global _ORG_LAYER_COMBO_RE, _ORG_LAYER_COMBO_MAXLEN, _ORG_LAYER_COMBO_CFG_ID
+    cfg = _load_config()
+    if _ORG_LAYER_COMBO_RE is not None and _ORG_LAYER_COMBO_CFG_ID == id(cfg):
+        return _ORG_LAYER_COMBO_RE
+    _mask_set, keep_set = _get_org_entity_layer_sets()
+    if not keep_set:
+        _ORG_LAYER_COMBO_RE = re.compile(r"(?!x)x")   # 空匹配（永不命中）
+        _ORG_LAYER_COMBO_MAXLEN = 0
+    else:
+        alt = "|".join(re.escape(w) for w in sorted(keep_set, key=len, reverse=True))
+        _ORG_LAYER_COMBO_RE = re.compile(rf"(?:{alt})")
+        _ORG_LAYER_COMBO_MAXLEN = max(len(w) for w in keep_set)
+    _ORG_LAYER_COMBO_CFG_ID = id(cfg)
+    return _ORG_LAYER_COMBO_RE
+
+
+def _is_org_layer_combo_span(text: str, start: int, end: int) -> bool:
+    """判断 [start, end) 是否与某个 D-7 组合式机构实体相交。
+
+    用于通用机构名通道的守卫：命中「通名+后缀」组合的片段一律**保留**，
+    杜绝「零售部」这类通用部门名被整段遮掉（过度脱敏），
+    也杜绝「计划财务部」被切成「计划财务 + 管理部」这类混合残态。
+    """
+    combo_re = _get_org_layer_combo_re()
+    if combo_re is None or _ORG_LAYER_COMBO_MAXLEN <= 0:
+        return False
+    pad = _ORG_LAYER_COMBO_MAXLEN + 2
+    lo = max(0, start - pad)
+    hi = min(len(text), end + pad)
+    window = text[lo:hi]
+    for m in combo_re.finditer(window):
+        if m.start() + lo < end and start < m.end() + lo:
+            return True
+    return False
+
+
+# 白名单实体的脱敏哨兵：首字符为私用区码位（非 ASCII 字母），
+#   保证「实体前紧邻的人名」右边界仍然成立——
+#   否则「郑侃营运管理部」会产出「郑侃XXXX」，人名因右边界被占位符
+#   打断而漏脱（实测：2 字名规则右边界为 (?!ASCII 字母)）。
+_ORG_LAYER_MASK_OPEN = "\ue004"
+_ORG_LAYER_MASK_CLOSE = "\ue005"
+_ORG_LAYER_MASK_RE = re.compile(
+    _ORG_LAYER_MASK_OPEN + r"(?P<mask>.*?)" + _ORG_LAYER_MASK_CLOSE, re.DOTALL)
+
+
+def _apply_org_entity_mask_pass(text: str, counts: Dict[str, int]) -> str:
+    """D-7：机构实体白名单整段脱敏（哨兵包裹，末尾统一还原）。
+
+    · 命中白名单 → **整段**替换为 ORG 占位符，不产生「营运XXXX」混合态；
+    · 哨兵包裹保证相邻人名的左右边界不被占位符打断。
+    """
+    if not text or not isinstance(text, str):
+        return text
+    rules = _get_org_entity_layer_rules()
+    if not rules.get("enable"):
+        return text
+    wl = sorted({w for w in (rules.get("entity_whitelist") or []) if w},
+                 key=len, reverse=True)
+    if not wl:
+        return text
+    alt = "|".join(re.escape(w) for w in wl)
+    ph = get_replacement("ORG", "XXXX")
+    label = _label_for_replacement(ph)
+
+    def _repl(m):
+        counts[label] = counts.get(label, 0) + 1
+        return _ORG_LAYER_MASK_OPEN + ph + _ORG_LAYER_MASK_CLOSE
+
+    return re.sub(rf"(?:{alt})", _repl, text)
+
+
+def _restore_org_entity_layer(text: str) -> str:
+    """还原 D-7 机构实体白名单脱敏哨兵（流水线末尾调用）。"""
+    if not text or _ORG_LAYER_MASK_OPEN not in text:
+        return text
+    return _ORG_LAYER_MASK_RE.sub(lambda m: m.group("mask"), text)
 
 
 # ---------------------------------------------------------------------------
@@ -6458,6 +6641,12 @@ def apply_redactions_counted(text: str) -> Tuple[str, Dict[str, int]]:
     # （保护占位符在流水线末尾统一还原）
     result = _apply_org_entity_pass(result, counts)
 
+    # D-7（Issue #64）：L3 机构实体层 —— 白名单机构实体整段脱敏
+    # 【时机】须在**通用机构名通道之前**——否则「营运管理部」会被兜底分支
+    #   切成「营运 + 管理部」，产生「营运XXXX」混合残态；
+    # 脱敏结果以哨兵包裹，流水线末尾统一还原为 ORG 占位符。
+    result = _apply_org_entity_mask_pass(result, counts)
+
     # D-11 补强（Issue #63 批次四）：专名网点「非清单语境保留」
     # 【时机】须在**所有会切分机构名的通道之前**——组织名通道（营业部/
     #   部/中心）、地址通道（回溯式收拢）、姓名通道（专名误吞为 XXX）
@@ -6701,6 +6890,9 @@ def apply_redactions_counted(text: str) -> Tuple[str, Dict[str, int]]:
     # D-8（Issue #64）：还原通用部门名保护占位符（流水线末尾统一还原）
     result = _restore_org_entity_words(result)
 
+    # D-7（Issue #64）：还原机构实体白名单脱敏哨兵
+    result = _restore_org_entity_layer(result)
+
     # D-11 补强（Issue #63 批次四）：还原专名网点保护占位符
     result = _restore_named_org_keep(result)
 
@@ -6905,6 +7097,9 @@ def reset_patterns() -> None:
     global _PLACE_RULES_CACHE
     global _FULL_ORG_RE_CACHE
     global _ORG_ABBREV_CACHE
+    global _ORG_LAYER_COMBO_RE
+    global _ORG_LAYER_COMBO_MAXLEN
+    global _ORG_LAYER_COMBO_CFG_ID
 
     _PATTERNS = None
     _FULL_NAME_SET_CACHE = None
@@ -6937,6 +7132,10 @@ def reset_patterns() -> None:
     _PLACE_RULES_CACHE = None
     _FULL_ORG_RE_CACHE = None
     _ORG_ABBREV_CACHE = None
+    # 【D-7 新增】机构实体层组合正则（通名 × 后缀）同样是配置派生缓存
+    _ORG_LAYER_COMBO_RE = None
+    _ORG_LAYER_COMBO_MAXLEN = 0
+    _ORG_LAYER_COMBO_CFG_ID = 0
 
 
 # ---------------------------------------------------------------------------
