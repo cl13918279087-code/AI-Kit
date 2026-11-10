@@ -1414,6 +1414,112 @@ def _is_real_name_fragment(text: str, start: int, end: int) -> bool:
     return matched in get_full_name_set()
 
 
+_TRIMBACK_NAMES: Optional[set] = None
+
+
+def _get_trimback_names() -> set:
+    """取「可修剪真名」集合：D16 全名库 ∪ #55 通用人名词典 ∪ D15 注入名。
+
+    【用途】Issue #75 的 G7 修剪回退（trim-back）——见
+    `_find_trimback_name_span`。这是**已知真名**的并集，与 D16 分层边界、
+    hot/warm/cold 字频分类完全正交（不改动任何既有闸门与分档结果）。
+    """
+    global _TRIMBACK_NAMES
+    if _TRIMBACK_NAMES is None:
+        names = set(get_full_name_set())
+        names |= set(_get_common_name_dict())
+        names |= {n for n in _EXTRA_NAMES if n}
+        _TRIMBACK_NAMES = names
+    return _TRIMBACK_NAMES
+
+
+def _find_trimback_name_span(text: str, start: int, end: int) -> Optional[Tuple[int, int]]:
+    """G7 命中时，在命中片段内寻找「可被单独脱敏的已知真名」区间。
+
+    【背景】Issue #75：规则 D / E / S3' 锚点层的名字位是贪婪的
+    （`姓氏 + 名字汉字{1,3}`），在「该文件由周竹婷签署」这类上下文里
+    会把「周竹婷**签**」整体吞下；而 G7 跨词边界守卫识别出「签署」
+    跨词 → **整段回退保留原文** → 人名整段泄漏。
+
+    【解法】不整段回退，而是**只回退被误吞的那部分**：命中片段内若存在
+    一个**已知真名**（D16 ∪ #55 词典 ∪ D15），就只脱敏该真名，
+    被误吞的尾字原样保留（G7 B 分支的证据恰恰说明尾字属于下一个词）。
+
+    【必要条件（缺一不可）】
+    ① **左邻不跨词**：真名首字与其左邻字不成词
+       （`指向真实` 里的「向真」因此被拒——左邻「指」+「向」= 指向 成词）；
+    ② **吞字证据**：命中末字与其右邻字成词（G7 B 分支同源：说明尾字
+       属于下一个词，而非名字的一部分），且真名后面**恰好只多 1 个尾字**
+       ——多于此说明「真名 + 若干字」整体才可能是完整姓名
+       （如「石艳平汇」→ 前缀「石艳」+「平汇」两字，此时修剪会制造
+       「XXX + 残字」的 #57 残尾形态，宁可不脱）；
+    ③ **真名可信**：该串是已知真名，首字为姓氏字，且不被任何
+       常用词 / 整词保护 / 业务词 / 独立成词守卫豁免。
+
+    【返回值】(name_start, name_end)；不满足条件返回 None（→ 整段回退）。
+    """
+    if end - start < 3:
+        return None
+    pairs = _get_boundary_pairs()
+    if not pairs:
+        return None
+    # 条件②：吞字证据（与 G7 B 分支同源）
+    if end >= len(text):
+        return None
+    if (text[end - 1] + text[end]) not in pairs:
+        return None
+    known = _get_trimback_names()
+    for L in (3, 2):
+        e = start + L
+        # 条件②后半：真名后**恰好只多 1 个尾字**
+        if e != end - 1:
+            continue
+        cand = text[start:e]
+        # 条件③：已知真名 + 首字为姓氏字
+        if cand not in known:
+            continue
+        if cand[0] not in SURNAME_SET:
+            continue
+        # 条件①：左邻不跨词
+        if start > 0 and (text[start - 1] + cand[0]) in pairs:
+            continue
+        # 条件③后半：真名自身仍须过一遍常用词 / 业务词守卫
+        if _is_protected_by_common_word(text, start, e):
+            continue
+        if _is_protected_by_common_word_guard(text, start, e):
+            continue
+        if _is_protected_by_biz_word(text, start, e):
+            continue
+        if _is_protected_by_standalone_exempt(text, start, e):
+            continue
+        return start, e
+    return None
+
+
+def _trimback_redact(m: re.Match, replacement: str,
+                     counts: Dict[str, int]) -> Optional[str]:
+    """G7 命中时的「修剪回退」脱敏（Issue #75）。
+
+    命中片段形如「周竹婷签」——真名 + 被贪婪吞掉的尾字。G7 判定其跨词
+    （尾字与右邻字成词）→ 常规做法是整段回退保留原文 → 人名整段泄漏。
+    本函数改为：**只脱敏其中的已知真名**，尾字原样保留。
+
+    返回替换串（供 `pattern.sub` 用）；不满足条件返回 None（→ 整段回退）。
+    """
+    if callable(replacement):
+        # 函数型 replacement（如 D11 的 _list_continuation_repl）不做部分替换
+        return None
+    span = _find_trimback_name_span(m.string, m.start(), m.end())
+    if span is None:
+        return None
+    ns, ne = span
+    matched = m.group(0)
+    rel_start = ns - m.start()
+    rel_end = ne - m.start()
+    counts["姓名"] = counts.get("姓名", 0) + 1
+    return matched[:rel_start] + replacement + matched[rel_end:]
+
+
 def _is_boundary_split_misfire(text: str, start: int, end: int) -> bool:
     """G7 跨词边界守卫：命中片段横跨在两个词的边界上 → 保留原文。"""
     pairs = _get_boundary_pairs()
@@ -6889,6 +6995,12 @@ def _name_guard_sub_counted(pattern: re.Pattern, text: str, replacement: str,
             return m.group(0)
         # G7 跨词边界守卫（Issue #51）：命中横跨在两个词的边界上 → 保留原文
         if _is_boundary_split_misfire(m.string, m.start(), m.end()):
+            # Issue #75：G7「修剪回退」——命中片段里若含**已知真名**，
+            # 只脱敏该真名，被贪婪吞掉的尾字原样保留（尾字属于下一个词），
+            # 而不是整段回退导致人名整段泄漏。
+            trimmed = _trimback_redact(m, replacement, counts)
+            if trimmed is not None:
+                return trimmed
             return m.group(0)
         # Agent 评审决策跳过：若本轮匹配文本在 skip 集合中，不遮盖
         if _get_skip_texts() and m.group(0) in _get_skip_texts():

@@ -222,29 +222,22 @@ def test_issue60_names_not_regressed():
     assert not missed, f"未脱敏：{missed}"
 
 
-def test_hot_tail_gap_tracked_not_d6_scope():
-    """hot 档尾字名的既有闸门缺口：显式追踪（D-6 射程外，非 D-6 引入）。
+def test_hot_tail_gap_closed_by_issue75():
+    """hot 档尾字名缺口已由 Issue #75（G7 修剪回退）闭合。
 
     这三例（周竹婷/杜钰/胡璐）尾字为 hot 档字，D-6「不放宽 hot 集」
     故结构性不覆盖；其漏脱根因是既有姓名规则的贪婪匹配吞字 + G7
-    跨词边界守卫整段回退，在 D-6 引入前后完全一致。
+    跨词边界守卫整段回退。
 
-    本断言用 xfail 显式登记该缺口：既不掩盖（D-6 口径不含 hot 档，
-    修好也不算 D-6 的功劳），也不误记到 D-6 头上。
+    #75 以「G7 修剪回退」修复（只脱敏已知真名、保留被吞的尾字），
+    hot/warm/cold 字频分档完全不变——与 D-6 口径保持正交。
     """
-    import pytest
-
     still_leaking = []
     for n in HOT_TAIL_GAP_NAMES:
         out = apply_redactions(f"该文件由{n}签署")
         if n in out:
             still_leaking.append((n, out))
-    if still_leaking:
-        pytest.xfail(
-            "已知正交缺口（hot 档尾字名 + G7 跨词边界守卫整段回退），"
-            f"另立 issue 承接：D-6 方案 1 不放宽 hot 集，结构性不覆盖：{still_leaking}"
-        )
-    assert not still_leaking
+    assert not still_leaking, f"仍未脱敏：{still_leaking}"
 
 
 # ---------------------------------------------------------------------------
