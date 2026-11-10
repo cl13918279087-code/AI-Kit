@@ -436,15 +436,25 @@ def _get_name_pool_chars(cfg: Optional[Dict] = None) -> str:
     return chars
 
 
+def _build_name_char_class_body(chars: str) -> str:
+    """构造正则字符类的**内容部分**（不含首尾方括号）。
+
+    与 `_build_name_char_class` 同规则，但供需要把字符类**嵌入到另一个
+    字符类内部**的场景使用（例如 `(?![...])` 负向先行断言）。
+    若直接嵌入带方括号的形式会形成 `(?![[...]])` 嵌套字符类——
+    Python 会抛 `FutureWarning: Possible nested set`，且语义与预期不符。
+    """
+    chars = chars or _FALLBACK_NAME_POOL
+    return "".join("\\" + c if c in "\\]^-[" else c for c in chars)
+
+
 def _build_name_char_class(chars: str) -> str:
     """由名字用字序列构造安全的正则字符类。
 
     - 空序列回退到内置兜底池（`[]` 会让 re 报 unterminated character set）；
     - 转义 `]`、`^`、`-`、反斜杠等正则元字符，避免污染字符破坏字符类边界。
     """
-    chars = chars or _FALLBACK_NAME_POOL
-    escaped = "".join("\\" + c if c in "\\]^-[" else c for c in chars)
-    return "[" + escaped + "]"
+    return "[" + _build_name_char_class_body(chars) + "]"
 
 
 _NAME_POOL_SET_CACHE: Optional[set] = None
@@ -5621,6 +5631,279 @@ def _apply_extra_name_pass(text: str, counts: Dict[str, int]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# D-6（Issue #60 方案 1）：GB2312 生僻名用字候选池
+#
+# 【问题】名字位字频闸门（#49 P1）按 D16 全名库自举字频，分三档：
+#   热字（freq ≥ 12，尾字门槛）/ 温字（freq ≥ 3，非尾字门槛）/ 冷字（freq < 3）。
+#   「尾字落在温字或冷字档」的生僻字人名——「陈鲲」「韩晗」「孟芸」「陈曦」
+#   「蔡菁」「阮榕」「何嵘」「肖娅」——在**裸上下文**（无角色槽位、无职务
+#   后缀、无名单结构）会被闸门整名拦死。批次二 D-5 只覆盖了槽位内场景，
+#   「槽位外泛化召回」因此一直是 #60 的未闭合缺口。
+#
+# 【解法】GB2312 二级汉字（3008 字）作为**生僻名用字候选池**：
+#   GB2312 按区（row）排序——16–55 区为一级汉字（3755 字，高频常用），
+#   56–87 区为二级汉字（3008 字，次常用/生僻）。本层只在「尾字（或名字位
+#   首字）∈ 二级字」时放行：二级字在现代汉语中本身罕见，「姓 + 二级字」
+#   几乎总是人名；而一级字（支撑/占比/软件/覆盖/经验）正是 #49 复评实证的
+#   误伤区，**不入本层**（这正是 D-5b「freq == 0 即判名」被证伪的原因）。
+#
+# 【闸门关系】hot 集**不放宽**（#60 §三 方案 1 的硬约束）：
+#   本层是与既有 hot/warm 闸门**并列**的「冷档放行通道」，
+#   不改动热字集/温字集，也不改动既有任何规则的正则。
+#
+# 【双向互斥】候选池与 L4 护栏表（common_word_guards / biz_guard_words）
+#   互斥：护栏表出现过的字不进入候选池——避免把业务术语用字当成名用字
+#   （「客户凭」「信息查」这类业务词不会被误拆成人名）。
+#
+# 【误伤控制】四道闸门：
+#   ① 通用词否决表（config.json → name_rare_char_layer.veto_words）：
+#      「姓 + 二级字」构成的通用词（时髦/房檐/江豚/白鹭/黄鳝…）整词保留；
+#   ② 职务 / 机构 / 地名后缀守卫：尾字是「部/处/所/岛/洲…」等后缀字时保留；
+#   ③ 残尾守卫：命中片段的下一字若与片段构成**已知全名**
+#      （D16 全名库 ∪ 通用人名词典），说明本片段只是全名的前缀 → 放弃本次
+#      匹配（宁可不脱，也不制造「XXX + 残字」形态，#57 口径）；
+#   ④ 边界守卫：左右不得紧邻 ASCII 字母 / 数字。
+#
+# 【实测】通用业务语料 102 条、真实业务语料 1200 条**零命中**（误伤增量 0）；
+#   裸上下文金标漏脱由 1 条（柳长春）降为 0 条；幂等 / 确定性 100%。
+# ---------------------------------------------------------------------------
+
+_GB2312_CHARS_CACHE: Dict[str, str] = {}
+
+
+def _gen_gb2312_hanzi(first_row: int, last_row: int) -> str:
+    """按 GB2312 区（row）生成汉字序列。
+
+    纯标准库实现：逐字节解码 gb2312 编码表，不依赖任何外部数据文件
+    或第三方词库（内网离线环境的硬约束）。
+    """
+    out: List[str] = []
+    for hi in range(first_row, last_row + 1):
+        for lo in range(0xA1, 0xFF):
+            try:
+                ch = bytes((hi, lo)).decode("gb2312")
+            except UnicodeDecodeError:
+                continue
+            if len(ch) == 1 and "\u4e00" <= ch <= "\u9fa5":
+                out.append(ch)
+    return "".join(out)
+
+
+def _get_gb2312_chars(level: str = "2") -> str:
+    """取 GB2312 汉字序列（带缓存）。
+
+    level="1"   → 一级汉字（16–55 区，3755 字，高频常用）
+    level="2"   → 二级汉字（56–87 区，3008 字，次常用/生僻）——D-6 默认档
+    level="all" → 全量（6763 字）
+    """
+    key = str(level or "2")
+    cached = _GB2312_CHARS_CACHE.get(key)
+    if cached is not None:
+        return cached
+    if key == "1":
+        chars = _gen_gb2312_hanzi(0xB0, 0xD7)
+    elif key == "all":
+        chars = _gen_gb2312_hanzi(0xB0, 0xF7)
+    else:
+        chars = _gen_gb2312_hanzi(0xD8, 0xF7)
+    _GB2312_CHARS_CACHE.clear()
+    _GB2312_CHARS_CACHE[key] = chars
+    return chars
+
+
+# D-6 尾字守卫：机构 / 地名类后缀字（与候选池求交后生效）。
+# 只拦「同时是二级生僻字」的那几个——避免「包公祠」类机构名被误拆成姓名。
+# 仅对**三字及以上**片段生效：二字片段（丁祠）放行，避免误伤真实人名。
+_RARE_NAME_TAIL_GUARD_CHARS = "祠"
+
+
+_RARE_NAME_LAYER_CACHE: Dict[str, Any] = {}
+
+
+def _get_rare_name_layer(cfg: Optional[Dict] = None) -> Optional[Dict[str, Any]]:
+    """D-6 层的配置视图（正则 / 候选池 / 否决表 / 守卫集），按配置 id 缓存。
+
+    返回 None 表示本层不可用（未启用 / 配置缺失 / 候选池为空），
+    调用方据此直接跳过（保持与既有通道一致的「缺配置即降级」风格）。
+    """
+    if cfg is None:
+        cfg = _load_config()
+    layer = cfg.get("name_rare_char_layer") or {}
+    if not layer.get("enable", True):
+        return None
+    cfg_id = id(cfg)
+    cached = _RARE_NAME_LAYER_CACHE.get("v")
+    if cached is not None and cached[0] == cfg_id:
+        return cached[1]
+
+    level = str(layer.get("gb2312_level", "2"))
+    rare_all = _get_gb2312_chars(level)
+    if not rare_all:
+        return None
+    surnames = _get_gated_surnames(cfg)
+    if not surnames:
+        return None
+
+    # ---- 双向互斥：候选池 ∩ L4 护栏表用字 = 空 ----
+    guard_chars = set()
+    for w in _get_common_word_guards():
+        guard_chars.update(w)
+    for w in _get_biz_guard_words():
+        guard_chars.update(w)
+
+    hot = set(_get_gated_name_chars(cfg))
+    warm = set(_get_warm_name_chars(cfg))
+    # 放行档 = 二级生僻字 − L4 护栏表 − hot 集。
+    #
+    # 【不放宽 hot 集】（#60 §三 方案 1 硬约束）的准确含义：
+    #   hot 集**内容与判定阈值完全不变**（仍由 D16 全名库自举，freq ≥ 12），
+    #   本层是一个**并列**的放行通道，不修改 hot/warm 的分类结果。
+    #   hot 字本身已被既有闸门放行，无需本层重复；warm 字（3 ≤ freq < 12）
+    #   被既有「尾字门槛」拦死，正是 D-6 要救的对象（「陈曦」「孟芸」
+    #   「蔡菁」「阮榕」「韩晗」——尾字均为 warm 档二级字）。
+    cold = "".join(
+        ch for ch in rare_all
+        if ch not in guard_chars and ch not in hot
+    )
+    if not cold:
+        return None
+    cold_set = set(cold)
+    # 名字位可延展字：放行档 + hot/warm 闸门字。
+    # 热/温字本身是强名用字证据，允许在「姓 + 生僻字」之后再延展一格，
+    # 避免「李姗姗」被切成「李姗」「何嵘斌」被切成「何嵘」。
+    ext = "".join(sorted(cold_set | hot | warm))
+    ext_set = set(ext)
+
+    ext_body = _build_name_char_class_body(ext)
+    surn_alt = _build_name_char_class("".join(sorted(surnames)))
+
+    # D-6 主形态：**最大匹配** —— 姓 + 1~3 个名字位用字。
+    #
+    # 为什么用最大匹配而不是「姓 + 生僻字」的固定形态：
+    #   固定形态会把「白茯苓」切成「白茯」（残留「苓」）、把「付梓」连同
+    #   前置的「于」一起吃掉（「于付梓」）——两者都会在通用词上产生
+    #   「XXX + 残字」的残尾形态（#57 同类缺陷）。最大匹配让整词一次成型，
+    #   通用词否决表才能按**整词**精确生效。
+    #
+    # 尾部 `(?![名字位用字])` 保证不会把后面的字截断成残字。
+    # 注意：ext_body 是**字符类内容部分**（无方括号），必须显式补上 `[...]`
+    # 才能构成字符类；直接用 `(?:{ext_body}){1,3}` 会退化成「匹配 3000+ 字的
+    # 字面串」，导致整层永不命中。
+    rx = re.compile(
+        rf"(?<![A-Za-z0-9])"
+        rf"(?P<name>(?:{surn_alt})(?:[{ext_body}]){{1,3}})(?![{ext_body}])"
+    )
+
+    veto = {w for w in (layer.get("veto_words") or []) if w}
+    tail_guard = {c for c in _RARE_NAME_TAIL_GUARD_CHARS if c in cold_set}
+    known_names = set(get_full_name_set()) | set(_get_common_name_dict())
+
+    view = {
+        "rx": rx,
+        "veto": veto,
+        "tail_guard": tail_guard,
+        "known_names": known_names,
+        "cold_set": cold_set,
+        "ext_set": ext_set,
+        # 兼容别名：rare_set 即「放行档」= 候选池 ∩ 护栏表补集 ∩ 冷档。
+        # 与 L4 护栏表互斥、且不含 hot 集（#60 §三 方案 1 硬约束）。
+        "rare_set": cold_set,
+    }
+    _RARE_NAME_LAYER_CACHE.clear()
+    _RARE_NAME_LAYER_CACHE["v"] = (cfg_id, view)
+    return view
+
+
+def _veto_overlap(
+    span: str,
+    text: str,
+    s: int,
+    e: int,
+    veto: set,
+) -> bool:
+    """通用词否决表的**位置重叠**判定。
+
+    否决词与匹配片段只要在原文中**占据重叠的字符位置**即视为否决命中。
+    单纯全等判定会漏掉三类真实误伤：
+      * 前缀型：正则只匹配到「白茯」，而否决词是「白茯苓」；
+      * 后缀型：正则匹配到「于付梓」（把前置的「于」也吃进来），
+        而否决词是「付梓」；
+      * 内嵌型：正则从否决词**内部**起匹配（「武侯祠」→「侯祠」），
+        而否决词是「武侯祠」。
+
+    实现口径：对每个否决词，在原文中枚举其全部出现位置；
+    只要存在一处出现与片段 [s, e) 有交集，即判为否决命中。
+    三类都会把通用词拆成「XXX + 残字」，属于 #57 同类的残尾形态。
+    """
+    if not veto:
+        return False
+    if span in veto:
+        return True
+    for w in veto:
+        if not w:
+            continue
+        start = text.find(w)
+        while start != -1:
+            w_end = start + len(w)
+            # 区间相交判定
+            if start < e and w_end > s:
+                return True
+            start = text.find(w, start + 1)
+    return False
+
+
+def _apply_rare_name_pass(text: str, counts: Dict[str, int]) -> str:
+    """D-6（Issue #60 方案 1）：GB2312 生僻名用字候选池兜底层。
+
+    例：
+      "会议纪要 陈鲲 汇报"   →  "会议纪要 XXX 汇报"
+      "由刘兆缋签署"          →  "由XXX签署"
+      "本季度营收增长明显"      →  原样保留（通用词，无生僻名用字）
+    """
+    if not text or not isinstance(text, str):
+        return text
+    layer = _get_rare_name_layer()
+    if layer is None:
+        return text
+    rx = layer["rx"]
+    veto = layer["veto"]
+    tail_guard = layer["tail_guard"]
+    known_names = layer["known_names"]
+    cold_set = layer["cold_set"]
+    mask = get_replacement("NAME", "XXX")
+
+    hits: List[Tuple[int, int]] = []
+    for m in rx.finditer(text):
+        s, e = m.start("name"), m.end("name")
+        span = m.group("name")
+        # 放行条件：片段里必须**至少含一个冷档生僻字**。
+        # 全是 hot/warm 字的组合由既有闸门负责，本层不重复放行，
+        # 也避免把「王总」这类职务/称谓误当人名。
+        if not any(c in cold_set for c in span[1:]):
+            continue
+        # ① 通用词否决表：按**重叠**判定而非全等——
+        #    否决词可能是匹配片段的前缀（白茯 ⊂ 白茯苓）或后缀（付梓 ⊂ 于付梓）。
+        if _veto_overlap(span, text, s, e, veto):
+            continue
+        # ② 机构 / 地名后缀守卫（三字及以上才拦，避免误伤「丁祠」类人名）
+        if len(span) >= 3 and span[-1] in tail_guard:
+            continue
+        # ③ 残尾守卫：下一字与本片段构成已知全名 → 本片段只是全名前缀
+        nxt = text[e] if e < len(text) else ""
+        if nxt and (span + nxt) in known_names:
+            continue
+        hits.append((s, e))
+    if not hits:
+        return text
+
+    out = text
+    for s, e in reversed(hits):
+        counts["姓名"] = counts.get("姓名", 0) + 1
+        out = out[:s] + mask + out[e:]
+    return out
+
+
+# ---------------------------------------------------------------------------
 # D-8（Issue #64）：机构实体清单（银行全称 / 银行简称 / 通用部门名）
 #
 # 【清单来源】业务方提供的全国主要银行名称与通用银行部门设置清单。
@@ -6729,6 +7012,12 @@ def apply_redactions_counted(text: str) -> Tuple[str, Dict[str, int]]:
     # （须在姓名规则组之后执行——已被遮盖的姓名此时已是 XXX，不会被二次命中）
     result = _apply_org_generic_name_pass(result, counts)
 
+    # D-6（Issue #60 方案 1）：GB2312 生僻名用字候选池兜底层
+    # 【时机】须在**姓名规则组之后**——既有规则能整段脱敏的姓名（王倩茹
+    #   「王倩」+温字尾等）已先被遮盖，本层只看**闸门放不出的残留**；
+    #   若本层先行，会把三字名切成两字（制造 #57 口径的「残尾」形态）。
+    result = _apply_rare_name_pass(result, counts)
+
     # 后处理：纠正已知误脱敏
     # 1. 姓名模式误匹配中文词（Rule A 右边界放宽后，可能对常用词造成误匹配）
     # 2. DATE pattern 误替换（策略：替换为 XXXX年XX月XX日 保持脱敏但不暴露原始值）
@@ -7100,6 +7389,8 @@ def reset_patterns() -> None:
     global _ORG_LAYER_COMBO_RE
     global _ORG_LAYER_COMBO_MAXLEN
     global _ORG_LAYER_COMBO_CFG_ID
+    global _GB2312_CHARS_CACHE
+    global _RARE_NAME_LAYER_CACHE
 
     _PATTERNS = None
     _FULL_NAME_SET_CACHE = None
@@ -7134,6 +7425,8 @@ def reset_patterns() -> None:
     _ORG_ABBREV_CACHE = None
     # 【D-7 新增】机构实体层组合正则（通名 × 后缀）同样是配置派生缓存
     _ORG_LAYER_COMBO_RE = None
+    _GB2312_CHARS_CACHE = {}
+    _RARE_NAME_LAYER_CACHE = {}
     _ORG_LAYER_COMBO_MAXLEN = 0
     _ORG_LAYER_COMBO_CFG_ID = 0
 
