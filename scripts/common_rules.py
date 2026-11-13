@@ -1360,6 +1360,76 @@ def _is_overlapped_by_common_word_guard(text: str, start: int, end: int) -> bool
 
 
 # ---------------------------------------------------------------------------
+# D-13 结构化编号语境守卫（Issue #76）
+#
+# 【背景】
+# #74 关闭后残余 over 中仍有一类「结构化编号」被误遮：
+#     「改造34A115工程信e融服务平台」 → 「改造34AXX工程信e融服务平台」
+# 其中 "115" 是系统改造编号「34A115」的组成部分，属**结构化编号**
+# （系统编号），语义上不是敏感值；而真正需要脱敏的是**独立数值型**
+# 项目代号（如「811工程」——数字自成一体，属 R-㉖ 项目代号口径）。
+#
+# 【三类通用判据】（与文档主题无关，可跨语料复用）
+#   ① 编号 token 内部：数字属于形如 34A115 / 1A101 / 31V0 的短编号
+#      （数字0-4 + 字母 + 数字1-5，总长 ≤ 10）；
+#   ② 编号标签语境：数字紧随「编号 / 序号 / 代号 / 工单号 / …」
+#      （表格序号、目录序号、系统编号标签）；
+#   ③ 目录页码锚点：PAGEREF _TocNNNN <页码> 行尾页码 /「第N页」「共N页」。
+#
+# 【安全边界（#76 硬要求 5）】
+#   本守卫**只**接入非安全类数字规则（当前唯一：数字型项目代号），
+#   绝不接入 IPv4 / 内网 URL / 身份证 / 手机号 / 固话 / 日期 / 密码 / PIN
+#   规则——那些是**有意脱敏项**（E6 等安全设计），放宽即安全回退；
+#   配置化项目代号词表（config.project_codes）同样**不接入**
+#   （显式指定的真实项目名）。
+#
+# 【为什么按「语境」而非「长度」切分】
+#   敏感值（手机号 11 位 / 身份证 18 位 / 账号 16-19 位）与结构化编号
+#   （3-6 位）在长度上会重叠，必须看**相邻结构**：
+#     「811工程」的 811 左侧是中文 → 独立数值 → 应脱敏；
+#     「34A115工程」的 115 左侧是字母 → 编号片段 → 豁免。
+# ---------------------------------------------------------------------------
+
+_STRUCT_NUM_TOKEN_RE = re.compile(r"[0-9]{0,4}[A-Za-z][0-9]{1,5}(?![0-9A-Za-z])")
+_STRUCT_NUM_LABELS = (
+    "编号", "序号", "代号", "工单号", "批次号", "版本号", "行号", "列号",
+    "页码", "流水号", "流程号", "变更号", "备案号", "合同号", "凭证号",
+    "清单号", "单号", "案例号", "任务号", "问题号", "缺陷号",
+)
+_STRUCT_NUM_LABEL_RE = re.compile(
+    r"(?:" + "|".join(_STRUCT_NUM_LABELS) + r")[：:\s#]*$"
+)
+_STRUCT_NUM_PAGEREF_RE = re.compile(r"PAGEREF\s+_Toc\d+\s+$")
+_STRUCT_NUM_PAGE_WORD_RE = re.compile(r"(?:第|共)\s*$")
+
+
+def _is_structured_number_context(text: str, start: int, end: int) -> bool:
+    """判断数字片段 [start, end) 是否处于「结构化编号语境」。
+
+    返回 True → 该数字是编号 / 序号 / 页码的组成部分，**不是**敏感数值。
+    """
+    frag = text[start:end]
+    if not frag.isdigit():
+        return False
+    # ① 编号 token 内部：数字被某个短编号 token 完整覆盖
+    lo = max(0, start - 12)
+    hi = min(len(text), end + 12)
+    for m in _STRUCT_NUM_TOKEN_RE.finditer(text, lo, hi):
+        if m.start() <= start and end <= m.end():
+            return True
+    # ② 编号标签语境：数字紧跟在编号/序号类标签词之后
+    #    （标签正则本身以「标签词 + 可选分隔符」结尾，故 search 命中即紧邻）
+    if _STRUCT_NUM_LABEL_RE.search(text, max(0, start - 16), start):
+        return True
+    # ③ 目录页码锚点：PAGEREF _TocNNNN <页码> / 第N页 / 共N页
+    if _STRUCT_NUM_PAGEREF_RE.search(text, max(0, start - 40), start):
+        return True
+    if _STRUCT_NUM_PAGE_WORD_RE.search(text, max(0, start - 4), start):
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
 # G7 跨词边界守卫（Issue #51，真实业务语料实测）
 #
 # 【问题】姓名规则把一个常用词**切成两半**时，命中片段横跨在两个词的边界上：
@@ -2915,11 +2985,18 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
             )
             patterns.append((_PROJECT_CODE_RE, lambda m: "XX"))
 
-        # 数字型项目代号：仅限数字紧邻"工程/项目"，且数字≥3位
-        # \d{3,} 只匹配数字部分（工程在 lookahead 不消耗），替换时保留工程/项目原文
+        # ---------- D-13（Issue #76）：结构化编号语境豁免 ----------
+        # 守卫本体在模块级（_is_structured_number_context），
+        # 此处只把「数字型项目代号」规则接入（唯一允许接入的非安全类数字规则）。
+        def _project_code_repl(m):
+            # D-13（Issue #76）：结构化编号语境 → 保留原文
+            if _is_structured_number_context(m.string, m.start(), m.end()):
+                return m.group(0)
+            return "XX"
+
         patterns.append((
             re.compile(r"(\d{3,})(?=工程|项目)"),
-            lambda m: "XX"
+            _project_code_repl
         ))
 
         # ---------- 11d. 地址/城市名（如海峡、郑州 → XX） ----------
