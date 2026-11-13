@@ -2500,6 +2500,9 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
 
     # ---------- 11. 银行名称（从配置动态加载，完全动态化） ----------
     if bank_names:
+        # D-12（Issue #74）：配置化银行名单（专名）集合——
+        #   前缀豁免（D-12）不得让这些专名漏脱。
+        _BANK_CONFIG_NAMES = {b for b in bank_names if b}
         # 动态提取所有银行名前缀，按长度降序排列确保长匹配优先
         prefixes_raw = []
         for b in bank_names:
@@ -2559,6 +2562,14 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
             #   但在普通词「长江大桥」中它只是地名通名，改写会造成
             #   「长XXX桥」这类误伤（既有缺陷，本次一并修复）。
             if _is_protected_by_place_guard(m.string, m.start(), m.end()):
+                return m.group(0)
+            # D-12（Issue #74，通用规则）：G4 整词保护表命中品牌词 → 保留原文。
+            #   「身份认证平台厦门银联接入三方测试环境」中的「厦门」是
+            #   「厦门银联」联合体品牌的前缀，被品牌规则切开成「厦XXX联」，
+            #   属于业务术语被误遮。G4 采用**重叠**语义（与地址通道 G4-c 一致）：
+            #   保护词「厦门银联」与品牌片段「厦门」相交即判定为业务术语。
+            #   真名安全：G4 表入库时已与 D16 全名库 / 金标双向互斥。
+            if _is_overlapped_by_common_word_guard(m.string, m.start(), m.end()):
                 return m.group(0)
             return brand[:2] + "XX"
         patterns.append((_BANK_BRAND_RE, _bank_brand_repl))
@@ -2670,6 +2681,38 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
                 return True
             return False
 
+        # D-12（Issue #74，通用规则）：银行名前缀与 G4 整词保护表相交 → 保留原文
+        #
+        # 银行名的合法前缀是**地名/字号**（宁波/郑州/中原/海峡），
+        # 而「发起开立」「自助」「模拟活期」等是**业务修饰语/泛称**，
+        # 出现在「银行」前说明这个「银行」是泛称（自助银行、其中银行卡），
+        # 不应被兜底规则 `[汉字]{2,6}银行` 连同前缀整体吞掉。
+        #   "配合发起开立银行承兑汇票的演练" → 旧："配合XX银行承兑汇票的演练"
+        #   "改造39A04自助银行ATM"           → 旧："改造39A04XX银行ATM"
+        # 判定采用**重叠**语义（与地址通道 G4-c 一致）：保护词出现在前缀区间内即豁免。
+        # 真名安全：G4 表入库时已与 D16 全名库 / #55 词典 / 金标双向互斥；
+        #           配置化银行名单（bank_names）为**专名**，显式豁免本规则。
+        def _bank_prefix_guard_hit(text: str, start: int, matched: str) -> bool:
+            words = _get_common_word_guards()
+            if not words:
+                return False
+            prefix_len = len(matched) - 2  # 去掉尾部「银行」
+            if prefix_len <= 0:
+                return False
+            end = start + prefix_len
+            for w in words:
+                if len(w) < 2:
+                    continue
+                idx = text.find(w, max(0, start - 2))
+                while idx >= 0:
+                    if idx >= end:
+                        break
+                    ws, we = idx, idx + len(w)
+                    if ws < end and start < we:
+                        return True
+                    idx = text.find(w, idx + 1)
+            return False
+
         # D9（赵辉，第6批，2026-10-09）：银行名前导词剥离
         # 贪婪模式 [汉字]{2,6}银行 会吞掉前导句法词（如"满足红塔银行"→吞"满足"）
         # 修复：若匹配长度 > 4，先逐个剥离前导词，只保留真实地名前缀
@@ -2678,6 +2721,12 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
             matched = m.group(0)
             # 1. 整体是否受泛称/业态保护
             if _bank_generic_guard(matched):
+                return matched
+            # 1b. D-12（Issue #74）：配置化银行名单为专名，不受前缀豁免影响
+            if matched in _BANK_CONFIG_NAMES:
+                return rep.get("BANK", "XX银行")
+            # 1c. D-12（Issue #74）：前缀命中 G4 整词保护表 → 整体保留
+            if _bank_prefix_guard_hit(m.string, m.start(), matched):
                 return matched
             # 2. D10（赵辉，第6批）：泛称复合词检查——
             #    核心规则："分行"/"支行"被"分支"/"各"/"总"修饰时是泛称，不脱
