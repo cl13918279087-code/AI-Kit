@@ -5292,6 +5292,14 @@ def _list_continuation_repl(m: re.Match) -> str:
     if head_len < 2:
         return full
     # 行首姓名 mask：按字符数折半（向上取整），最小 2
+    # D-14（Issue #64）：行首姓名同样须受**词级守卫**约束——
+    #   本通道此前不查整词保护表，导致「批量任务、混合业务测试」这类
+    #   「通用词 + 人事关键词」的列表行被整段当作姓名遮盖（G7 over 来源）。
+    #   判定域 = 行首姓名片段本身（与其它姓名通道一致）。
+    if head in _ANCHOR_EXCLUDED_NAMES:
+        return full
+    if _is_protected_by_common_word_guard(m.string, m.start(), m.start() + head_len):
+        return full
     mask_chars = max((head_len + 1) // 2, 2)
     masked_head = "XX" * mask_chars
     return masked_head + tail
@@ -7099,6 +7107,13 @@ def _name_guard_sub_counted(pattern: re.Pattern, text: str, replacement: str,
     def _repl(m: re.Match) -> str:
         if locked_spans and _is_in_locked_span(locked_spans, m.start(), m.end()):
             return m.group(0)
+        # D-14（Issue #64）：**词级守卫的判定域 = 实际被遮盖的那一段**。
+        #   部分规则的命中整体包含锚点/职务词（如 S3' 角色锚点规则
+        #   「负责人 + 姓名」），其被遮盖的只是 `name` 分组；
+        #   若拿整体命中片段（"负责人管理"）去做整词保护判定，
+        #   保护表里的通用词（"管理"）就永远匹配不上 → 通用词被误吞。
+        #   故统一取 `name` 分组（有则用之，无则用整体）作为守卫判定域。
+        g_start, g_end = m.span("name") if "name" in m.re.groupindex else (m.start(), m.end())
         # 姓名形态须**全为汉字**（Issue #49 M9 遗留约束 / Issue #54 幂等性）。
         # 命中片段含 ASCII 字母 → 说明规则把**占位符**（XXX / YYYY）当成
         # 名字用字吞掉了（"演XXX和XXX线" → "演XXXXXX线"），
@@ -7106,18 +7121,18 @@ def _name_guard_sub_counted(pattern: re.Pattern, text: str, replacement: str,
         # 英文人名由独立的英文通道处理，不走本通道。
         if re.search(r"[A-Za-z]", m.group(0)):
             return m.group(0)
-        if _is_protected_by_common_word(m.string, m.start(), m.end()):
+        if _is_protected_by_common_word(m.string, g_start, g_end):
             return m.group(0)
         # 独立成词豁免（Issue #49 复评处置口径：「叶子」独立成词不做姓名脱敏，
         # 但「叶子涵」作为姓名仍须脱敏）——须排在整词保护表**之前**，
         # 否则「叶子」若被加入整词保护表，「叶子涵」会被连带放过。
-        if _is_protected_by_standalone_exempt(m.string, m.start(), m.end()):
+        if _is_protected_by_standalone_exempt(m.string, g_start, g_end):
             return m.group(0)
         # R-㊷：业务词保护守卫（G1 跨界 / G2 整体 / G3 指示词）
-        if _is_protected_by_biz_word(m.string, m.start(), m.end()):
+        if _is_protected_by_biz_word(m.string, g_start, g_end):
             return m.group(0)
         # G4 整词保护表（Issue #51）：与真实业务术语重叠 → 保留原文
-        if _is_protected_by_common_word_guard(m.string, m.start(), m.end()):
+        if _is_protected_by_common_word_guard(m.string, g_start, g_end):
             return m.group(0)
         # G7 跨词边界守卫（Issue #51）：命中横跨在两个词的边界上 → 保留原文
         if _is_boundary_split_misfire(m.string, m.start(), m.end()):
