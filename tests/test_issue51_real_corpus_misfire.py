@@ -160,9 +160,14 @@ def test_common_word_guards_mutually_exclusive_with_real_names(config, gold_name
     互斥（无任何包含关系）是 G4 不会造成真名漏脱的**充分条件**：
     保护词既不是真名的子串、也不包含任何真名，
     因此任何真名都不可能被保护表豁免。
+
+    【Issue #79】比对对象改为**有效真名集**（`get_full_name_set()`）——
+    即扣除「非人名」条目（字段标签「姓名」、系统名「司法」）后的精确层名单。
+    原始 `full_name_list` 里混有系统/产品名（实测「司法查控」），它们本就不是
+    人名，不该以「真名」标准参与互斥判定；引擎也不会对它们做精确匹配。
     """
     guards = set(config.get("common_word_guards") or [])
-    names = set(config.get("full_name_list") or []) | gold_names
+    names = set(common_rules.get_full_name_set()) | gold_names
     bad = []
     for g in guards:
         for n in names:

@@ -8236,7 +8236,13 @@
     "第四轮",
     "超柜",
     "超柜适",
-    "短信中心"
+    "短信中心",
+    "司法查控",
+    "付方账户",
+    "部门总经理",
+    "加强引导",
+    "加强投产规范",
+    "加强问题快速响应"
   ],
   "word_boundary_pairs": [
     ".0",
@@ -11279,6 +11285,9 @@
   "common_name_dict_enabled": true,
   "common_name_dict_file": "scripts/data/common_name_dict.txt",
   "full_name_list_file": "",
+  "d16_non_name_entries": [
+    "司法"
+  ],
   "standalone_exempt_words": [
     "叶子"
   ],

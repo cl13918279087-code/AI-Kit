@@ -463,6 +463,14 @@ def _process_txbx_xml(path: Path, counts: dict) -> None:
     处理文本框（wps:txbx / wpg:txbx）内的 XML。
     这些元素内嵌了完整的 <w:document> 片段。
     使用 lxml 解析 XML，只对 w:t 文本节点执行 apply_redactions，避免破坏 XML 结构。
+
+    【Issue #78】改为**段落级聚合**（与正文通道 `_process_word_xml_with_llm` 一致）：
+      · 原实现按 `w:t` **逐节点**脱敏 → Word/WPS 把一句话拆进多个 run 时
+        （"演"+"练"、"张"+"三丰"），跨 run 的通用词无法命中整词保护表
+        （通用词被整段吞掉 → 过度脱敏），跨 run 的实体无法识别（漏脱）；
+      · 现按 `w:p` 聚合其下所有 `w:t` → 整段 `apply_redactions`
+        → 用 `redistribute_paragraph` 做差异级精确回写（未变更 run 原样保留）；
+      · 不在任何 `w:p` 内的游离 `w:t` 回退到逐节点处理（兼容异常结构）。
     """
     from lxml import etree
 
@@ -472,7 +480,46 @@ def _process_txbx_xml(path: Path, counts: dict) -> None:
         root = tree.getroot()
 
         changed = False
-        for t_elem in root.iter(f"{W}t"):
+
+        # 一次性取出全部 w:t 节点并**保持强引用**——lxml 的元素代理在存活期内
+        # 身份稳定，故可用 id() 精确标记「已按段落处理」的节点，
+        # 避免第二遍回退处理时重复脱敏。
+        all_t = list(root.iter(f"{W}t"))
+        in_para_ids = set()
+        for t_elem in all_t:
+            anc = t_elem.getparent()
+            while anc is not None:
+                if anc.tag == f"{W}p":
+                    in_para_ids.add(id(t_elem))
+                    break
+                anc = anc.getparent()
+
+        # ① 段落级通道（跨 run 拼接 + 差异回写）
+        for p in root.iter(f"{W}p"):
+            t_nodes = [t for t in p.iter(f"{W}t")]
+            if not t_nodes:
+                continue
+            texts = [t.text or "" for t in t_nodes]
+            combined = "".join(texts)
+            if not combined:
+                continue
+            redacted = apply_redactions(combined)
+            if redacted == combined:
+                continue
+            new_texts = _redistribute_paragraph(texts, redacted)
+            for t, nt in zip(t_nodes, new_texts):
+                if (t.text or "") != nt:
+                    t.text = nt
+                    # 文本首尾含空格时需保留空格声明，避免 Word 打开丢空格
+                    if nt != nt.strip():
+                        t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+            changed = True
+            counts["段落/单元格"] = counts.get("段落/单元格", 0) + 1
+
+        # ② 游离节点回退（不在任何段落内的 w:t）
+        for t_elem in all_t:
+            if id(t_elem) in in_para_ids:
+                continue
             original = t_elem.text or ""
             if not original:
                 continue

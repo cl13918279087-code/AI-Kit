@@ -262,6 +262,26 @@ _FULL_NAME_SET_CACHE: Optional[set] = None
 _D16_NON_NAME_ENTRIES = frozenset({"姓名"})
 
 
+def _get_d16_non_name_entries(cfg: Optional[Dict[str, Any]] = None) -> frozenset:
+    """D16 精确层的「非人名」排除集 = 内置默认 ∪ 配置 `d16_non_name_entries`。
+
+    【Issue #79】语料派生全名库中混入了**系统/产品名**条目「司法」
+    （实测 4 处全部出现在「司法查控（法院仿真 / 全国版）」中，人工标准版
+    一律保留原文；精确层按库内姓名整段脱敏会产出「XXX查控平台」→ 过度脱敏）。
+    与「姓名」同构：不是人名，是被误收进全名库的术语。
+
+    【为什么做成配置项而不是写死】
+    内网部署方的本行花名册可能**确有**「司法」此人——写死会导致该姓名
+    在全名库中被剔除而漏脱。配置化后，部署方按需删除该条目即可恢复，
+    无需改代码。
+    """
+    if cfg is None:
+        cfg = _load_config()
+    extra = {w for w in (cfg.get("d16_non_name_entries") or [])
+             if isinstance(w, str) and w}
+    return frozenset(_D16_NON_NAME_ENTRIES | extra)
+
+
 def _get_extra_name_list(cfg: Optional[Dict[str, Any]] = None) -> List[str]:
     """返回 D-5 补充名单条目（内联 + 外置文件合并）。
 
@@ -394,7 +414,8 @@ def get_full_name_set() -> set:
     global _FULL_NAME_SET_CACHE
     if _FULL_NAME_SET_CACHE is None:
         names = _get_full_name_list()
-        _FULL_NAME_SET_CACHE = {n for n in names if n not in _D16_NON_NAME_ENTRIES}
+        _FULL_NAME_SET_CACHE = {n for n in names
+                                if n not in _get_d16_non_name_entries()}
     return _FULL_NAME_SET_CACHE
 
 
@@ -3251,8 +3272,19 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
 
             def _org_composite_repl(m):
                 """前缀成词 / 白名单机构实体：整段脱敏（Issue #61 §四 验收 1、
-                Issue #64 §四 验收 1）。"""
-                return rep.get("ORG", "XXXX")
+                Issue #64 §四 验收 1）。
+
+                【Issue #77】ORG 占位符以**私用区哨兵**包裹：
+                  D-4 前缀成词层先于姓名通道执行，若直写 ASCII `XXXX`，
+                  其首字符 `X` 会打断**紧邻其前**人名的右边界
+                  （`(?![a-zA-Z])` / `(?![a-zA-Z0-9])`）→
+                  「张三信息科技部」产出「张三XXXX」（人名漏脱）。
+                  哨兵首字符为私用区码位（非 ASCII 字母），
+                  左右边界均保持成立；流水线末尾由
+                  `_restore_org_entity_layer` 统一还原为 `XXXX`。
+                """
+                return (_ORG_LAYER_MASK_OPEN + rep.get("ORG", "XXXX")
+                        + _ORG_LAYER_MASK_CLOSE)
 
             patterns.append((_ORG_COMPOSITE_RE, _org_composite_repl))
 
@@ -3288,7 +3320,10 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
             if _is_protected_by_common_word_guard(m.string, m.start(), m.end(),
                                                   strict_longer=True):
                 return frag
-            return rep.get("ORG", "XXXX")
+            # 【Issue #77】同 D-4 前缀成词层：ORG 占位符以私用区哨兵包裹，
+            #   避免 ASCII 占位符首字符打断紧邻人名的右边界（人名漏脱）。
+            return (_ORG_LAYER_MASK_OPEN + rep.get("ORG", "XXXX")
+                    + _ORG_LAYER_MASK_CLOSE)
 
         patterns.append((_ORG_NAME_RE, _org_name_repl))
 
@@ -3335,7 +3370,11 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
     # 实测污染样本：「姓名」被当作人名全名收录，导致「请填写姓名」→「请填写XXX」。
     # 这类条目不是人名，是文档字段名；用显式清单过滤而不是改数据文件，
     # 便于上游修正 full_name_list 后自动恢复。
-    _full_name_list = [n for n in _full_name_list if n not in _D16_NON_NAME_ENTRIES]
+    # 【Issue #79】排除集 = 内置默认 ∪ 配置 `d16_non_name_entries`
+    #（仓库配置追加「司法」——语料派生库中的系统/产品名，详见
+    #  `_get_d16_non_name_entries` 注释）。
+    _full_name_list = [n for n in _full_name_list
+                       if n not in _get_d16_non_name_entries(cfg)]
     # 【执行顺序修正（Issue #49 P1，2026-10-26）】
     # D16 精确层的 pattern **延后**到 S2 名单块救援之后再 append。
     # 原因：S2 的证据是「块内含 D16 已确认真名」；若 D16 先跑，
