@@ -164,6 +164,34 @@ def _build_surname_set() -> set:
 SURNAME_SET = _build_surname_set()
 
 # ---------------------------------------------------------------------------
+# 罕见姓氏集（Issue #80）
+# ---------------------------------------------------------------------------
+#
+# 【用途】通用人名词典层（#55）的**左邻姓氏守卫**的补集。
+#
+# 【背景】
+#   该层的左邻守卫原本只查 `SURNAME_SET`（百家姓常见姓氏），
+#   于是「罕见姓氏 + 2 字名」会被**从中间切开**：
+#     「科技运营：赤帅超」→ 命中 2 字名「帅超」→「赤XX」
+#   ——「赤」是姓氏却成了残尾，既与人工标准版不一致（标准版整段保留），
+#   也留下了「姓 + 半名」这一可反查的形态（#57 口径）。
+#
+# 【为什么是「放弃匹配」而不是「连姓一起遮」】
+#   人工标准版对「赤帅超」的口径是**整段保留**（该真名不在标准版的人名库内，
+#   标准版未识别）。按「与人工标准版对齐」的项目口径，此处应整段保留；
+#   若改为整段遮盖，则我方遮盖片段不在标准版遮盖集合内 → 计入 over。
+#   两者对比：**放弃匹配**与标准版完全一致（over 归零），
+#   **整段遮盖**则产生 over 并与标准版口径相悖。
+#   隐私侧的取舍已在整改文档中显式披露（标准版漏脱、我方按对齐口径保留）。
+#
+# 【集合口径】百家姓中的罕见姓氏——在现代中文文档里极少作为姓氏出现，
+#   命中即意味着「左邻字 + 词典 2 字名」更可能是一个完整的 3 字真名。
+_RARE_SURNAME_SET = frozenset(
+    "赤幸危夹慕繁逄訾隗辟阚仉俟冼宓缪甄蔺濮亓麴蒯隽郏逯笪仵鄢"
+)
+
+
+# ---------------------------------------------------------------------------
 # M9（Issue #49，2026-10）：字池载入期清洗
 #
 # 背景：#45 扩池时把 17 个非汉字字符误采进 name_pool：
@@ -1748,7 +1776,10 @@ def _find_common_name_dict_candidates(text: str) -> List[Tuple[int, int, str]]:
                 if left.isascii() and left.isalnum():
                     break
                 # 左邻为姓氏字 → 可能是更长姓名的后缀，放弃（防截断）
-                if "\u4e00" <= left <= "\u9fa5" and left in SURNAME_SET:
+                # Issue #80：姓氏集合含罕见姓氏（赤/幸/危…），
+                # 否则「赤帅超」会被从中间切成「赤 + 帅超」。
+                if "\u4e00" <= left <= "\u9fa5" and (
+                        left in SURNAME_SET or left in _RARE_SURNAME_SET):
                     break
                 # 左邻 + 候选本身是更长的词典条目 → 交给更长的分支处理
                 if (left + cand) in words:
@@ -2548,8 +2579,16 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
     ))
     # R2 新增：无年份中文短日期"X月X日"（如"5月20日发布"）
     # 左边界阻止年份残留（YYYY年X月X日 已由上方完整规则先替换）与数字
+    #
+    # Issue #81：去掉后边界 `(?![0-9])`。
+    #   该守卫使「日期后紧跟数字」整体放弃 → 同一日期因写法不同而口径分裂：
+    #     「人员4月9日下午16：00-18：00」→ 遮盖（后随汉字）
+    #     「核对时间为4月9日5:00-8:00」    → 不遮盖（后随数字）
+    #   人工标准版对后随数字的写法同样遮盖（如 G7「投产阶段（10月29日18:00-
+    #   10月31日18:00）」→「MM月DD日18:00-MM月DD日18:00」），
+    #   故统一为：日期本体一律遮盖，其后的数字（时刻）原样保留。
     patterns.append((
-        re.compile(r'(?<![0-9年])(?:0?[1-9]|1[0-2])月(?:[0-3]?[0-9])日(?![0-9])'),
+        re.compile(r'(?<![0-9年])(?:0?[1-9]|1[0-2])月(?:[0-3]?[0-9])日'),
         _date_chinese_short
     ))
     # R2 新增：无年份斜杠短日期"M/D"（如"截止9/1上报"）
@@ -3470,6 +3509,24 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
     _d16_confirmed = set(_full_name_list)
     _name_rep_block = rep.get("NAME", "XXX")
 
+    def _wb_block_item_is_misfire(m: re.Match, item_text: str, offset: int,
+                                  is_first: bool, is_last: bool) -> bool:
+        """名单块**逐项**的 G7 跨词边界误判判定（Issue #80）。
+
+        块级判定（`_is_boundary_split_misfire(m.start(), m.end())`）对名单块
+        天然不成立——名单块本身就是「多个词用顿号并列」，
+        整体命中必然「横跨在两个词的边界上」，
+        于是整块（含其中的真名）被一并放弃：
+          「张惠蓉、郭艳丹、郑纯改」→ G7 误判 → 整块保留 → 3 字真名全部漏脱。
+        故改为**逐项**判定：块内相邻项之间是顿号（列表分隔符，非词边界），
+        只有块首项的左邻、块末项的右邻才参与边界对判定。
+        """
+        if not item_text:
+            return False
+        s = m.start("block") + offset
+        e = s + len(item_text)
+        return _is_boundary_split_misfire(m.string, s, e)
+
     def _list_rescue_repl(m: re.Match) -> str:
         """名单块一致性救援：块内含 D16 真名 → 同块各项整体脱敏。"""
         block = m.group("block")
@@ -3489,16 +3546,31 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
             if s and _is_protected_by_biz_word(it, 0, len(it)):
                 return block
         out = []
+        offset = 0
+        name_idx = 0
+        name_total = sum(1 for it in items if it and not re.fullmatch(_list_sep, it))
         for it in items:
             if re.fullmatch(_list_sep, it):
                 out.append(it)          # 分隔符原样保留
+                offset += len(it)
                 continue
             stripped = it.strip()
             if not stripped:
                 out.append(it)
+                offset += len(it)
                 continue
-            out.append(it.replace(stripped, _name_rep_block))
+            # Issue #80：逐项做跨词边界误判判定（首/末项才看块外邻居）
+            if _wb_block_item_is_misfire(m, stripped, offset + it.index(stripped),
+                                        name_idx == 0, name_idx == name_total - 1):
+                out.append(it)
+            else:
+                out.append(it.replace(stripped, _name_rep_block))
+            offset += len(it)
+            name_idx += 1
         return "".join(out)
+
+    # 名单块类规则：块级 G7 跨词边界守卫不适用（见 _wb_block_item_is_misfire）
+    _list_rescue_repl._wb_block_rule = True
 
     patterns.append((_list_block_re, _list_rescue_repl))
 
@@ -3565,13 +3637,27 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
             if _is_protected_by_biz_word(it, 0, len(it)):
                 return block
         out = []
+        offset = 0
+        name_idx = 0
+        name_total = sum(1 for it in parts if it and not re.fullmatch(_list_sep, it))
         for it in parts:
             if re.fullmatch(_list_sep, it):
                 out.append(it)
+                offset += len(it)
                 continue
             s = it.strip()
-            out.append(it.replace(s, _name_rep_block) if s else it)
+            # Issue #80：逐项做跨词边界误判判定（首/末项才看块外邻居）
+            if s and _wb_block_item_is_misfire(m, s, offset + it.index(s),
+                                               name_idx == 0, name_idx == name_total - 1):
+                out.append(it)
+            else:
+                out.append(it.replace(s, _name_rep_block) if s else it)
+            offset += len(it)
+            name_idx += 1
         return "".join(out)
+
+    # 名单块类规则：块级 G7 跨词边界守卫不适用（见 _wb_block_item_is_misfire）
+    _s4_rescue_repl._wb_block_rule = True
 
     patterns.append((_s4_block_re, _s4_rescue_repl))
 
@@ -3656,6 +3742,27 @@ def _build_patterns() -> List[Tuple[re.Pattern, str]]:
             # 3 字及以上：左边界允许 ASCII/数字/标点，只排除紧跟汉字
             _alt = "|".join(re.escape(n) for n in sorted(_long_names, key=len, reverse=True))
             _d16_layers.append(re.compile(rf'(?<![\u4e00-\u9fa5])(?:{_alt})(?![a-zA-Z])'))
+            # -------------------------------------------------------------------
+            # Issue #80：3 字库内真名的左边界放宽（允许汉字左邻）
+            # -------------------------------------------------------------------
+            # 【缺陷现象】
+            # 3 字及以上库内真名的左边界为 `(?<![\u4e00-\u9fa5])`（左边不能是汉字），
+            # 而真实文档中人名几乎总是跟在汉字后：
+            #   「…统一支付收单平台林传宇零售金融部…」「…数据仓库高项韬计划财务部…」
+            # → 整串漏匹配 → 随后被 2 字名层 / 通用规则抢先命中 →
+            #   「林传宇」漏脱（人工标准版整段遮盖）、「高项韬」只被遮成「项韬」
+            #   （3 字人名的**部分遮盖**，见 Issue #80）。
+            #
+            # 【为什么 3 字可以放宽、2 字不放宽】
+            # 2 字名误伤风险高（"白天"/"叶子"/"单元"…），故其严格左边界是
+            # #49 P1-I 的实测结论，保持不变；
+            # 3 字名几乎不可能是常用词的一部分，且 D16 是**真实人名库**
+            # （含库内污染项，已由 `d16_non_name_entries` 排除，见 Issue #79）。
+            # 该层排在 ≥4 字层之后，保证长名优先，3 字名不会被更长名截断。
+            _names3 = [n for n in _full_name_list if len(n) == 3]
+            if _names3:
+                _alt3 = "|".join(re.escape(n) for n in sorted(_names3, key=len, reverse=True))
+                _d16_layers.append(re.compile(rf'(?:{_alt3})(?![a-zA-Z])'))
         if _short_names:
             # 2 字名：左边界严格（排除 ASCII/数字在前），右边界允许数字/中文跟随
             _alt = "|".join(re.escape(n) for n in sorted(_short_names, key=len, reverse=True))
@@ -5893,6 +6000,444 @@ def _get_extra_name_re() -> Optional[re.Pattern]:
     return _EXTRA_NAME_RE_CACHE
 
 
+# ---------------------------------------------------------------------------
+# Issue #80：姓名原子化修复通道（3 字真名整串遮盖）
+# ---------------------------------------------------------------------------
+#
+# 【缺陷现象】
+#   3 字真名被切成「前 2 字 + 残尾」：
+#     「资产合作管理部彭圣草改造13A128」→「XXX草改造13A128」
+#     「营运管理部蒋新蕊下线23B38」→「XXX蕊下线23B38」
+#     「计划财务部陈韬、林秀萍、邱虹淋改造」→「XXX、XXX、XXX淋改造」
+#   残尾单字可与人名库反查，等同未脱敏（#57 口径）。
+#
+# 【根因】
+#   姓名规则组的名字位字符类取自 name_pool（1283 字），
+#   而「草 / 蕊 / 淋 / 嫣」这类尾字**不在池内** → 贪婪匹配在尾字前停住；
+#   随后 D16 2 字层 / 通用规则抢先命中 → 只遮 2 字。
+#   池内尾字（斌 / 鹏 / 华）同样中招：字频「尾字热字门槛」把温字尾挡在门外。
+#
+# 【解法：上下文取证的原子化通道】
+#   在姓名规则组**之前**插入一条独立通道，只在 3 字候选具备**强上下文证据**时
+#   整串遮盖（证据来自上下文，与 S3「全池匹配」同源，但本通道额外允许
+#   **尾字为非池字**，这正是 #80 的缺口）：
+#     ① 机构后缀（部/行/处/室/中心/平台/系统/组/队…）后紧跟；
+#     ② 角色锚点（组长/负责人/成员/经办人…）+ 分隔符后紧跟；
+#     ③ 顿号姓名块内（相邻项同样具备姓名形态）。
+#
+# 【为什么必须放在姓名规则组之前】
+#   与 D16 2 字层同理：2 字层一旦先把「彭圣」替换成 XXX，
+#   后执行的通道再也看不到原始的 3 字候选，无法原子化修复。
+#
+# 【误伤护栏（四道）】
+#   ① 姓位闸门（freq ≥ 5 的实证姓氏）；
+#   ② 名字位首字须在 name_pool 内（避免「成本控制」这类业务短语成候选）；
+#   ③ 职务标签护栏：候选命中职务后缀（王经理 / 组长）→ 交给职务通道处理；
+#   ④ 通用词保护表 / 业务词表 / 跨词边界守卫命中 → 放弃本次候选。
+#   非池字尾（草 / 嫣）额外要求「顿号姓名块」上下文——单点槽位不足以支撑。
+# ---------------------------------------------------------------------------
+
+# 机构后缀（长词优先）：「部门」类比单字「部」更具体，须先匹配。
+#
+# 【为什么不含「系统」与「行」】
+#   「系统」既可能是机构名（核心系统 + 人名），也可能是普通词尾
+#   （「原有系统安全平稳迁移」「外围系统关联改动点」）——
+#   后者会造出「安全平」「关联改」这类误遮。
+#   「行」是单字高频词尾（执行 / 进行 / 发行 / 行为 …），
+#   「不可点击执行成功和…」曾被误判成「执行 + 人名」——
+#   机构义只保留「分行 / 支行」等 2 字形态。
+_NAME_ATOMIC_ORG_SUFFIXES = (
+    "部门", "分部", "事业部", "分公司", "支行", "分行", "网点", "门店",
+    "中心", "平台", "机构", "科室", "小组", "团队", "项目组",
+    "部", "处", "室", "科", "组", "队",
+)
+
+_NAME_ATOMIC_ANCHOR_CACHE: Optional[tuple] = None
+
+# Issue #80 补强：**原子化通道专用**的角色锚点。
+#
+# 【为什么不并入 _NAME_GATE_ANCHORS】
+#   _NAME_GATE_ANCHORS 同时被 D16 姓名规则组（正则 `_anchor_alt`）复用，
+#   往里加词会整体放大 D16 层的召回面——那是**行为漂移**级改动，
+#   与本 issue 的「3 字姓名原子化」目标无关，风险不可控。
+#   本表只服务于原子化通道的**槽位证据判定**（只决定「此处是否可能是姓名
+#   槽位」，不直接决定遮盖动作），影响面可控。
+#
+# 【新增项的证据】
+#   - 「组员」：G7 平安信用卡投产方案的作战单元表里，
+#     「组员：」后面的名单是**真实人名清单**的标准版口径（整段 XXX），
+#     但「组员」不在 _NAME_GATE_ANCHORS 中 → 槽位证据缺失 →
+#     块内 3 字名（余路路 / 张瓞引 / 吴佳翌）被 2 字层截断。
+#   - 「副组长」：现有锚点表里的「组长」在「副组长：」语境下会被
+#     `rest[-1] in " \t　:："` 守卫拒掉（rest = 「副」不是分隔符），
+#     导致副组长名单整体失去槽位证据。
+_NAME_ATOMIC_EXTRA_ANCHORS = (
+    "组员", "副组长",
+)
+
+
+def _get_name_atomic_anchors() -> tuple:
+    """取角色锚点（带缓存）：用于「锚点 + 分隔符 + 姓名」槽位判定。
+
+    【只保留 2 字及以上的锚点】
+    单字锚点（由 / 请 / 派 / 调 …）在正文里极常见（自由 / 由于 / 理由 /
+    请求 / 邀请 …），命中即等于「锚点后随便一个词都可能是人名」——
+    实测会造出「由管理行上报…」这类误遮。
+    """
+    global _NAME_ATOMIC_ANCHOR_CACHE
+    if _NAME_ATOMIC_ANCHOR_CACHE is None:
+        _NAME_ATOMIC_ANCHOR_CACHE = tuple(
+            dict.fromkeys(
+                [a for a in _NAME_GATE_ANCHORS if len(a) >= 2]
+                + list(_NAME_ATOMIC_EXTRA_ANCHORS)))
+    return _NAME_ATOMIC_ANCHOR_CACHE
+
+
+_NAME_ATOMIC_SEP_SET = "、，,/／"
+
+# 机构后缀的**单字**形态（Issue #80 补强·机构词尾字守卫）。
+# 用途：低频姓氏若紧跟这些字，则更可能是机构名的一部分（财务部 / 业务处 …），
+# 而非姓氏。仅用于「是否把该字当姓」这一判定，不直接决定遮盖动作。
+_NAME_ATOMIC_ORG_TAIL_CHARS = "部处室科组队网点"
+
+# 非池字尾字的「文档内稀有度」阈值：尾字在本文档中出现次数 ≤ 该值时，
+# 才允许被解释为姓名的第 3 字（而非普通词首字）。
+_NAME_ATOMIC_RARE_TAIL_MAX = 3
+
+
+def _atomic_char_freq(text: str) -> Dict[str, int]:
+    """统计文档内字符频次（用于「稀有尾字」判定）。"""
+    freq: Dict[str, int] = {}
+    for ch in text:
+        if "\u4e00" <= ch <= "\u9fa5":
+            freq[ch] = freq.get(ch, 0) + 1
+    return freq
+
+
+def _atomic_bigram_freq(text: str) -> Dict[str, int]:
+    """统计文档内**二字组**频次（用于「稀有尾字」的加强判据）。"""
+    freq: Dict[str, int] = {}
+    for i in range(len(text) - 1):
+        a, b = text[i], text[i + 1]
+        if "\u4e00" <= a <= "\u9fa5" and "\u4e00" <= b <= "\u9fa5":
+            freq[a + b] = freq.get(a + b, 0) + 1
+    return freq
+
+
+def _atomic_name_span(text: str, idx: int, freq: Dict[str, int],
+                      surnames: set, pool: set,
+                      bigrams: Optional[Dict[str, int]] = None
+                      ) -> Optional[Tuple[int, int, bool]]:
+    """定位 idx 处的人名区间，返回 (start, end, is_candidate)。
+
+    - **strict**（is_candidate=False）：姓 + 1~2 个池内字（2~3 字）；
+    - **candidate**（is_candidate=True）：strict 只吃到 2 字时，若第 3 字是
+      **非池字**且在本文档中**低频**（≤ _NAME_ATOMIC_RARE_TAIL_MAX 次），
+      则认定为姓名的第 3 字（草 / 淋 / 嫣这类尾字不在 name_pool 内）。
+
+    「低频」这一条是 candidate 与普通词首字的**唯一可分辨信号**：
+    「彭圣草」的尾字「草」在整篇文档里只出现 2 次，而「林润改造」的
+    「造」出现数十次——高频字更可能是普通词首字。
+
+    【Issue #80 补强·二字组判据】
+    单字频次对「多个真名共用同一个尾字」的场景会失效：
+    「邱虹淋」的尾字「淋」在 G3 里出现 4 次（其它真名也以「淋」结尾），
+    单字频次判据失效 → 只遮「邱虹」，留下「淋」残尾。
+    二字组（「虹淋」）的频次则能把这批真名区分开——真名的第 2~3 字
+    组合几乎不会重复，故取「二字组在本文档内出现 ≤ 1 次」作为**加强判据**：
+    单字频次不达标时，若二字组唯一，仍判为 candidate。
+    """
+    n = len(text)
+    # 【Issue #80 补强·复姓姓名】
+    # 复姓（皇甫 / 上官 / 诸葛 …）是 **2 字姓氏**，其后的名字位最多 2 字，
+    # 故整名可达 **4 字**。若不识别复姓，单字扫描会把「皇甫义楠」切成
+    # 「皇甫义」+「楠」→ 留下 1 字残尾（正是 #80 的「部分遮盖」形态），
+    # 且遮盖后 D16 层的 4 字全名匹配被破坏 → 整名漏脱。
+    for cs in _NAME_GATE_COMPOUND_SURNAMES:
+        if not text.startswith(cs, idx):
+            continue
+        # 复姓 + 1~2 个池内字
+        glen = 0
+        while glen < 2 and idx + len(cs) + glen < n and \
+                text[idx + len(cs) + glen] in pool:
+            glen += 1
+        if glen >= 1:
+            return (idx, idx + len(cs) + glen, False)
+        # 复姓 + 1 个池内字 + 1 个稀有非池字（candidate）
+        if idx + len(cs) + 1 < n:
+            tail = text[idx + len(cs) + 1]
+            if ("\u4e00" <= tail <= "\u9fa5" and tail not in pool
+                    and freq.get(tail, 0) <= _NAME_ATOMIC_RARE_TAIL_MAX):
+                return (idx, idx + len(cs) + 2, True)
+        break
+    if idx >= n or text[idx] not in surnames:
+        return None
+    # strict：姓 + 池内字（最多 2 个）
+    length = 1
+    while length < 3 and idx + length < n and text[idx + length] in pool:
+        length += 1
+    if length < 2:
+        return None
+    if length == 3:
+        return (idx, idx + 3, False)
+    # length == 2：考察第 3 字
+    if idx + 2 < n:
+        tail = text[idx + 2]
+        if ("\u4e00" <= tail <= "\u9fa5" and tail not in pool
+                and freq.get(tail, 0) <= _NAME_ATOMIC_RARE_TAIL_MAX):
+            return (idx, idx + 3, True)
+        # 加强判据：二字组唯一 → 仍判为姓名第 3 字
+        if ("\u4e00" <= tail <= "\u9fa5" and tail not in pool
+                and bigrams is not None
+                and bigrams.get(text[idx + 1:idx + 3], 0) <= 1):
+            return (idx, idx + 3, True)
+    return (idx, idx + 2, False)
+
+
+def _atomic_prefix_is_slot(text: str, start: int) -> bool:
+    """块/候选的前文是否为「机构后缀」或「角色锚点槽位」。
+
+    【锚点须带分隔符】
+    「组长：马娟」成立；「组长马娟」也成立，但「由管理行上报…」里的
+    「由」不是槽位——故要求锚点与姓名之间有分隔符（：/: 或空白），
+    否则「汇报/联系/参会」等动词性锚点会造成大面积误遮。
+    """
+    left = text[max(0, start - 20):start]
+    if any(left.endswith(sfx) for sfx in _NAME_ATOMIC_ORG_SUFFIXES):
+        return True
+    stripped = left.rstrip(" \t　:：\n\r")
+    for a in _get_name_atomic_anchors():
+        if not stripped.endswith(a):
+            continue
+        rest = stripped[:-len(a)]
+        # 【Issue #80 补强】字段分隔符集合补入换行符：
+        #   名单/槽位锚点在真实文档里几乎总是**独占一行**
+        #   （「4.5\n研发支持组\n组长：…」「…\n组员：…」）。
+        #   原集合只有空格/制表/冒号 → 锚点位于行首（行首锚点的前一个
+        #   字符是 '\n'）时槽位证据被判否 → 整行名单失去「列表一致性」证据，
+        #   块内 3 字名被 2 字层截断（余路路 → XX路）。
+        #   换行同样是合法字段分隔符，纳入后名单块证据恢复。
+        if not rest or rest[-1] in " \t　:：\n\r":
+            return True
+    return False
+
+
+def _atomic_is_sep(ch: str) -> bool:
+    return ch in _NAME_ATOMIC_SEP_SET
+
+
+def _apply_name_atomic_pass(text: str, counts: Dict[str, int]) -> str:
+    """Issue #80：上下文取证的 3 字姓名原子化通道（整串遮盖，不留残尾）。
+
+    两个阶段：
+      ① **顿号姓名块整块原子化**——块内各项均为姓名形态 / 3 字候选时，
+         整块一次性遮盖（含非池字尾的项）。必须整块处理：若只遮单项，
+         块内其余项会失去「列表一致性」证据而被后续规则漏脱。
+      ② **单点槽位原子化**——机构后缀 / 角色锚点后紧跟、且不属于顿号块的
+         3 字姓名（尾字在池内）。
+
+    护栏：姓位闸门 / 名字位首字在池内 / 职务标签 / 通用词保护表 /
+          业务词表 / 跨词边界守卫。
+    """
+    if not text or not isinstance(text, str):
+        return text
+    surnames = set(_get_gated_surnames())
+    pool = _get_name_pool_set()
+    if not surnames or not pool:
+        return text
+    mask = get_replacement("NAME", "XXX")
+    out = _atomic_block_pass(text, counts, surnames, pool, mask)
+    out = _atomic_slot_pass(out, counts, surnames, pool, mask)
+    return out
+
+
+def _atomic_block_pass(text: str, counts: Dict[str, int], surnames: set,
+                       pool: set, mask: str) -> str:
+    """阶段①：顿号姓名块整块原子化。
+
+    块 = 连续的「人名区间 + 单个分隔符 + 人名区间」；
+    触发条件 = 块内**至少一项是 3 字姓名**（strict-3 池内尾字 或 candidate 非池尾字）。
+
+    【为什么用「宽松姓氏集」做块内项识别】
+    名单块里的项若夹着一个**姓氏闸门未放行**的姓（巢 / 储 / 寇 …），
+    该项就会从块内「掉出去」——块被截断成前半截，块内其余项失去
+    「列表一致性」证据；而本通道一旦遮了前半截，后面的 S2 / S4 名单块
+    规则也因结构被破坏而无法再兜住后半截 → 出现**名单块尾部漏脱**
+    （实测：G7「副组长：张斌、俞如忠、储量」→ 储量漏脱）。
+    故块内项的识别放宽到**全姓氏集**；是否遮盖仍由
+    「块内含 3 字姓名 + 槽位证据 + 逐项护栏」三重条件决定。
+    """
+    freq = _atomic_char_freq(text)
+    bigrams = _atomic_bigram_freq(text)
+    n = len(text)
+    # 块内项识别用宽松姓氏集：闸门未放行、但在本文档中**低频**的姓氏
+    # （巢 / 储 / 寇 …）也计入，用于「补齐名单块的项链」。
+    #
+    # 【为什么加「文档内低频」限定】
+    #   全姓氏集里混着「务 / 臣 / 祖 / 皮 …」等**常用汉字**，
+    #   它们在句中多作普通词（「财务」「任务」），若无条件放宽，
+    #   贪婪扫描会切出「务部黄」这种跨词片段（务+部+黄 全在名字池），
+    #   既吞掉真名（陈韬被切成「务部陈」）又有误遮部门名的风险。
+    #   文档内低频（≤ _NAME_ATOMIC_RARE_TAIL_MAX 次）把这批字挡在外面：
+    #   「务」在业务文档里高频出现 → 不放宽；「巢 / 储」低频 → 放宽。
+    extra_relaxed = {
+        s for s in SURNAME_SET
+        if s not in surnames and freq.get(s, 0) <= _NAME_ATOMIC_RARE_TAIL_MAX
+    }
+    relaxed = set(surnames) | extra_relaxed
+    spans: List[Tuple[int, int, bool]] = []
+    i = 0
+    while i < n:
+        # 【Issue #80 补强·机构词尾字守卫】
+        # 低频姓氏若**紧跟机构后缀字**（部 / 处 / 室 / 科 / 组 / 队 …），
+        # 它更可能是机构名的一部分而不是姓：
+        #   「财务部陈韬」→ 「务」被当作姓 → 切出「务部陈」（跨词片段），
+        #   既吞掉真名（陈韬）又有误遮部门名的风险。
+        # 该守卫**只作用于低频放宽姓氏**（闸门已放行的姓氏不受影响），
+        # 避免误伤真实姓名中的同名用字。
+        if (text[i] in extra_relaxed and i + 1 < n
+                and text[i + 1] in _NAME_ATOMIC_ORG_TAIL_CHARS):
+            i += 1
+            continue
+        if text[i] in relaxed:
+            span = _atomic_name_span(text, i, freq, relaxed, pool, bigrams)
+            if span:
+                # 名单项不会跨过分隔符：区间右边界收敛到下一个分隔符，
+                # 避免「黄钰、张俊杰」被贪婪读成「黄钰张」。
+                limit = i
+                while limit < n and not _atomic_is_sep(text[limit]):
+                    limit += 1
+                s, e, cand = span
+                if e > limit:
+                    e = limit
+                    cand = False
+                if e - s >= 2:
+                    spans.append((s, e, cand))
+                    i = e
+                    continue
+                i = s + 1
+                continue
+        i += 1
+    if len(spans) < 2:
+        return text
+
+    out = text
+    # 归组：相邻两项之间恰好是一个分隔符
+    group = [spans[0]]
+    groups: List[List[Tuple[int, int, bool]]] = []
+    for prev, cur in zip(spans, spans[1:]):
+        if cur[0] == prev[1] + 1 and _atomic_is_sep(out[prev[1]]):
+            group.append(cur)
+        else:
+            if len(group) >= 2:
+                groups.append(group)
+            group = [cur]
+    if len(group) >= 2:
+        groups.append(group)
+
+    # **自后向前**处理各块：块内项被替换为 XXX 后文本长度会变化
+    # （2 字项 → XXX 变长、3 字项等长），自后向前可保证尚未处理块的
+    # 偏移量始终有效（前文未被改动）。
+    for grp in reversed(groups):
+        # 【Issue #80 整改·名单块 3 字项】
+        # 整块处理的触发条件从「至少一项是非池字尾候选」放宽为
+        # 「至少一项是 **3 字姓名**（strict-3 池内尾字 或 candidate 非池尾字）」。
+        #
+        # 放宽的理由：S2 / S4 名单块规则的「项形态」上限是 2 字，
+        # 遇到 3 字项时块正则只吃到前 2 字 → `余路路` 变成 `XX路`、
+        # `张瓞引` 变成 `XXX引`——正是 #80 记录的「名单块 3 字项只遮前 2 字」。
+        # 由于块内各项已被判定为姓名形态（姓氏 + 池内字），且有
+        # 「列表一致性」证据（前后相邻项同为姓名），整块按 3 字粒度遮盖
+        # 不会引入新的误伤面。
+        if not any((e - s) == 3 for s, e, _ in grp):
+            continue
+        # 【Issue #80 补强·名单块「整段闭合」】
+        # 块必须**覆盖整个名单串**（末项后面不再是分隔符）才整块遮盖。
+        # 否则本通道只遮了名单的前半截，后半截失去「列表一致性」证据，
+        # 而后续 S2 / S4 名单块规则又因结构被破坏无法兜住 → 尾部漏脱
+        # （实测：G7「组员：陈曦、李雅丽、叶助茂、徐禅」→ 叶助茂漏脱）。
+        # 未闭合的块交回 S2 / S4 处理，保持既有行为不变。
+        last_end = grp[-1][1]
+        if last_end < len(out) and _atomic_is_sep(out[last_end]):
+            continue
+        if not _atomic_prefix_is_slot(out, grp[0][0]):
+            continue
+        # 逐项护栏
+        bad = False
+        for s, e, _ in grp:
+            seg = out[s:e]
+            if (_is_protected_by_common_word_guard(out, s, e)
+                    or _is_protected_by_biz_word(out, s, e)
+                    or _is_role_label(seg)
+                    or _is_boundary_split_misfire(out, s, e)):
+                bad = True
+                break
+        if bad:
+            continue
+        # 整块遮盖（保留分隔符原样）
+        buf = [out[:grp[0][0]]]
+        prev_end = grp[0][0]
+        for s, e, _ in grp:
+            buf.append(out[prev_end:s])
+            buf.append(mask)
+            prev_end = e
+            counts["姓名"] = counts.get("姓名", 0) + 1
+        buf.append(out[prev_end:])
+        out = "".join(buf)
+    return out
+
+
+def _atomic_slot_pass(text: str, counts: Dict[str, int], surnames: set,
+                      pool: set, mask: str) -> str:
+    """阶段②：机构后缀 / 角色锚点后紧跟的 3 字姓名（尾字须在池内）。
+
+    属于顿号块的单项**不在此处理**——块内各项必须整块判定，
+    否则单项提前遮盖会摧毁块内其余项的「列表一致性」证据。
+    """
+    out = text
+    i = 0
+    n = len(out)
+    while i < n:
+        ch = out[i]
+        if ch not in surnames:
+            i += 1
+            continue
+        if i + 2 >= n:
+            break
+        c2 = out[i + 1]
+        c3 = out[i + 2]
+        if c2 not in pool or c3 not in pool:
+            i += 1
+            continue
+        # 顿号块内的项交给阶段① / S2 / S4 处理
+        if (i > 0 and _atomic_is_sep(out[i - 1])) or (
+                i + 3 < n and _atomic_is_sep(out[i + 3])):
+            i += 1
+            continue
+        seg = out[i:i + 3]
+        if _is_role_label(seg):
+            i += 1
+            continue
+        if _is_protected_by_common_word_guard(out, i, i + 3):
+            i += 1
+            continue
+        if _is_protected_by_biz_word(out, i, i + 3):
+            i += 1
+            continue
+        if _is_boundary_split_misfire(out, i, i + 3):
+            i += 1
+            continue
+        if not _atomic_prefix_is_slot(out, i):
+            i += 1
+            continue
+        counts["姓名"] = counts.get("姓名", 0) + 1
+        out = out[:i] + mask + out[i + 3:]
+        i += 3
+    return out
+
+
+
+
 def _apply_extra_name_pass(text: str, counts: Dict[str, int]) -> str:
     """D-5 补强：确认真名清单在**任意上下文**按精确匹配脱敏。"""
     if not text or not isinstance(text, str):
@@ -6180,6 +6725,77 @@ def _apply_rare_name_pass(text: str, counts: Dict[str, int]) -> str:
         counts["姓名"] = counts.get("姓名", 0) + 1
         out = out[:s] + mask + out[e:]
     return out
+
+
+# ---------------------------------------------------------------------------
+# Issue #81：业务日程型日期区间的口径对齐（内部测试窗口保留）
+#
+# 【标准版口径】人工标准版对**对外里程碑日期**（上线 / 投产 / 发布 / 切换）
+#   遮盖，对**内部测试窗口日期**（轮次 / 阶段 / 批次 引导）**整段保留**。
+#   实测 G6「尖刀组UAT3规划」：
+#     标准版  「第1轮：2011年9月6日至2011年9月14日」  → 原文保留
+#     我方    「第1轮：YYYY年MM月DD日至YYYY年MM月DD日」→ 产生 7 处 over
+#   而同文档的对外里程碑日期双方一致：
+#     「最终实现新核心系统于2011年10月15日平稳上线」→ 双方均整段遮盖。
+#
+# 【实现】采用哨兵 + 末尾还原（与 _ORG_ENTITY_SENTINEL 同范式）：
+#   在**日期规则生效之前**把「轮次/阶段/批次/环节 引导的日期区间」整体换成哨兵，
+#   使日期规则看不到该区间；流水线末尾再还原为原文。
+#   【为什么不用规则排除】日期规则是全量正则，无法按上下文区分
+#   「内部测试窗口」与「对外里程碑」；哨兵是唯一能在规则前置阶段
+#   精确裁剪「哪一段日期不参与脱敏」的手段。
+#
+# 【范围收敛】仅匹配「引导词 + 冒号 + 日期区间」这一强形态：
+#   引导词限定 第N轮 / 第N轮次 / 第N阶段 / 第N批次 / 第N环节，
+#   且必须紧跟「：/：」再跟日期区间（含「至/到/-」分隔）。
+#   故不会误伤 G3 的「第四轮演练绿灯测试的执行时间是4月9日 11:00-15:00」
+#   （引导词后不是冒号），也不会误伤 G7 的「第1轮：静态阶段一」（其后非日期）。
+# ---------------------------------------------------------------------------
+
+_SCHEDULE_RANGE_SENTINEL = "\x00WBSCHED{}\x00"
+_SCHEDULE_RANGE_RE = re.compile(
+    r"第\s*[0-9一二三四五六七八九十]+\s*(?:轮次|轮|阶段|批次|环节)\s*[：:]\s*"
+    r"(?:[0-9]{4}年)?[0-9]{1,2}月[0-9]{1,2}日"
+    r"(?:\s*(?:至|到|—|－|-)\s*(?:[0-9]{4}年)?[0-9]{1,2}月[0-9]{1,2}日)?"
+)
+
+
+def _schedule_sentinel(idx: int) -> str:
+    """构造不含数字的哨兵（避免哨兵内数字被账号/口令等规则命中）。"""
+    letters = ""
+    n = idx
+    while True:
+        letters = chr(ord("A") + n % 26) + letters
+        n = n // 26 - 1
+        if n < 0:
+            break
+    return _SCHEDULE_RANGE_SENTINEL.format(letters)
+
+
+def _apply_schedule_range_keep_pass(text: str, kept: List[str]) -> str:
+    """Issue #81：把轮次/阶段/批次引导的日期区间替换为哨兵（末尾还原）。
+
+    kept —— 出入参，收集被保护的原文，供 _restore_schedule_range_keep 还原。
+    """
+    if not text or not isinstance(text, str):
+        return text
+    if "第" not in text:
+        return text
+
+    def _repl(m: re.Match) -> str:
+        kept.append(m.group(0))
+        return _schedule_sentinel(len(kept) - 1)
+
+    return _SCHEDULE_RANGE_RE.sub(_repl, text)
+
+
+def _restore_schedule_range_keep(text: str, kept: List[str]) -> str:
+    """Issue #81：还原被保护的内部测试日程日期区间（流水线末尾调用）。"""
+    if not text or "\x00WBSCHED" not in text:
+        return text
+    for i, orig in enumerate(kept):
+        text = text.replace(_schedule_sentinel(i), orig)
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -7174,7 +7790,14 @@ def _name_guard_sub_counted(pattern: re.Pattern, text: str, replacement: str,
         if _is_protected_by_common_word_guard(m.string, g_start, g_end):
             return m.group(0)
         # G7 跨词边界守卫（Issue #51）：命中横跨在两个词的边界上 → 保留原文
-        if _is_boundary_split_misfire(m.string, m.start(), m.end()):
+        #
+        # Issue #80：名单块类规则（S2 / S4）**豁免块级判定**——
+        #   名单块本身就是「多个词用顿号并列」，整体命中必然横跨词边界，
+        #   若按整块判定，块内真名会被整块放弃
+        #   （「张惠蓉、郭艳丹、郑纯改」→ 整块保留 → 3 字真名全部漏脱）。
+        #   名单块改为**逐项**判定（见 _wb_block_item_is_misfire）。
+        if (not getattr(replacement, "_wb_block_rule", False)
+                and _is_boundary_split_misfire(m.string, m.start(), m.end())):
             # Issue #75：G7「修剪回退」——命中片段里若含**已知真名**，
             # 只脱敏该真名，被贪婪吞掉的尾字原样保留（尾字属于下一个词），
             # 而不是整段回退导致人名整段泄漏。
@@ -7212,6 +7835,14 @@ def apply_redactions_counted(text: str) -> Tuple[str, Dict[str, int]]:
     # 以便看到未经改写的原始数字（日期形态识别依赖原始串）
     result = _apply_digital_password_pass(result, counts)
 
+    # Issue #80：姓名原子化修复通道——上下文取证的 3 字真名整串遮盖。
+    # 【时机】须在**机构实体层之前**：D-8 会把通用部门名替换为哨兵
+    #   （「计划财务部」→ \x00WBORGENT16\x00），哨兵一旦落地，
+    #   「机构后缀 + 姓名」的上下文证据即失效，3 字真名只能被切成 2 字。
+    # 【时机】亦须在**姓名规则组之前**：2 字层一旦先把「彭圣」替换成 XXX，
+    #   后执行的通道再也看不到原始 3 字候选，无法原子化修复。
+    result = _apply_name_atomic_pass(result, counts)
+
     # D-8（Issue #64）：银行全称/简称整段脱敏 + 通用部门名整段保护
     # （保护占位符在流水线末尾统一还原）
     result = _apply_org_entity_pass(result, counts)
@@ -7227,6 +7858,16 @@ def apply_redactions_counted(text: str) -> Tuple[str, Dict[str, int]]:
     #   部/中心）、地址通道（回溯式收拢）、姓名通道（专名误吞为 XXX）
     #   都会把机构名切碎，故先以哨兵整体占位，末尾统一还原。
     result = _apply_named_org_keep_pass(result, counts)
+
+    # Issue #81：业务日程型日期区间保护——「轮次/阶段/批次/环节」引导的
+    # 内部测试窗口日期整段保留（人工标准版口径）。
+    # 【时机】须在**日期规则生效之前**（日期规则在 pre_patterns 中），
+    #   否则区间会被拆成年/月/日分片逐个遮盖，产生 over。
+    # 【为什么用哨兵】日期规则是全量正则，无法按上下文区分
+    #   「内部测试窗口」与「对外里程碑」；哨兵可在规则前置阶段
+    #   精确裁剪「哪一段日期不参与脱敏」。
+    _schedule_kept: List[str] = []
+    result = _apply_schedule_range_keep_pass(result, _schedule_kept)
 
     # 第一阶段：姓名之前的规则（邮箱/日期/银行/支行/地名等）
     for pattern, replacement in pre_patterns:
@@ -7476,6 +8117,9 @@ def apply_redactions_counted(text: str) -> Tuple[str, Dict[str, int]]:
 
     # D-11 补强（Issue #63 批次四）：还原专名网点保护占位符
     result = _restore_named_org_keep(result)
+
+    # Issue #81：还原内部测试日程日期区间保护哨兵
+    result = _restore_schedule_range_keep(result, _schedule_kept)
 
     return result, counts
 

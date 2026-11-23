@@ -9,6 +9,19 @@
 2) textutil / antiword 等外部依赖在内网不一定存在，且在部分沙箱中写文件被拦截；
 3) 纯 Python 解析无外部进程、无临时目录依赖，最适合内网离线交付。
 
+【域（field）语义 —— Issue #82】
+Word 97-2003 二进制正文流把「域指令段」与「域结果段」同体存储：
+  0x13 域开始 → <指令文本> → 0x14 域分隔 → <结果文本> → 0x15 域结束
+其中指令文本（`TOC \\o "1-5" \\h \\z \\u`、`PAGEREF _Toc2599986 \\h`、
+`HYPERLINK \\l _Toc…`）是**域的元数据**，不是可见正文；
+Word/WPS 渲染出来的「目录」只显示结果段（条目文字 + 页码）。
+若把指令文本原样抽进正文，会与「按渲染文本抽取」的另一侧（docx 侧 python-docx
+只读 w:t、不读 w:instrText）产生**口径分裂** → 两侧文本不可比，
+比对指标被对齐噪声污染（Issue #82）。
+
+本模块默认输出**渲染文本**（丢弃指令段、保留结果段），
+需要原始码时可显式传 `include_field_codes=True`。
+
 【实现要点】
 - FIB（File Information Block）定位正文与片段表：
   * fcClx = FIB 偏移 0x01A2，lcbClx = FIB 偏移 0x01A6（Word 97 FIB）
@@ -37,6 +50,42 @@ _FIB_CLX_OFF = 0x01A2
 _FIB_CCP_TEXT_OFF = 0x004C
 _FIB_FLAGS_OFF = 0x000A
 _FIB_FLAG_FWHICHTBLSTM = 0x0200
+
+# Word 域控制符（Issue #82）
+_FIELD_BEGIN = "\x13"   # 域开始
+_FIELD_SEP = "\x14"     # 域分隔（指令段 / 结果段分界）
+_FIELD_END = "\x15"     # 域结束
+
+
+def strip_field_instructions(text: str) -> str:
+    """丢弃域指令段、保留域结果段（渲染文本语义，Issue #82）。
+
+    规则：
+    - 0x13 开启一层域（初始处于「指令段」）；
+    - 0x14 将当前层切换为「结果段」；
+    - 0x15 关闭当前层；
+    - 仅当**所有**未关闭的层都处于「结果段」时，字符才计入输出
+      （嵌套域：外层仍在指令段时，内层结果同样丢弃）。
+
+    域外的普通正文原样保留。
+    """
+    out: List[str] = []
+    stack: List[str] = []          # 每层状态："instr" / "result"
+    for ch in text:
+        if ch == _FIELD_BEGIN:
+            stack.append("instr")
+            continue
+        if ch == _FIELD_SEP:
+            if stack:
+                stack[-1] = "result"
+            continue
+        if ch == _FIELD_END:
+            if stack:
+                stack.pop()
+            continue
+        if all(state == "result" for state in stack):
+            out.append(ch)
+    return "".join(out)
 
 
 def is_ole2(path: Path) -> bool:
@@ -93,9 +142,12 @@ def _parse_clx_piece_table(clx: bytes) -> Optional[List[tuple]]:
     return None
 
 
-def extract_doc_text(path: str | Path) -> str:
+def extract_doc_text(path: str | Path, include_field_codes: bool = False) -> str:
     """
     提取 .doc 正文文本（段落以 \\n 结尾）。
+
+    默认输出**渲染文本**：域指令段（`TOC \\o …` / `PAGEREF …` / `HYPERLINK …`）
+    被丢弃、域结果段保留（Issue #82）；传 `include_field_codes=True` 可取回原始码。
 
     解析失败时返回空字符串（调用方需据此降级）。
     """
@@ -144,6 +196,9 @@ def extract_doc_text(path: str | Path) -> str:
         full = "".join(out)
         if ccp_text and len(full) > ccp_text:
             full = full[:ccp_text]
+        # 域语义处理（Issue #82）：丢弃域指令段、保留域结果段
+        if not include_field_codes:
+            full = strip_field_instructions(full)
         # 控制字符清理：段落标记 \r → \n
         full = full.replace("\r\n", "\n").replace("\r", "\n")
         full = "".join(ch for ch in full if ch == "\n" or ch == "\t" or ord(ch) >= 0x20)

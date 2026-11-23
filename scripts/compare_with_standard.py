@@ -39,10 +39,16 @@ from typing import Any, Dict, List, Optional, Tuple
 PKG_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PKG_ROOT / "scripts"))
 
+# Issue #81：补齐**无年份短日期**占位符。
+# 此前仅收录 YYYY年MM月DD日 / YYYY年MM月 / YYYY/MM/DD，
+# 而短日期遮盖产出的是 MM月DD日 / MM/DD —— 该形态在比对时既不计 agree、
+# 也不计 over/residual，使「短日期」维度处于不可观测状态。
+# 注意：短日期形态须排在长日期形态之后，避免 YYYY年MM月DD日 被 MM月DD日 先匹配。
 PLACEHOLDER_RE = re.compile(
     r"(XXXXX@XXXXX|X{2,}银行|XX分行|XX支行|XX:XX:XX:XX:XX:XX|"
     r"X\.X\.X\.X|0XX-XXXXXXXX|XXX+|XXXX+|X{2,}|"
-    r"YYYY年MM月DD日|YYYY年MM月|YYYY/MM/DD|YYYY年MM月DD日)"
+    r"YYYY年MM月DD日|YYYY年MM月|YYYY/MM/DD|YYYY年MM月DD日|"
+    r"MM月DD日|MM/DD)"
 )
 
 RESIDUAL_PATTERNS = [
